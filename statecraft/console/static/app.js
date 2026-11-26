@@ -3,7 +3,11 @@
 "use strict";
 
 const $ = (sel, el = document) => el.querySelector(sel);
-const main = $("#main");
+const page = $("#main");
+// each route renders into its own container; only the latest route's is shown, so a slow view
+// that finishes after the person moved on never overwrites the newer one
+let current = null;
+let routes = 0;
 const state = { registry: null, run: null, agent: null, filesPrefix: "", source: null, feed: null };
 
 function h(tag, attrs = {}, ...children) {
@@ -154,6 +158,7 @@ const VIEW_COLOR = { succeeded: "#1f9d55", running: "#3559e0", suspended: "#c98a
 
 // ---- overview ------------------------------------------------------------------------------
 async function showOverview() {
+  const main = current;
   const [o, runs] = await Promise.all([api("/api/overview"), api("/api/runs")]);
   $("#title").textContent = o.title;
   const card = (n, label) => h("div", { class: "card" }, h("div", { class: "n" }, n), h("div", { class: "dim" }, label));
@@ -165,7 +170,7 @@ async function showOverview() {
     h("div", { class: "grid", style: "grid-template-columns: 1fr 1fr; margin-top: 14px" },
       h("div", { class: "panel" }, h("h2", {}, "Recent runs"), runsTable(runs.slice(-12).reverse())),
       h("div", { class: "panel" }, h("h2", {}, "Live events (all runs)"), feed)));
-  followAll(feed);
+  if (main === current) followAll(feed);
 }
 
 function runsTable(runs) {
@@ -211,6 +216,7 @@ function allAgents(reg) {
 }
 
 async function showRegistry(selected) {
+  const main = current;
   const reg = await loadRegistry();
   const agents = allAgents(reg);
   const filter = h("input", { placeholder: "filter agents…", style: "width:100%" });
@@ -278,10 +284,12 @@ function stateMachine(m, walked) {
 
 // ---- static graph --------------------------------------------------------------------------
 async function showGraph() {
+  const main = current;
   const g = await api("/api/graph");
   const reg = await loadRegistry();
   const features = reg.features.map((f) => f.name);
-  const pick = h("select", {}, h("option", { value: "" }, "all features"), features.map((f) => h("option", { value: f }, f)));
+  // one feature at a time reads best; "all" names each agent with its feature
+  const pick = h("select", {}, features.map((f) => h("option", { value: f }, f)), h("option", { value: "" }, "all features"));
   const show = { spawns: true, uses: true, data: false };
   const box = h("div", { class: "graphbox" });
   const toggles = Object.keys(show).map((k) => h("label", {}, h("input", { type: "checkbox", ...(show[k] ? { checked: "" } : {}), onchange: (e) => { show[k] = e.target.checked; draw(); } }), " ", k));
@@ -292,7 +300,7 @@ async function showGraph() {
       ((e.kind === "writes" || e.kind === "reads") && show.data)).filter((e) => inFeature(e.from) && inFeature(e.to));
     const used = new Set(edges.flatMap((e) => [e.from, e.to]));
     const nodes = g.nodes.filter((n) => used.has(n.id) || (n.type === "agent" && inFeature(n.id) && f))
-      .map((n) => ({ ...n, icon: n.type === "server" ? "⛁" : n.type === "artifact" ? "▤" : n.kind === "agentic" ? "✦" : "●" }));
+      .map((n) => ({ ...n, label: !f && n.type === "agent" ? n.id : n.label, icon: n.type === "server" ? "⛁" : n.type === "artifact" ? "▤" : n.kind === "agentic" ? "✦" : "●" }));
     fill(box, nodes.length ? layeredGraph(nodes, edges, {
       onClick: (n) => { if (n.type === "agent") location.hash = `#/registry/${encodeURIComponent(n.id)}`; else if (n.type === "server") location.hash = "#/servers"; },
     }) : h("div", { class: "empty" }, "Nothing to draw."));
@@ -305,6 +313,7 @@ async function showGraph() {
 
 // ---- servers -------------------------------------------------------------------------------
 async function showServers() {
+  const main = current;
   const servers = await api("/api/servers");
   fill(main, h("div", { class: "grid", style: "grid-template-columns: repeat(auto-fill, minmax(420px, 1fr))" },
     servers.map((s) => h("div", { class: "panel" },
@@ -317,6 +326,7 @@ async function showServers() {
 
 // ---- runs ----------------------------------------------------------------------------------
 async function showRuns() {
+  const main = current;
   const reg = await loadRegistry();
   const runs = await api("/api/runs");
   const agentPick = h("select", {}, allAgents(reg).filter((a) => !a.feature.startsWith("(")).map((a) => h("option", { value: a.ref }, a.ref)));
@@ -338,6 +348,7 @@ function alertBox(text) {
 }
 
 async function showRun(root, selected) {
+  const main = current;
   closeStreams();
   const tree = h("div", { class: "tree" });
   const graph = h("div", { class: "graphbox", style: "max-height:420px" });
@@ -363,6 +374,7 @@ async function showRun(root, selected) {
   };
   await refresh();
   await drawAgent(side);
+  if (main !== current) return; // superseded while loading: no stream for a hidden view
   const src = new EventSource(`/api/runs/${encodeURIComponent(root)}/events`);
   state.source = src;
   src.onopen = () => setLive(true, `live · ${root}`);
@@ -470,6 +482,7 @@ async function drawAgent(side) {
 
 // ---- workspace -----------------------------------------------------------------------------
 async function showFiles(root) {
+  const main = current;
   closeStreams();
   const paths = await api(`/api/runs/${encodeURIComponent(root)}/files`);
   const list = h("div", { class: "list" });
@@ -504,6 +517,9 @@ async function showFiles(root) {
 async function route() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
   const tab = parts[0] || "overview";
+  const token = ++routes;
+  const sameRun = tab === "runs" && parts[1] && parts[2] !== "files" && state.run && state.run.root === parts[1] && state.source;
+  if (!sameRun) current = h("div");
   document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("on", a.dataset.tab === tab));
   try {
     if (tab === "registry") { closeStreams(); await showRegistry(parts.slice(1).join("/")); }
@@ -512,7 +528,7 @@ async function route() {
     else if (tab === "runs" && parts[1] && parts[2] === "files") await showFiles(parts[1]);
     else if (tab === "runs" && parts[1]) {
       const selected = parts.slice(2).join("/");
-      if (state.run && state.run.root === parts[1] && state.source) {
+      if (sameRun) {
         state.run.selected = selected || parts[1];
         const data = await api(`/api/runs/${encodeURIComponent(parts[1])}`);
         const v = state.run;
@@ -523,8 +539,9 @@ async function route() {
     else if (tab === "runs") { closeStreams(); await showRuns(); }
     else await showOverview();
   } catch (e) {
-    fill(main, h("div", { class: "panel v-terminated" }, e.message));
+    fill(current, h("div", { class: "panel v-terminated" }, e.message));
   }
+  if (token === routes && !sameRun) fill(page, current);
 }
 
 window.addEventListener("hashchange", route);

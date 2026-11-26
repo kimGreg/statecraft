@@ -26,7 +26,9 @@ h3 { font-size: 13px; margin: 14px 0 6px; color: var(--dim); text-transform: upp
 .cards { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
 .card, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
 .card .n { font-size: 26px; font-weight: 650; }
-.split { display: grid; grid-template-columns: minmax(260px, 360px) 1fr; gap: 14px; align-items: start; }
+.split { display: grid; grid-template-columns: minmax(260px, 360px) minmax(0, 1fr); gap: 14px; align-items: start; }
+.split > *, .grid > * { min-width: 0; }
+.item { flex-wrap: wrap; }
 .list { max-height: 78vh; overflow: auto; }
 .item { padding: 7px 9px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
 .item:hover, tr.clickable:hover { background: var(--accent-soft); }
@@ -60,7 +62,7 @@ svg .node.on rect { stroke-width: 2.5; }
 svg .node.current rect { fill: var(--accent-soft); stroke-width: 2.5; }
 svg .node.visited rect { stroke: var(--ok); }
 svg .node { cursor: pointer; }
-.graphbox { overflow: auto; max-height: 78vh; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.graphbox { max-width: 100%; overflow: auto; max-height: 78vh; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
 button, select, input { font: inherit; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
 button { cursor: pointer; } button:hover { border-color: var(--accent); }
