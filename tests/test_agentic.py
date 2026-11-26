@@ -166,7 +166,8 @@ async def test_an_unusable_answer_is_asked_again_then_faults(tmp_path) -> None:
 async def test_limits_are_faults(tmp_path) -> None:
     engine = engine_with(tmp_path, ScriptedModel(step_fn=lambda m, t: call("math__add", a=1, b=1)))
     root = await engine.spawn("t:adder", {"goal": "loop"})
-    [row] = await engine.run(root, timeout=10, scan_every=0.01)
+    # a hang guard, not a pace: the loop runs to its limits, many steps on a slow machine
+    [row] = await engine.run(root, timeout=60, scan_every=0.01)
     assert row["view"] == "suspended" and "more than" in row["error"]
 
 

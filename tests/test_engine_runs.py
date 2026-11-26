@@ -188,30 +188,46 @@ async def test_ending_a_failed_child_ends_the_join_but_not_as_success(engine) ->
     assert table[root]["view"] == "suspended" and "ChildFailed" in table[root]["error"]
 
 
+async def until(check, seconds: float = 20.0) -> None:
+    """Wait for a condition on the store; the engine's pace is not the test's to assume (a step
+    that was running when a signal arrived commits whenever it finishes)."""
+    deadline = asyncio.get_running_loop().time() + seconds
+    while not await check():
+        assert asyncio.get_running_loop().time() < deadline, "the condition never held"
+        await asyncio.sleep(0.01)
+
+
 async def test_stop_holds_an_agent_and_term_runs_on_term_and_ends_children(engine) -> None:
     root = await engine.spawn("t:parent")
     executor = engine.executor(scan_every=0.01)
     stop = asyncio.Event()
     task = asyncio.create_task(executor.run(stop))
     child = f"{root}/nap"
-    for _ in range(200):
-        await asyncio.sleep(0.01)
+
+    async def stepped(n: int) -> bool:
         record = await engine.store.find(child)
-        if record is not None and record.step >= 3:
-            break
+        return record is not None and record.step >= n
+
+    async def held_still() -> bool:
+        # stopped, and no step in flight: a step running when STOP came has committed
+        record = await engine.store.load(child)
+        lease = await engine.store.lease(child)
+        busy = lease is not None and lease.valid(engine.services.clock())
+        return record.reason("stopped") is not None and not busy
+
+    async def ended() -> bool:
+        return (await engine.store.load(child)).ended
+
+    await until(lambda: stepped(3))
     await engine.signal(child, "STOP")
-    await asyncio.sleep(0.2)
+    await until(held_still)
     held = (await engine.store.load(child)).step
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.3)  # a stopped agent takes no step, however long one waits
     assert (await engine.store.load(child)).step == held
     await engine.signal(child, "CONT")
-    await asyncio.sleep(0.2)
-    assert (await engine.store.load(child)).step > held
+    await until(lambda: stepped(held + 1))
     await engine.signal(root, "TERM")
-    for _ in range(200):
-        await asyncio.sleep(0.01)
-        if (await engine.store.load(child)).ended:
-            break
+    await until(ended)
     stop.set()
     await task
     assert (await engine.store.load(root)).status == "terminated"
