@@ -4,6 +4,8 @@
 
 Status: sections 1 to 11 are implemented; section 12 is planned. Items marked *(planned)* are
 specified but not built yet. The recovery properties the tests check are in section 13.
+What the system is made of (resources, layers, providers, add-ons) and how the code moves
+into it: [architecture.md](architecture.md).
 
 ## 0. Goals
 

@@ -19,7 +19,8 @@ fault means. A model-driven agent is a state machine too, one tool call per step
 - **Ports, not frameworks.** State store (memory, SQLite), files, tools, model: an application
   plugs its own.
 
-Design: [docs/design.md](docs/design.md).
+Design: [docs/design.md](docs/design.md) (how a step runs) and
+[docs/architecture.md](docs/architecture.md) (resources, layers, providers, add-ons).
 
 ## Quick start
 
