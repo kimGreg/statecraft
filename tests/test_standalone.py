@@ -20,7 +20,8 @@ def declared(optional: bool = True) -> set[str]:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     listed = list(project["dependencies"])
     if optional:
-        listed += project.get("optional-dependencies", {}).get("schema", [])
+        extras = project.get("optional-dependencies", {})
+        listed += [*extras.get("schema", []), *extras.get("console", [])]
     names = {re.split(r"[<>=\[ ;]", d)[0].lower() for d in listed}
     return {IMPORT_NAMES.get(n, n) for n in names}
 

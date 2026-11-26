@@ -63,6 +63,9 @@ class _Tables:
     def tree_ids(self, root: str) -> list[str]:
         return sorted(i for i in self.s["agents"] if i == root or i.startswith(root + "/"))
 
+    def root_ids(self) -> list[str]:
+        return sorted(i for i in self.s["agents"] if "/" not in i)
+
     def work_ids(self) -> list[str]:
         return sorted(
             i

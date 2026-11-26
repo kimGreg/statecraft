@@ -13,7 +13,9 @@ dependencies = [
 [project.optional-dependencies]
 # the decider checks answers against a full JSON Schema (without it: type and enum only)
 schema = ["jsonschema>=4.20"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "jsonschema>=4.20"]
+# the web console (`python -m statecraft.console`)
+console = ["starlette>=0.37", "uvicorn>=0.29"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "jsonschema>=4.20", "starlette>=0.37", "uvicorn>=0.29"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -21,6 +23,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["statecraft*"]
+
+[tool.setuptools.package-data]
+"statecraft.console" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

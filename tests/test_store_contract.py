@@ -163,3 +163,9 @@ async def test_the_tree_is_the_root_and_its_descendants(store) -> None:
     for agent_id in ("a_b", "a_b/c", "a_b/c/d", "a_bx", "zz"):
         await store.create(rec(agent_id))
     assert [r.id for r in await store.tree("a_b")] == ["a_b", "a_b/c", "a_b/c/d"]
+
+
+async def test_roots_are_the_records_without_a_parent(store) -> None:
+    for agent_id in ("b", "a", "a/child", "a/child/leaf", "b/x"):
+        await store.create(rec(agent_id))
+    assert [r.id for r in await store.roots()] == ["a", "b"]

@@ -15,6 +15,7 @@ fault means. A model-driven agent is a state machine too, one tool call per step
   once even if the parent dies; questions and answers are records.
 - **Content-addressed artifacts**, published by the step that commits their reference.
 - **Forks and attachments.** A run can reuse an earlier run's results, or work in its workspace.
+- **A console** to see it all: registry, graphs, live runs, questions, workspaces.
 - **Ports, not frameworks.** State store (memory, SQLite), files, tools, model: an application
   plugs its own.
 
@@ -86,6 +87,23 @@ await engine.run(root)
 The full script is [examples/quickstart.py](examples/quickstart.py). Kill it at any point and run
 it again on the same `state.db`: it continues from the last committed step.
 
+## Console
+
+A web console over any engine: the registry (every agent's declarations and state machine),
+the graph of spawns, tool servers and artifact flow, the tool servers, and every run, live: its
+tree, each agent's state, data, model conversation and path of states, its open questions (answer
+them there), signals, events and workspace files.
+
+```bash
+pip install "statecraft[console]"
+python -m statecraft.console --engine my_app.engines:make --port 8790
+```
+
+`--engine` names a function that returns an `Engine` (or `(engine, servers)`, where `servers` is
+an async function listing the application's live tool servers). In code:
+`statecraft.console.console_app(engine)` is an ASGI app. Executors run elsewhere on the same
+store, or beside the console with `--executors N`.
+
 ## Pieces
 
 | Piece | Where |
@@ -100,6 +118,7 @@ it again on the same `state.db`: it continues from the last committed step.
 | `ctx`, the executor loop, the engine (spawn, signal, answer, events, run, fork, attach) | `context.py`, `executor.py`, `engine.py` |
 | The artifact envelope; views and the cumulative state | `artifacts.py`, `views.py` |
 | Tools answered by plain functions, for tests | `testing.py` |
+| The web console (optional extra) | `console/` |
 
 ## Develop
 

@@ -55,6 +55,7 @@ class Tables(Protocol):
     def history_read(self, agent_id: str) -> list[dict[str, Any]]: ...
     def work_ids(self) -> list[str]: ...
     def tree_ids(self, root: str) -> list[str]: ...
+    def root_ids(self) -> list[str]: ...
 
 
 def root_of(agent_id: str) -> str:
@@ -88,6 +89,11 @@ class StateStore:
         """Every record with work left: active, or ended with intents pending."""
         with self.transaction() as t:
             return [r for r in (t.get(i) for i in t.work_ids()) if r is not None]
+
+    async def roots(self) -> list[Record]:
+        """Every root (a run), in id order."""
+        with self.transaction() as t:
+            return [r for r in (t.get(i) for i in t.root_ids()) if r is not None]
 
     async def tree(self, root: str) -> list[Record]:
         """The root and every agent under it, in id order."""

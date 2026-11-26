@@ -118,6 +118,14 @@ class _Tables:
         )
         return [i for (i,) in rows]
 
+    def root_ids(self) -> list[str]:
+        return [
+            i
+            for (i,) in self.db.execute(
+                "SELECT id FROM agents WHERE instr(id, '/') = 0 ORDER BY id"
+            )
+        ]
+
     def work_ids(self) -> list[str]:
         return [i for (i,) in self.db.execute("SELECT id FROM agents WHERE work = 1 ORDER BY id")]
 
