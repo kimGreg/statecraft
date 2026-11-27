@@ -148,10 +148,24 @@ class StepContext:
         that stays the same when the state runs again (the same call made again after a crash
         or a CONT), or an explicit `idempotency_key`. The identity is never derived from the
         order of calls: two different calls in one state need two names."""
+        return await self.invoke(
+            effect, arguments, call_name=call_name, idempotency_key=idempotency_key
+        )
+
+    async def invoke(
+        self,
+        effect: str,
+        arguments: dict[str, Any],
+        *,
+        call_name: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> Any:
+        """`call` with the arguments as one mapping: for arguments that are not known in advance
+        (a model's tool call), where an argument may itself be named `call_name`."""
         if call_name is not None and idempotency_key is not None:
             raise ValueError("give call_name or idempotency_key, not both")
         key = idempotency_key or (self.record.key("call", call_name) if call_name else None)
-        return await self._runtime.effects.call(self, effect, arguments, key)
+        return await self._runtime.effects.call(self, effect, dict(arguments), key)
 
     def tools(self) -> list[str]:
         """The tools this instance may call (its pinned bindings)."""

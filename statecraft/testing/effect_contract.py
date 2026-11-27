@@ -53,6 +53,8 @@ class EffectHarness:
     slow_request: Callable[[str, float], dict[str, Any]]
     #: a request the provider refuses (classified), when it has one
     bad_request: dict[str, Any] | None = None
+    #: whether anything the tagged request started still runs (required for remote_work)
+    alive: Callable[[str], bool] | None = None
     workspace: str = "w"
     scope: dict[str, Any] = field(
         default_factory=lambda: {"workspace": "w", "shared": "rw", "private": "home/a/private"}
@@ -185,6 +187,8 @@ async def test_a_cancelled_call_holds_its_work_until_it_ended(
     effect_harness: EffectHarness,
 ) -> None:
     effect_harness.needs("remote_work")
+    alive = effect_harness.alive
+    assert alive is not None, "a remote_work harness must say what still runs (alive)"
     tag, key = _tag(), f"k-{_tag()}"
     context = effect_harness.context(key)
     call = asyncio.ensure_future(
@@ -192,12 +196,17 @@ async def test_a_cancelled_call_holds_its_work_until_it_ended(
             effect_harness.operation, effect_harness.slow_request(tag, 30), context
         )
     )
-    await asyncio.sleep(0.2)
+    for _ in range(100):  # until the work runs
+        await asyncio.sleep(0.05)
+        if alive(tag):
+            break
+    assert alive(tag), "the slow request never ran"
     call.cancel()
     await asyncio.gather(call, return_exceptions=True)
     assert context.work, "work that outlives the call must be registered"
     await asyncio.wait_for(asyncio.gather(*context.work, return_exceptions=True), 5)
-    assert all(w.done() for w in context.work)
+    # the work's end is the work's end: nothing it started runs once its futures are done
+    assert not alive(tag), "the registered work ended while the work still runs"
     if effect_harness.declares("reconcile"):
         found = await effect_harness.provider.reconcile(effect_harness.operation, key, context)
         assert found.status in ("unknown", "completed", "failed")  # never running, never absent

@@ -280,7 +280,7 @@ class Executor:
                 child_id = record.children.get(name)
                 child = await self.store.find(child_id) if child_id else None
                 if child is not None:
-                    children[name] = await self._child_view(child)
+                    children[name] = await self._child_view(child, record)
         now = self.now()
         resolved = resolve_wait(record, children, now)
         if resolved == record:
@@ -303,13 +303,20 @@ class Executor:
         log.warning("%s: cleanup faulted after its parent ended; ending it", record.id)
         return await self.store.kill(record.id)
 
-    async def _child_view(self, child: Record) -> ChildView:
-        """A faulted child whose inbox already holds a CONT, TERM or KILL is not faulted for a
-        join: that fault is being dealt with (a parent that CONTs a child and waits again must
-        not be woken by the same fault)."""
+    async def _child_view(self, child: Record, parent: Record) -> ChildView:
+        """A faulted child that is being dealt with is not faulted for a join: a CONT, TERM or
+        KILL already in its inbox, or still a pending intent of the parent (a parent that CONTs
+        a child and waits again, in one step or two, is not woken by the same fault)."""
         view = ChildView.of(child)
         if view.fault is None:
             return view
+        for intent in parent.pending_intents:
+            if (
+                intent["kind"] == "signal"
+                and intent.get("target") == child.id
+                and signal_name(intent["signal"]) in ("CONT", "TERM", "KILL")
+            ):
+                return ChildView(child.status)
         for item in await self.store.read_inbox(child.id, child.inbox_applied):
             message = item["message"]
             if (

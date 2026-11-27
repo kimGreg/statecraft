@@ -31,7 +31,7 @@ import jsonschema
 
 from ..kernel.executor import Executor, signal_name
 from ..kernel.process import Fault, Lease, Record, Transition
-from ..kernel.store import Busy, Conflict, Ended, StateStore
+from ..kernel.store import Busy, CallRefused, Conflict, Ended, StateStore
 from ..kernel.transitions import (
     InvalidAnswer,
     apply_answer,
@@ -597,13 +597,23 @@ class Runtime:
             raise KeyError(f"no call {key}")
         if entry["status"] != "indeterminate":
             raise ValueError(f"call {key} is {entry['status']}, not indeterminate")
-        if outcome == "completed":
-            return await self.store.end_call(key, "completed", result=result, by=by)
-        if outcome == "failed":
-            return await self.store.end_call(key, "failed", error=f"resolved by {by}", by=by)
-        if outcome == "replay":
-            return await self.store.end_call(key, "replay", by=by)
-        raise ValueError(f"outcome must be completed, failed or replay, not {outcome!r}")
+        lease = await self.store.lease(entry["agent"])
+        if lease is not None and lease.valid(self.clock()):
+            raise ValueError(f"{entry['agent']} is running a step; resolve the call when it is not")
+        settle = {
+            "completed": {"result": result},
+            "failed": {"error": f"resolved by {by}"},
+            # a replay is a new request to the provider: a new generation of the key
+            "replay": {"generation": int(entry.get("generation") or 0) + 1},
+        }
+        if outcome not in settle:
+            raise ValueError(f"outcome must be completed, failed or replay, not {outcome!r}")
+        try:
+            return await self.store.end_call(
+                key, outcome, expected="indeterminate", by=by, **settle[outcome]
+            )
+        except CallRefused as exc:
+            raise ValueError(str(exc)) from None
 
     async def repin(self, agent_id: str) -> dict[str, Any]:
         """Accept the current definition and tools for an instance whose pins changed (then CONT

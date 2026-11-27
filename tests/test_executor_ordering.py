@@ -367,3 +367,37 @@ async def test_a_join_wakes_on_a_message() -> None:
     wakes = record.data["wakes"]
     assert wakes[0]["by"] == "message" and wakes[0]["signals"] == ["look"]
     assert wakes[-1]["by"] == "children" and record.status == "succeeded"
+
+
+class BossSameStep(Boss):
+    """CONTs the faulted child and waits on it again in the same step."""
+
+    @state
+    async def handle(self, ctx, data):
+        Boss.handled.append(ctx.woke["faulted"][0]["error"])
+        ctx.signal("c", "CONT")
+        return Wait(join=["c"], then="done", on_fault="handle")
+
+
+async def test_a_cont_and_a_rejoin_in_one_step_are_not_woken_by_the_same_fault() -> None:
+    Flaky.runs, Boss.handled = [], []
+    rt = memory_runtime(executors=0)
+    rt.registrar.agents.register("boss", BossSameStep, spawns=["flaky"])
+    rt.registrar.agents.register("flaky", Flaky)
+    async with rt:
+        await rt.spawn("boss", root_id="p")
+        executor = Executor(rt, scan_every=0.01)
+
+        async def step(agent_id: str) -> None:
+            await executor._process(await rt.store.load(agent_id))
+            await executor.drain()
+
+        await step("p")  # spawn
+        await step("p")  # the child is created; `wait` runs
+        await step("p/c")  # the child faults once
+        await step("p")  # woken by the fault; `handle` CONTs and rejoins in one step
+        await step("p")  # the CONT intent is pending: no second wake
+        assert len(Boss.handled) == 1
+        await rt.run("p", timeout=5)
+        assert (await rt.get("p"))["view"] == "succeeded"
+    assert len(Boss.handled) == 1

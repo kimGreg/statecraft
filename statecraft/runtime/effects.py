@@ -221,7 +221,12 @@ class EffectManager:
         under the provider's own key contract (`resend`) or an operator's `replay`."""
         digest = digest_of(
             {
-                "binding": ctx.record.bindings.get(name),
+                # the request, not how it is run: a policy change (repin) keeps the identity
+                "binding": {
+                    k: v
+                    for k, v in (ctx.record.bindings.get(name) or {}).items()
+                    if k != "policy_digest"
+                },
                 "operation": definition.operation or name,
                 "arguments": arguments,
                 "workspace": ctx._workspace_id,
@@ -234,23 +239,30 @@ class EffectManager:
         except CallRefused as exc:
             self._block(ctx, name, key, str(exc))
             raise EffectError("refused", str(exc), effect=name, sent=False) from None
+        # an operator's replay is a new request to the provider: a new generation of the key
+        generation = int(entry.get("generation") or 0)
+        sent_key = key if not generation else f"{key}~g{generation}"
         if created:
-            return _SEND
+            return _SEND, sent_key
         status = entry["status"]
         crossing["earlier"] = status
         if status == "completed" and "result" in entry:  # established by an operator
-            return entry["result"]
+            return entry["result"], sent_key
         if status in ("replay", "failed"):  # allowed once by a person; or definitely not applied
-            await journal.end_call(key, "sent")
-            return _SEND
+            await journal.end_call(key, "sent", generation=generation)
+            return _SEND, sent_key
         can_reconcile = "reconcile" in capabilities_of(provider)
         if status == "indeterminate" and entry.get("clear_by") == "operator":
             reason = f"{name}: the outcome of call {key} is unknown; an operator must resolve it"
             self._block(ctx, name, key, reason)
             raise EffectError("indeterminate", reason, effect=name, sent=False)
         if not can_reconcile:
-            return _SEND  # a deduplicated provider applies a key once: sending it again settles it
-        return await self._reconcile(ctx, provider, definition, name, key, scope, slots, crossing)
+            # a deduplicated provider applies a key once: sending it again settles it
+            return _SEND, sent_key
+        value = await self._reconcile(
+            ctx, provider, definition, name, key, sent_key, scope, slots, crossing
+        )
+        return value, sent_key
 
     async def _reconcile(
         self,
@@ -259,6 +271,7 @@ class EffectManager:
         definition: Any,
         name: str,
         key: str | None,
+        sent_key: str | None,
         scope: dict[str, Any],
         slots: asyncio.Semaphore | None,
         crossing: dict[str, Any],
@@ -267,10 +280,10 @@ class EffectManager:
         journal = self._journal()
         operation = definition.operation or name
         for _ in range(RECONCILE_ROUNDS):
-            context = self._context(ctx, definition, key, scope, 0)
+            context = self._context(ctx, definition, sent_key, scope, 0)
             try:
                 found = await asyncio.wait_for(
-                    provider.reconcile(operation, key, context), definition.policy.timeout
+                    provider.reconcile(operation, sent_key, context), definition.policy.timeout
                 )
             except asyncio.CancelledError:
                 raise
@@ -288,20 +301,27 @@ class EffectManager:
                 await journal.end_call(key, "sent")
                 return _SEND
             if found.status == "running" and found.work is not None:
-                if slots is not None:  # a running execution holds capacity like a new one
+                # a running execution holds capacity like a new one, until it really ended
+                if slots is not None:
                     await slots.acquire()
                 try:
-                    await asyncio.gather(found.work, return_exceptions=True)
-                finally:
-                    if slots is not None:
-                        slots.release()
+                    await asyncio.wait_for(asyncio.shield(found.work), definition.policy.timeout)
+                except TimeoutError:
+                    self._release_when(found.work, slots)
+                    break  # still running past the deadline: unknown for now
+                except asyncio.CancelledError:  # KILL or lease loss while reattached
+                    await self._cancel_remote(provider, operation, sent_key, context)
+                    self._release_when(found.work, slots)
+                    raise
+                if slots is not None:
+                    slots.release()
                 continue
             break
         reason = f"{name}: the outcome of call {key} cannot be established yet"
         if found.reason:
             reason += f" ({found.reason[:200]})"
+        self._block(ctx, name, key, reason)  # first: blocked even if journaling fails
         await journal.end_call(key, "indeterminate", clear_by="reconcile", error=reason)
-        self._block(ctx, name, key, reason)
         raise EffectError("indeterminate", reason, effect=name, sent=False)
 
     async def _unsettled(
@@ -322,9 +342,46 @@ class EffectManager:
         else:
             clear_by = "reconcile" if can_reconcile else "resend"
         reason = f"{name}: outcome unknown ({failure.cls}: {failure.message[:200]})"
+        self._block(ctx, name, key, reason)  # first: blocked even if journaling fails
         await journal.end_call(key, "indeterminate", clear_by=clear_by, error=reason)
-        self._block(ctx, name, key, reason)
         return EffectError("indeterminate", reason, effect=name, code=failure.code)
+
+    async def _cancelled(self, ctx: StepContext, provider: Any, name: str, key: str | None) -> None:
+        """A keyed call cancelled after it was sent (the state's own timeout, KILL, lease loss):
+        it may have been applied. The step is blocked and the call journaled unknown, so a new
+        identity cannot go around it and a later run settles it first."""
+        reason = f"{name}: call {key} was cancelled after it was sent; its outcome is unknown"
+        self._block(ctx, name, key, reason)
+        clear_by = "reconcile" if "reconcile" in capabilities_of(provider) else "resend"
+        with contextlib.suppress(Exception):
+            await asyncio.shield(
+                self._journal().end_call(key, "indeterminate", clear_by=clear_by, error=reason)
+            )
+
+    @staticmethod
+    async def _cancel_remote(provider: Any, operation: str, key: str | None, context: Any) -> None:
+        cancel = getattr(provider, "cancel", None)
+        if cancel is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(cancel(operation, key, context))
+
+    def _release_when(self, work: asyncio.Future[Any], slots: asyncio.Semaphore | None) -> None:
+        """Give a slot back once `work` ended (now, if it already did)."""
+        if slots is None:
+            return
+        if work.done():
+            slots.release()
+            return
+
+        async def wait_then_release() -> None:
+            try:
+                await asyncio.gather(work, return_exceptions=True)
+            finally:
+                slots.release()
+
+        task = asyncio.ensure_future(wait_then_release())
+        self._lingering.add(task)
+        task.add_done_callback(self._lingering.discard)
 
     async def _call(
         self, ctx: StepContext, name: str, arguments: dict[str, Any], key: str | None
@@ -376,18 +433,23 @@ class EffectManager:
             slots = self._slots(definition.provider, provider)
             scope = ctx.scope()
             result: Any = _SEND
+            sent_key = key
             if policy.kind == "deduplicated":
-                result = await self._settle_earlier(
+                result, sent_key = await self._settle_earlier(
                     ctx, provider, definition, name, arguments, key, scope, slots, crossing
                 )
             if result is _SEND:
                 try:
                     result = await self._send(
-                        ctx, provider, definition, name, arguments, key, scope, slots, crossing
+                        ctx, provider, definition, name, arguments, sent_key, scope, slots, crossing
                     )
                 except EffectError as failure:
                     if policy.kind == "deduplicated":
                         raise await self._unsettled(ctx, provider, name, key, failure) from None
+                    raise
+                except asyncio.CancelledError:
+                    if policy.kind == "deduplicated" and crossing.get("attempts"):
+                        await self._cancelled(ctx, provider, name, key)
                     raise
                 if policy.kind == "deduplicated":
                     await self._journal().end_call(key, "completed")

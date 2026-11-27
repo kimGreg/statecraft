@@ -385,9 +385,13 @@ class StateStore:
 
         return await self._txn(body)
 
-    async def end_call(self, key: str, status: str, **detail: Any) -> dict[str, Any]:
+    async def end_call(
+        self, key: str, status: str, *, expected: str | None = None, **detail: Any
+    ) -> dict[str, Any]:
         """Settle or mark a journaled call (`completed`, `failed`, `indeterminate` with
-        `clear_by`, or back to `sent` when a replay starts)."""
+        `clear_by`, or back to `sent` when a replay starts). With `expected`, only if the call
+        is in that state now (`CallRefused` otherwise): an operator's decision never overwrites
+        what a running step settled, nor the other way round."""
         if status not in CALL_STATES:
             raise ValueError(f"call state must be one of {CALL_STATES}, not {status!r}")
         detail = jsonable(detail)
@@ -396,6 +400,8 @@ class StateStore:
             entry = t.call_get(key)
             if entry is None:
                 raise KeyError(key)
+            if expected is not None and entry["status"] != expected:
+                raise CallRefused(f"call {key} is {entry['status']}, not {expected}")
             entry = {k: v for k, v in entry.items() if k not in ("clear_by", "error", "result")}
             entry.update(detail, status=status)
             t.call_put(key, entry["agent"], entry)

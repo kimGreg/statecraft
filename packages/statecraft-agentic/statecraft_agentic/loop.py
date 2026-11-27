@@ -684,7 +684,7 @@ class AgenticAgent(Agent):
             offered = {model_name_of(t): t for t in self.offered(ctx)}
             if name not in offered:
                 return {"error": f"unknown tool {name!r}"}
-            return await ctx.call(offered[name], call_name=identity, **dict(arguments or {}))
+            return await ctx.invoke(offered[name], dict(arguments or {}), call_name=identity)
         except EffectError as exc:  # classified by the runtime: the model decides what next
             return {
                 "error": {

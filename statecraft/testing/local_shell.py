@@ -21,8 +21,12 @@ process that leaves the command's process group, `setsid`, is not ended with it)
     is gone without an exit code: it may have done part of its work);
   * cancelling a call kills the command's whole process group, and the call's work future ends
     only when no process of the group is left: capacity is never returned early;
-  * receipts are kept outside the workspaces (refused otherwise), where no agent and no command
-    can write them.
+  * receipts are kept outside the workspaces (refused otherwise): no agent reaches them through
+    the workspace, and a command does not run in them; an unisolated local shell could still
+    write them, which is why a sandbox backend keeps them outside the sandbox;
+  * a receipt records its process group with the leader's start time and the boot id, so a
+    process group id reused later (another boot, another process) is never taken for the
+    command, nor killed.
 """
 
 from __future__ import annotations
@@ -48,6 +52,22 @@ WRAPPER = (
     'cd "$2" && /bin/sh -c "$3" >"$1/out" 2>"$1/err"; '
     'echo $? >"$1/code.tmp" && mv "$1/code.tmp" "$1/code"'
 )
+
+
+def _boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _start_time(pid: int) -> str:
+    """The process's start time since boot (Linux), "" when it does not exist or is unknown."""
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return ""
+    return stat_line.rsplit(")", 1)[1].split()[19]
 
 
 def _alive(pgid: int) -> bool:
@@ -97,10 +117,23 @@ class LocalShell:
         }
 
     def _pgid(self, folder: Path) -> int | None:
+        """The command's process group, or None when it has none, or it is not ours anymore
+        (recorded in another boot, or its id now leads another process)."""
         try:
-            return int((folder / "pgid").read_text())
+            pgid, started, boot = [*(folder / "pgid").read_text().split(), "", ""][:3]
+            pgid_n = int(pgid)
         except (FileNotFoundError, ValueError):
             return None
+        if boot and boot != _boot_id():
+            return None
+        current = _start_time(pgid_n)
+        if started and current and current != started:
+            return None  # the id leads another process: ours ended (a group id is not reused
+            # while a member of the group lives)
+        return pgid_n
+
+    def _recorded(self, folder: Path) -> bool:
+        return (folder / "pgid").exists()
 
     def _state(self, folder: Path) -> str:
         if not (folder / "started").exists():
@@ -109,11 +142,11 @@ class LocalShell:
             return "completed"
         if (folder / "cancelled").exists():
             return "unknown"
-        pgid = self._pgid(folder)
-        if pgid is None:  # claimed; its process is being started, or the starter died
+        if not self._recorded(folder):  # claimed; its process is being started, or the starter died
             age = time.time() - (folder / "started").stat().st_mtime
             return "running" if age < START_GRACE else "unknown"
-        return "running" if _alive(pgid) else "unknown"
+        pgid = self._pgid(folder)
+        return "running" if pgid is not None and _alive(pgid) else "unknown"
 
     @staticmethod
     def _claim(folder: Path) -> bool:
@@ -125,7 +158,10 @@ class LocalShell:
         return True
 
     async def _ended(self, folder: Path) -> None:
-        """Until the command's process group is gone (its exit code written, or killed)."""
+        """Until the command's process group is gone (its exit code written, or killed); while
+        it is being started, until it is."""
+        while not self._recorded(folder) and self._state(folder) == "running":
+            await asyncio.sleep(POLL)
         pgid = self._pgid(folder)
         child = self._children.get(pgid) if pgid else None
         while pgid is not None and _alive(pgid):
@@ -184,7 +220,9 @@ class LocalShell:
             start_new_session=True,  # its own process group: cancelling ends all of it
         )
         self._children[proc.pid] = proc
-        (folder / "pgid").write_text(str(proc.pid))
+        (folder / "pgid").write_text(f"{proc.pid} {_start_time(proc.pid)} {_boot_id()}")
+        if (folder / "cancelled").exists():  # cancelled while it was being started
+            self._kill(folder)
         return await self._attach(folder, context)
 
     async def _attach(self, folder: Path, context: Any) -> Any:
@@ -215,6 +253,12 @@ class LocalShell:
         if pgid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signal.SIGKILL)
+
+    async def cancel(self, operation: str, key: str, context: Any) -> None:
+        """Stop a command this provider did not start in this process (a reattached one)."""
+        folder = self._folder(key)
+        if folder.exists():
+            self._cancel(folder)
 
     async def reconcile(self, operation: str, key: str, context: Any) -> Reconciled:
         folder = self._folder(key)
