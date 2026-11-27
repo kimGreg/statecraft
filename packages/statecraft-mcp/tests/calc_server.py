@@ -34,6 +34,23 @@ def boom() -> str:
     raise ValueError("boom")
 
 
+@server.tool(annotations=types.ToolAnnotations(readOnlyHint=True))
+async def slow(seconds: float) -> str:
+    """Answers after a while."""
+    import asyncio
+
+    await asyncio.sleep(seconds)
+    return "done"
+
+
+@server.tool()
+def die() -> str:
+    """Ends the server's process (stdio) in the middle of a call."""
+    import os
+
+    os._exit(1)
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["stdio"]:
         server.run("stdio")

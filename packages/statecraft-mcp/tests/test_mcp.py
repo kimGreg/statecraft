@@ -69,7 +69,9 @@ async def test_in_memory_discovery_policies_and_calls() -> None:
     assert policies == {
         "calc.add": "read_only",
         "calc.boom": "read_only",
+        "calc.die": "non_repeatable",
         "calc.send": "non_repeatable",
+        "calc.slow": "read_only",
         "calc.store": "idempotent",
     }
     add = next(t for t in tools if t["name"] == "calc.add")

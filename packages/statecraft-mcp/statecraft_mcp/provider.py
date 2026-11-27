@@ -19,8 +19,19 @@ says so (`deduplicating=[tool, ...]`); otherwise the runtime refuses to start.
 
 Sessions: with `session_header`, each root gets its own connection carrying the root's workspace
 id in that header (the server works in that session); otherwise one connection is shared.
-Failures: a connection that cannot be opened is `unavailable` (not sent); a tool's error result
-is `failed`; anything else during a call is `transient` (it may have been executed).
+Failures: a connection that cannot be opened, or that was already closed when the request was to
+be written, is `unavailable` (not sent); a tool's error result is `failed`; a JSON-RPC error the
+server answered about the request itself (bad parameters, unknown method) is `invalid`, another
+answered error `failed` (an answer: never retried); anything else during a call is `transient`
+(it may have been executed).
+
+Connections: one per session key, opened outside the provider's lock (a slow connect never holds
+up calls on other sessions; callers of the same key wait for one connect); a connection that
+broke (a dead stdio server, a closed stream) is dropped and opened again on the next call; a
+connect that is cancelled or fails leaves nothing running; the least recently used session is
+closed when there are more than `max_sessions`, never while calls on it are in flight. The tool
+list (every page of it) is read at start; a server's list-changed notification applies at the
+next start, when the registry is built again.
 """
 
 from __future__ import annotations
@@ -29,11 +40,35 @@ import asyncio
 import contextlib
 import sys
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 from statecraft import EffectDefinition, EffectError, EffectPolicy
 
 UNANNOTATED = EffectPolicy(kind="non_repeatable")
+#: JSON-RPC errors that say the request itself was wrong (nothing was done)
+INVALID_CODES = (-32700, -32600, -32601, -32602)
+#: the JSON-RPC code the client uses when the connection closed with a request out
+CONNECTION_CLOSED = -32000
+#: errors raised when writing to a connection that is already closed (the request never left)
+NOT_SENT = ("ClosedResourceError", "BrokenResourceError")
+#: errors that mean the connection broke while a request was out (it may have been executed)
+BROKEN = ("EndOfStream", "BrokenPipeError", "ConnectionResetError", "RemoteProtocolError")
+
+
+@dataclass
+class _Session:
+    task: asyncio.Task[None]
+    client: Any
+    closing: asyncio.Event
+    active: int = 0
+    broken: bool = False
+
+    @property
+    def usable(self) -> bool:
+        return not self.broken and not self.task.done()
+
+
 #: Where a call's idempotency key goes (request `_meta`), and where a server declares that a tool
 #: applies each key once (tool `_meta` in the listing).
 KEY_META = "io.statecraft/idempotencyKey"
@@ -71,9 +106,8 @@ class MCPProvider:
         self.deduplicating = set(deduplicating or [])
         self._declared: set[str] = set()  # tools whose server declares deduplication
         self.server_version = ""
-        self._sessions: OrderedDict[str, tuple[asyncio.Task[None], Any, asyncio.Event]] = (
-            OrderedDict()
-        )
+        self._sessions: OrderedDict[str, _Session] = OrderedDict()
+        self._connecting: dict[str, asyncio.Future[None]] = {}
         self._lock = asyncio.Lock()
 
     # ---- connections ------------------------------------------------------------------------
@@ -108,41 +142,107 @@ class MCPProvider:
             if not ready.done():
                 ready.set_exception(exc)
 
-    async def _client(self, session: str | None) -> Any:
+    async def _session(self, session: str | None) -> _Session:
+        """The open connection of a session key, counted as in use (`_release` when done)."""
         key = session if self.session_header else ""
+        while True:
+            async with self._lock:
+                held = self._sessions.get(key)
+                if held is not None and held.usable:
+                    held.active += 1
+                    self._sessions.move_to_end(key)
+                    return held
+                if held is not None:  # broken or ended: drop it, open another
+                    self._drop(key)
+                pending = self._connecting.get(key)
+                mine = pending is None
+                if mine:
+                    pending = asyncio.get_running_loop().create_future()
+                    self._connecting[key] = pending
+            assert pending is not None
+            if not mine:  # someone opens this key's connection: wait for it, then look again
+                try:
+                    await asyncio.shield(pending)
+                except EffectError:
+                    raise
+                except Exception as exc:
+                    raise self._unreachable(exc) from exc
+                continue
+            await self._connect(key, pending)
+
+    async def _connect(self, key: str, pending: asyncio.Future[None]) -> None:
+        ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        closing = asyncio.Event()
+        task = asyncio.create_task(self._hold(key, ready, closing))
+        try:
+            client = await asyncio.wait_for(asyncio.shield(ready), self.timeout)
+        except BaseException as exc:  # cancelled or failed: nothing is left running
+            closing.set()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(task), 1)
+            async with self._lock:
+                self._connecting.pop(key, None)
+            if isinstance(exc, asyncio.CancelledError):
+                if not pending.done():
+                    pending.set_exception(ConnectionError("the connect was cancelled"))
+                    pending.exception()  # retrieved: waiters get it, nobody else must
+                raise
+            failure = self._unreachable(exc)
+            if not pending.done():
+                pending.set_exception(failure)
+                pending.exception()
+            raise failure from exc
         async with self._lock:
-            held = self._sessions.get(key)
-            if held is not None and not held[0].done():
-                self._sessions.move_to_end(key)
-                return held[1]
-            ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-            closing = asyncio.Event()
-            task = asyncio.create_task(self._hold(key, ready, closing))
-            try:
-                client = await asyncio.wait_for(ready, self.timeout)
-            except Exception as exc:
-                closing.set()
-                raise EffectError(
-                    "unavailable",
-                    f"cannot connect: {type(exc).__name__}: {exc}",
-                    effect=self.name,
-                    sent=False,
-                ) from exc
-            self._sessions[key] = (task, client, closing)
-            while len(self._sessions) > self.max_sessions:
-                _old, (_task, _c, old_closing) = self._sessions.popitem(last=False)
-                old_closing.set()
-            return client
+            self._sessions[key] = _Session(task, client, closing)
+            self._connecting.pop(key, None)
+            self._evict()
+        if not pending.done():
+            pending.set_result(None)
+
+    def _unreachable(self, exc: BaseException) -> EffectError:
+        return EffectError(
+            "unavailable",
+            f"cannot connect: {type(exc).__name__}: {exc}",
+            effect=self.name,
+            sent=False,
+        )
+
+    def _drop(self, key: str) -> None:
+        held = self._sessions.pop(key, None)
+        if held is not None:
+            held.closing.set()
+
+    def _evict(self) -> None:
+        """Close the least recently used sessions over `max_sessions`, never one in use."""
+        for key in list(self._sessions):
+            if len(self._sessions) <= self.max_sessions:
+                return
+            if self._sessions[key].active == 0:
+                self._drop(key)
+
+    async def _release(self, held: _Session) -> None:
+        async with self._lock:
+            held.active -= 1
+            if held.broken:
+                held.closing.set()
+            self._evict()
+
+    async def _client(self, session: str | None) -> Any:
+        """A connection for one request that holds no session open (discovery)."""
+        held = await self._session(session)
+        await self._release(held)
+        return held.client
 
     async def start(self) -> None:
         await self._client(None)
 
     async def close(self) -> None:
-        for _task, _client, closing in self._sessions.values():
-            closing.set()
-        for task, _client, _closing in self._sessions.values():
+        for held in self._sessions.values():
+            held.closing.set()
+        for held in self._sessions.values():
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(task, 5)
+                await asyncio.wait_for(held.task, 5)
         self._sessions.clear()
 
     # ---- the provider interface -------------------------------------------------------------
@@ -200,17 +300,21 @@ class MCPProvider:
         return found
 
     async def invoke(self, operation: str, arguments: dict[str, Any], context: Any) -> Any:
-        client = await self._client(getattr(context, "workspace", None))
+        held = await self._session(getattr(context, "workspace", None))
+        effect = f"{self.name}.{operation}"
         try:
             key = getattr(context, "key", None)
             meta = {KEY_META: key} if key else None  # every attempt carries the same key
-            result = await client.call_tool(operation, arguments, meta=meta)
+            result = await held.client.call_tool(operation, arguments, meta=meta)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise EffectError(
-                "transient", f"{type(exc).__name__}: {exc}", effect=f"{self.name}.{operation}"
-            ) from exc
+            failure = self._failure(exc, effect)
+            if failure.cls in ("unavailable", "transient"):
+                held.broken = True  # the connection is not trusted again: the next call reopens
+            raise failure from exc
+        finally:
+            await self._release(held)
         if result.is_error:
             text = " ".join(getattr(c, "text", "") for c in result.content)
             raise EffectError(
@@ -225,6 +329,18 @@ class MCPProvider:
             return structured
         texts = [getattr(c, "text", None) for c in result.content]
         return texts[0] if len(texts) == 1 else texts
+
+    @staticmethod
+    def _failure(exc: BaseException, effect: str) -> EffectError:
+        names = {k.__name__ for k in type(exc).__mro__}
+        message = f"{type(exc).__name__}: {exc}"[:300]
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and code != CONNECTION_CLOSED:  # an answer from the server
+            cls = "invalid" if code in INVALID_CODES else "failed"
+            return EffectError(cls, message, effect=effect, code=str(code))
+        if names & set(NOT_SENT):
+            return EffectError("unavailable", message, effect=effect, sent=False)
+        return EffectError("transient", message, effect=effect)
 
 
 def _wrapped(schema: Any) -> bool:
