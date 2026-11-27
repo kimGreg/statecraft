@@ -88,6 +88,70 @@ class Receipts:
         assign = ", ".join(f"{k} = ?" for k in fields)
         await self._run(f"UPDATE receipts SET {assign} WHERE key = ?", *fields.values(), key)
 
+    async def transition(self, key: str, from_states: tuple[str, ...], **fields: Any) -> bool:
+        """Change a receipt only if it is in one of `from_states` now (compare and set): a
+        settled receipt is never overwritten by a slower writer."""
+        if "result" in fields:
+            fields["result"] = json.dumps(fields["result"])
+        fields["updated"] = time.time()
+        assign = ", ".join(f"{k} = ?" for k in fields)
+        states = ", ".join("?" for _ in from_states)
+        [(count,)] = await self._run(
+            f"UPDATE receipts SET {assign} WHERE key = ? AND state IN ({states})",
+            *fields.values(),
+            key,
+            *from_states,
+        )
+        return count == 1
+
+    async def heartbeat(self, key: str) -> None:
+        """A start in progress is alive (its sandbox is being made, its command submitted)."""
+        await self._run(
+            "UPDATE receipts SET updated = ? WHERE key = ? AND state = 'starting' "
+            "AND execution IS NULL",
+            time.time(),
+            key,
+        )
+
+    async def expire_start(self, key: str, grace: float, reason: str) -> bool:
+        """A start whose starter stopped beating is unknown (it may have submitted)."""
+        [(count,)] = await self._run(
+            "UPDATE receipts SET state = 'unknown', reason = ?, updated = ? WHERE key = ? "
+            "AND state = 'starting' AND execution IS NULL AND updated < ?",
+            reason,
+            time.time(),
+            key,
+            time.time() - grace,
+        )
+        return count == 1
+
+    # ---- sandboxes ----------------------------------------------------------------------------
+    async def claim_creation(self, scope: str, owner: str, stale: float) -> bool:
+        """Claim the creation of a scope's sandbox across processes: one creator; a claim whose
+        creator stopped (older than `stale` seconds) may be taken over."""
+        now = time.time()
+        [(count,)] = await self._run(
+            "UPDATE sandboxes SET state = ?, updated = ? WHERE scope = ? AND sandbox IS NULL "
+            "AND (state = 'creating' OR (state LIKE 'creating:%' AND updated < ?))",
+            f"creating:{owner}",
+            now,
+            scope,
+            now - stale,
+        )
+        return count == 1
+
+    async def replace_sandbox(self, scope: str, old: str, label: str) -> bool:
+        """Forget a dead sandbox of a scope, only if it is still the one recorded."""
+        [(count,)] = await self._run(
+            "UPDATE sandboxes SET sandbox = NULL, label = ?, state = 'creating', updated = ? "
+            "WHERE scope = ? AND sandbox = ?",
+            label,
+            time.time(),
+            scope,
+            old,
+        )
+        return count == 1
+
     # ---- sandboxes ----------------------------------------------------------------------------
     async def sandbox(self, scope: str) -> dict[str, Any] | None:
         rows = await self._run(

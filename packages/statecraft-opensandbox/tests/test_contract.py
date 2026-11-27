@@ -33,6 +33,7 @@ def effect_harness(request, tmp_path: Path) -> EffectHarness:
         receipts=tmp_path / "receipts.db",
         poll=0.02,
         destroy_on_cancel=request.param == "destroy_on_cancel",
+        scope="call" if request.param == "destroy_on_cancel" else "agent",
     )
     provider.bind(View(tmp_path / "ws"))
     shared = tmp_path / "ws" / "w" / "shared"

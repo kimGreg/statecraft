@@ -6,7 +6,8 @@ folders and runs commands with `/bin/sh` in its own process group, in the host f
     lose_records(id)     `execd` restarted: the sandbox's execution records are gone (404)
     lose_create_answer   the next create makes the sandbox, then the answer is lost
 
-No isolation: it is a test double, not a sandbox.
+No isolation: it is a test double, not a sandbox. It records each mount's mode but cannot enforce
+read-only (OpenSandbox does: the integration tests run against it).
 """
 
 from __future__ import annotations
@@ -105,7 +106,9 @@ class FakeBackend:
 
     async def status(self, sandbox: str, execution: str) -> dict[str, Any] | None:
         box = self.sandboxes.get(sandbox)
-        run = None if box is None else box["runs"].get(execution)
+        if box is None:  # as OpenSandbox: no endpoint for a sandbox that is gone
+            raise ConnectionError(f"sandbox {sandbox} is gone")
+        run = box["runs"].get(execution)
         if run is None:
             return None
         proc = run["proc"]

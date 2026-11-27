@@ -1,9 +1,10 @@
 """The shared coding sample: a lead and two workers in one workspace, each in its own sandbox.
 
 What must hold
-  * the lead's spawn is asynchronous: its own command runs while the workers work; it joins them
-    and verifies the modules they wrote, in its sandbox; one sandbox per agent, three in all;
-  * every file is where its owner wrote it, natively and as the sandboxes saw it;
+  * the lead spawns the workers and goes on (its own command runs before it joins them); it
+    verifies, in its sandbox, the modules the workers wrote natively (the check imports them:
+    the sandbox sees the native files); one sandbox per agent, three in all;
+  * every file is where its owner wrote it;
   * a worker whose command's outcome is unknown (its submit answer lost) faults and stays for a
     person; the lead goes on with the other worker and then waits for it; once an operator
     settles the call and CONTs it, the worker finishes without its command being submitted
@@ -61,10 +62,11 @@ async def test_an_unknown_outcome_is_settled_by_an_operator(tmp_path: Path) -> N
         lost = []
 
         async def lose_for_textx(sandbox, command):  # the textx worker's test, once
-            if "textx" in command and not lost:
+            execution = await original(sandbox, command)
+            if "textx" in command and not lost:  # submitted; its answer is lost
                 lost.append(command)
-                backend.lose_submit_answer = True
-            return await original(sandbox, command)
+                raise ConnectionError("the submit answer was lost")
+            return execution
 
         backend.submit = lose_for_textx
         root = await rt.spawn("shared_coding:lead", root_id="team")
