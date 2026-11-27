@@ -1,0 +1,13 @@
+# The plugin package, enabled by name. Install it first: `pip install -e examples/notes_plugin`.
+#   statecraft run notes:digest --config examples/notes_plugin/statecraft.yaml \
+#     --input '{"notes": ["buy milk", "call Ann "]}'
+store: {provider: sqlite, path: .statecraft/notes.db}
+workspace: {provider: local, root: .statecraft/notes}
+runtime: {lease_ttl: 1, beat: 0.2, scan_every: 0.05}
+plugins: [notes, agentic, mcp]
+effect_providers:
+  words:
+    provider: mcp
+    command: python
+    args: [-m, notes_plugin.words_server]
+    trusted: true

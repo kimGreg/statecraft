@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from statecraft.stores import SqliteStore
+from statecraft.providers.stores import SqliteStore
 
 HERE = Path(__file__).parent
 WORKER = HERE / "crash_worker.py"

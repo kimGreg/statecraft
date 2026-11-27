@@ -1,21 +1,23 @@
 [project]
 name = "statecraft"
-version = "0.1.0"
-description = "A durable state machine executor for agents: agents as state machines, a fenced state store, model-driven agents as states"
+version = "0.2.0"
+description = "A durable execution runtime for composable agents: state machines, effects, recovery"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27",
+  "jsonschema>=4.20",
   "pydantic>=2.7,<3",
   "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
-# the decider checks answers against a full JSON Schema (without it: type and enum only)
-schema = ["jsonschema>=4.20"]
-# the web console (`python -m statecraft.console`)
-console = ["starlette>=0.37", "uvicorn>=0.29"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "jsonschema>=4.20", "starlette>=0.37", "uvicorn>=0.29"]
+# the runtime served over HTTP (`statecraft serve`)
+server = ["starlette>=0.37", "uvicorn>=0.29"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "starlette>=0.37", "uvicorn>=0.29"]
+
+[project.scripts]
+statecraft = "statecraft.cli.main:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -24,11 +26,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["statecraft*"]
 
-[tool.setuptools.package-data]
-"statecraft.console" = ["static/*"]
-
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/statecraft-agentic/tests", "packages/statecraft-mcp/tests",
+             "packages/statecraft-console/tests", "examples"]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

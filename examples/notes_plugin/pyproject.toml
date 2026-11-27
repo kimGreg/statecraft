@@ -1,0 +1,19 @@
+[project]
+name = "notes-plugin"
+version = "0.1.0"
+description = "A statecraft plugin package (sample): an agent, a Python tool, an MCP server, a skill"
+requires-python = ">=3.11"
+dependencies = ["statecraft", "statecraft-agentic", "statecraft-mcp"]
+
+[project.entry-points."statecraft.plugins"]
+notes = "notes_plugin.plugin:register"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["notes_plugin*"]
+
+[tool.setuptools.package-data]
+"notes_plugin" = ["skills/*/*.md"]

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from statecraft.process import ChildView, Fault, Record, Transition
-from statecraft.transitions import (
+from statecraft.kernel.process import ChildView, Fault, Record, Transition
+from statecraft.kernel.transitions import (
     InvalidAnswer,
     InvalidTransition,
     apply_answer,

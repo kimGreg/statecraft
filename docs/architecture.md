@@ -4,13 +4,15 @@
 > tools, models and storage; statecraft manages execution, concurrency, persistence,
 > coordination and recovery.
 
-Status: **design.** [design.md](design.md) is the kernel's execution design (records, steps,
-fencing, intents, recovery) and stays authoritative for how a step runs; this document does not
-change it. This document says what surrounds the kernel to make it a product, and fixes the
+Status: **implemented** (statecraft 0.2), except section 18.3's step 8 (remote workers, a
+distributed store, worker isolation, hot reload). [design.md](design.md) is the kernel's
+execution design (records, steps, fencing, intents, recovery) and stays authoritative for how a
+step runs; this document says what surrounds the kernel to make it a product, and fixes the
 contracts between the parts: the SDK an agent is written with, the concurrency rules agents and
 providers must follow, the registries that resolve agents and effects, the providers that
 connect them, the runtime that runs them locally or as a server, and the extensions built on top.
-Section 17 is the product's acceptance checklist; section 18 the migration from today's code.
+Section 17 is the product's acceptance checklist; section 18 the migration from the earlier code;
+section 20 notes where the implementation settles details this design left open.
 
 ## 0. Identity
 
@@ -791,3 +793,18 @@ Each step keeps the kernel's recovery tests green:
 
 Still open: the distributed store (design §14); worker isolation and its protocol; hot reload;
 namespaces and tenants, after the trust boundary.
+
+## 20. Implementation notes
+
+Where the implementation settles details this design left open:
+
+| Topic | As implemented |
+|---|---|
+| layer order | kernel ← sdk ← providers ← runtime ← server, client, cli, testing (`tests/test_layers.py`); the file port (`Files`, `WorkspaceProvider`) lives in `kernel/files.py` so providers need nothing above the sdk; the runtime may construct default providers |
+| derived views | `StateView` stays in `runtime/views.py` (opt-in `Runtime(views=[...])`) |
+| extension services | `registrar.provide(name, obj)` and `ctx.service(name)`: how an extension's agents reach the extension's own objects (the skill catalog); the runtime never reads them |
+| keyed Python tools | a `deduplicated` Python tool that declares an `idempotency_key` parameter receives the call's key; the parameter is not part of its input schema |
+| tool policies | `@tool` requires a policy (no default); MCP tools of an untrusted server, and unannotated ones, are `non_repeatable` until the operator sets a policy |
+| repin | `runtime.repin(agent)` records the current definition and bindings for an instance suspended by a pin change; then CONT |
+| `resume` | `statecraft resume ROOT --config` runs an existing root until quiet (after a crash) |
+| samples | `examples/` (orders, research, assistant, recovery, a plugin package) cover the acceptance checklist; the assistant also runs on a real model when one is configured |

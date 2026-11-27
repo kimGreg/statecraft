@@ -12,12 +12,9 @@ import json
 
 import pytest
 
-from statecraft.agent import Agent, Done, Spawn, Wait, state
-from statecraft.catalog import Catalog
-from statecraft.engine import Engine
-from statecraft.stores import MemoryStore
-from statecraft.views import StateView
-from statecraft.workspace import LocalFiles
+from statecraft.runtime.views import StateView
+from statecraft.sdk.agent import Agent, Done, Spawn, Wait, state
+from statecraft.testing import permissive_runtime
 
 
 class Step(Agent):
@@ -59,15 +56,23 @@ class Chain(Agent):
         return Done
 
 
+class Look(Agent):
+    start = "go"
+
+    @state
+    async def go(self, ctx, data):
+        await ctx.write("progress", await ctx.describe("run1"))
+        return Done
+
+
 @pytest.fixture
-def engine(tmp_path):
-    return Engine(
-        store=MemoryStore(),
-        files=LocalFiles(tmp_path),
-        tools=None,
-        catalog=Catalog({}, extra={"t:chain": (Chain, None), "t:step": (Step, None)}),
-        views=[StateView()],
+async def engine(tmp_path):
+    e = permissive_runtime(
+        {"t:chain": Chain, "t:step": Step, "t:look": Look}, files_root=tmp_path, views=[StateView()]
     )
+    await e.start()
+    yield e
+    await e.close()
 
 
 async def test_a_fork_reads_the_kept_agents_and_runs_the_rest(engine, tmp_path) -> None:
@@ -113,15 +118,6 @@ async def test_an_agent_can_read_another_runs_progress(engine) -> None:
     await engine.spawn("t:chain", {}, root_id="run1")
     await engine.run("run1", scan_every=0.01)
 
-    class Look(Agent):
-        start = "go"
-
-        @state
-        async def go(self, ctx, data):
-            await ctx.write("progress", await ctx.describe("run1"))
-            return Done
-
-    engine.services.catalog.extra["t:look"] = (Look, None)
     await engine.spawn("t:look", {}, root_id="look1")
     await engine.run("look1", scan_every=0.01)
     progress = (await engine.artifact("look1", "progress"))["payload"]

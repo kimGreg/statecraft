@@ -1,0 +1,27 @@
+# The assistant sample: `statecraft run quote --config examples/assistant/statecraft.yaml
+#   --input '{"items": [{"qty": 2, "price": 3.5}, {"qty": 1, "price": 10}]}'`
+store: {provider: sqlite, path: .statecraft/assistant.db}
+workspace: {provider: local, root: .statecraft/assistant}
+plugins: [agentic, mcp, "examples.assistant.agents:register"]
+extensions:
+  agentic:
+    skill_paths: [examples/assistant/skills]
+effect_providers:
+  calc:
+    provider: mcp
+    command: python
+    args: [examples/assistant/calc_server.py]
+    trusted: true
+agents:
+  quote:
+    entry: examples.assistant.agents:Quote
+    input: {type: object, required: [items]}
+    spawns: [assistant, "agentic:decider"]
+    reads: [priced, decision]
+    writes: [quote]
+  assistant:
+    entry: examples.assistant.agents:Assistant
+    tools: [model.default, calc.add, calc.multiply]
+    writes: [priced]
+    extensions:
+      agentic: {model: default, skills: [arithmetic-review], tools: [calc.add, calc.multiply]}

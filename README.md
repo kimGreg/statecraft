@@ -1,34 +1,41 @@
 # statecraft
 
-A durable state machine executor for agents.
+A durable execution runtime for composable agents. Bring your own agents, tools, models and
+storage; statecraft manages execution, concurrency, persistence, coordination and recovery.
 
-Agents are checkpointed state machines. Every state change commits atomically to a state store,
-so a run survives crashes, restarts and deploys: committed steps are never lost, and an
-unfinished state simply runs again. Agents depend on each other only by spawning and joining.
-People answer questions, signals stop and resume agents, and a parent decides what a child's
-fault means. A model-driven agent is a state machine too, one tool call per step.
+Agents are checkpointed state machines. Every step commits atomically to a state store, so a run
+survives crashes, restarts and deploys: committed steps are never lost, and an unfinished state
+simply runs again. Agents depend on each other only by spawning and joining; people answer
+questions; signals stop, continue and end agents; a parent decides what a child's fault means.
 
-- **Small kernel.** The lifecycle rules are pure functions (`transitions.py`); the executor and
-  the store do the rest. No graph DSL, no replay, no hidden call stacks.
-- **Fenced commits.** Leases with epochs: a stale or dead executor can never commit or publish.
-- **Durable control.** Spawns and signals are intents with deterministic ids, carried out exactly
-  once even if the parent dies; questions and answers are records.
-- **Content-addressed artifacts**, published by the step that commits their reference.
-- **Forks and attachments.** A run can reuse an earlier run's results, or work in its workspace.
-- **A console** to see it all: registry, graphs, live runs, questions, workspaces.
-- **Ports, not frameworks.** State store (memory, SQLite), files, tools, model: an application
-  plugs its own.
+- **Small kernel.** Pure lifecycle rules, fenced commits (a stale or dead executor can never
+  commit), durable intents carried out exactly once. No model, prompt or skill inside.
+- **Tools with a contract.** Every external call goes through one effect manager: permission,
+  schemas, deadlines, a declared retry policy (`read_only`, `idempotent`, `deduplicated`,
+  `non_repeatable`), classified failures, and a record of the call in the step's history.
+- **Concurrency.** Agents run in parallel within slots; a waiting agent holds none; tool calls run
+  in parallel inside a state; blocking and CPU-heavy tools run in threads or processes; KILL and
+  a lost lease cancel what is in flight.
+- **Registries.** Agents and tools register by Python API, configuration or installed plugins;
+  each instance pins the code and tool contracts it started with.
+- **Embedded or served.** One `Runtime` API in your process, or `statecraft serve` over HTTP with
+  a client and a CLI; same semantics.
+- **Extensions.** `statecraft-agentic` (model-driven agents as state machines, models as tools,
+  skills), `statecraft-mcp` (MCP servers as tool providers), `statecraft-console` (the
+  visualizer).
 
 Design: [docs/design.md](docs/design.md) (how a step runs) and
-[docs/architecture.md](docs/architecture.md) (resources, layers, providers, add-ons).
+[docs/architecture.md](docs/architecture.md) (what surrounds it).
 
 ## Quick start
 
 ```python
-from statecraft import Agent, Catalog, Done, Engine, Spawn, Wait, state
-from statecraft.stores import SqliteStore
-from statecraft.testing import MemoryTools
-from statecraft.workspace import LocalFiles
+from statecraft import Agent, Done, Runtime, Spawn, Wait, state, tool
+
+
+@tool(name="math.add", policy="read_only")
+async def add(a: float, b: float) -> float:
+    return a + b
 
 
 class Add(Agent):
@@ -36,8 +43,9 @@ class Add(Agent):
 
     @state
     async def add(self, ctx, data):
-        result = await ctx.call("math.add", a=ctx.input["a"], b=ctx.input["b"])
-        await ctx.write("sum", {"value": result["sum"]})
+        await ctx.write(
+            "sum", {"value": await ctx.call("math.add", a=ctx.input["a"], b=ctx.input["b"])}
+        )
         return Done
 
 
@@ -46,8 +54,9 @@ class Total(Agent):
 
     @state
     async def split(self, ctx, data):
-        children = {"left": ("calc:add", {"a": 1, "b": 2}), "right": ("calc:add", {"a": 3, "b": 4})}
-        return Spawn(children, then="wait")
+        return Spawn(
+            {"left": ("add", {"a": 1, "b": 2}), "right": ("add", {"a": 3, "b": 4})}, then="wait"
+        )
 
     @state
     async def wait(self, ctx, data):
@@ -57,13 +66,14 @@ class Total(Agent):
     async def ask(self, ctx, data):
         for name in ("left", "right"):
             data[name] = (await ctx.read("sum", by=name)).payload["value"]
-        question = {
-            "name": "scale",
-            "question": "Multiply the total by?",
-            "schema": {"type": "integer"},
-            "default": 1,
-        }
-        return Wait(answer=question, then="finish")
+        return Wait(
+            answer={
+                "name": "scale",
+                "question": "Multiply the total by?",
+                "schema": {"type": "integer"},
+            },
+            then="finish",
+        )
 
     @state
     async def finish(self, ctx, data):
@@ -71,64 +81,70 @@ class Total(Agent):
         return Done
 
 
-engine = Engine(
-    store=SqliteStore("state.db"),
-    files=LocalFiles("workspaces"),
-    tools=MemoryTools(handlers={"math.add": lambda a: {"sum": a["a"] + a["b"]}}),
-    catalog=Catalog({}, extra={"calc:add": (Add, None), "calc:total": (Total, None)}),
-)
-root = await engine.spawn("calc:total")
-await engine.run(root)  # until a person must answer
-[question] = await engine.questions(root)
-await engine.answer(question["question_id"], 10)
-await engine.run(root)
-(await engine.artifact(root, "total"))["payload"]  # {"value": 100}
+runtime = Runtime.local("./statecraft-data", executors=0)
+runtime.registrar.tools.register(add)
+runtime.registrar.agents.register("add", Add, tools=["math.add"])
+runtime.registrar.agents.register("total", Total, spawns=["add"])
+async with runtime:
+    root = await runtime.spawn("total")
+    await runtime.run(root)  # until a person must answer
+    [question] = await runtime.questions(root)
+    await runtime.answer(question["question_id"], 10)
+    await runtime.run(root)
+    (await runtime.artifact(root, "total"))["payload"]  # {"value": 100}
 ```
 
 The full script is [examples/quickstart.py](examples/quickstart.py). Kill it at any point and run
-it again on the same `state.db`: it continues from the last committed step.
+it again on the same folder: it continues from the last committed step.
 
-## Console
+## Configuration, server, CLI
 
-A web console over any engine: the registry (every agent's declarations and state machine),
-the graph of spawns, tool servers and artifact flow, the tool servers, and every run, live: its
-tree, each agent's state, data, model conversation and path of states, its open questions (answer
-them there), signals, events and workspace files.
-
-```bash
-pip install "statecraft[console]"
-python -m statecraft.console --engine my_app.engines:make --port 8790
+```yaml
+# statecraft.yaml
+store: {provider: sqlite, path: ./statecraft.db}
+workspace: {provider: local, root: ./workspaces}
+runtime: {concurrency: 16, executors: 1}
+plugins: [agentic, mcp, my-package]          # installed plugins are enabled by name
+effect_providers:
+  python: {provider: python, module: my_package.tools}
+  search: {provider: mcp, url: http://localhost:8001/mcp, policies: {query: read_only}}
+agents:
+  report: {entry: my_package.agents:Report, tools: [search.query], writes: [report]}
 ```
 
-`--engine` names a function that returns an `Engine` (or `(engine, servers)`, where `servers` is
-an async function listing the application's live tool servers). In code:
-`statecraft.console.console_app(engine)` is an ASGI app. Executors run elsewhere on the same
-store, or beside the console with `--executors N`.
+```bash
+statecraft serve --config statecraft.yaml            # HTTP API with server-sent events
+statecraft run report --config statecraft.yaml --input '{"topic": "robots"}'
+statecraft resume ROOT --config statecraft.yaml      # continue a root after a crash
+statecraft ps | inspect ID | signal ID STOP | answer QUESTION VALUE (--config F | --url U)
+python -m statecraft_console --config statecraft.yaml  # the visualizer
+```
 
-## Pieces
+A plugin is a package that declares `register(registrar)` under the `statecraft.plugins` entry
+point; see [examples/notes_plugin](examples/notes_plugin).
 
-| Piece | Where |
+## Samples
+
+[examples/](examples/README.md): orders (tool policies, people, faults), research (parallel
+work, CPU in processes), assistant (an agentic agent on MCP tools with a skill and a decider;
+scripted or a real model), recovery (a killed process resumes), and a plugin package.
+
+## Packages
+
+| Package | What |
 |---|---|
-| The record, the lease, a step's outcome (data only) | `process.py` |
-| The pure lifecycle rules: transitions, faults, signals, answers, waits, intents | `transitions.py` |
-| `Agent`, `@state`, `Spawn`, `Wait`, `Done` | `agent.py` |
-| `AgenticAgent` (a model loop as states), the `Model` port, the decider | `agentic.py` |
-| The `StateStore` contract (fencing, atomic commits, history, events); memory and SQLite | `store.py`, `stores/` |
-| The files port (`LocalFiles`, per-root scoping) | `workspace.py` |
-| Agents and skills as data (`agent.yaml`, `SKILL.md`), the catalog | `spec.py`, `catalog.py` |
-| `ctx`, the executor loop, the engine (spawn, signal, answer, events, run, fork, attach) | `context.py`, `executor.py`, `engine.py` |
-| The artifact envelope; views and the cumulative state | `artifacts.py`, `views.py` |
-| Tools answered by plain functions, for tests | `testing.py` |
-| The web console (optional extra) | `console/` |
+| `statecraft` | kernel, sdk, runtime, providers (memory, SQLite, local workspace, Python tools), server, client, CLI, testing |
+| `statecraft-agentic` (`packages/`) | `AgenticAgent`, model tools, skills, decider, skill agent, sequence and fan-out |
+| `statecraft-mcp` (`packages/`) | MCP servers (HTTP, stdio, in memory) as tool providers |
+| `statecraft-console` (`packages/`) | the web console over the runtime API |
 
 ## Develop
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q tests
+python -m pip install -e ".[dev]" -e packages/statecraft-agentic -e packages/statecraft-mcp \
+  -e packages/statecraft-console -e examples/notes_plugin
+python -m pytest -q
 ```
 
-The tests need no server and no model key: crash recovery is tested by killing a worker process
-with `SIGKILL` at each boundary and recovering from the SQLite file alone.
-
-Rules for working here: [AGENTS.md](AGENTS.md).
+The tests need no server and no model key: crash recovery is tested by killing processes with
+`SIGKILL` and recovering from the SQLite file alone. Rules for working here: [AGENTS.md](AGENTS.md).

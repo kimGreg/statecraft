@@ -1,0 +1,11 @@
+# Run, kill it while `transform` runs, resume:
+#   statecraft run pipeline --config examples/recovery/statecraft.yaml --root p1 \
+#     --input '{"slow": true}'      # Ctrl-C or kill -9 during transform
+#   statecraft resume p1 --config examples/recovery/statecraft.yaml
+store: {provider: sqlite, path: .statecraft/recovery.db}
+workspace: {provider: local, root: .statecraft/recovery}
+runtime: {lease_ttl: 1, beat: 0.2, scan_every: 0.05}
+agents:
+  pipeline:
+    entry: examples.recovery.agents:Pipeline
+    writes: [result]

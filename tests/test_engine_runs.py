@@ -14,11 +14,10 @@ from typing import Any
 
 import pytest
 
-from statecraft.agent import Agent, ChildFailed, Done, Spawn, Wait, state
-from statecraft.catalog import Catalog
-from statecraft.engine import Engine
-from statecraft.stores import MemoryStore, SqliteStore
-from statecraft.workspace import LocalFiles
+from statecraft.kernel.executor import Executor
+from statecraft.providers.stores import MemoryStore, SqliteStore
+from statecraft.sdk.agent import Agent, ChildFailed, Done, Spawn, Wait, state
+from statecraft.testing import permissive_runtime as make_runtime
 
 FLAKY: dict[str, int] = {}
 
@@ -133,24 +132,22 @@ class Parent(Agent):
         return Done
 
 
-CATALOG = {
-    "t:square": (Square, None),
-    "t:sum": (Sum, None),
-    "t:sleeper": (Sleeper, None),
-    "t:parent": (Parent, None),
-}
+CATALOG = {"t:square": Square, "t:sum": Sum, "t:sleeper": Sleeper, "t:parent": Parent}
 
 
 @pytest.fixture(params=["memory", "sqlite"])
-def engine(request, tmp_path):
+async def engine(request, tmp_path):
     FLAKY.clear()
     store = MemoryStore() if request.param == "memory" else SqliteStore(tmp_path / "s.db")
-    return Engine(
+    runtime = make_runtime(
+        CATALOG,
+        tools={"math.square": (lambda a: {"value": a["n"] ** 2}, "read_only")},
         store=store,
-        files=LocalFiles(tmp_path / "ws"),
-        tools=Tools(),
-        catalog=Catalog({}, extra=dict(CATALOG)),
+        files_root=tmp_path / "ws",
     )
+    await runtime.start()
+    yield runtime
+    await runtime.close()
 
 
 async def test_children_run_and_the_parent_reads_their_published_artifacts(engine) -> None:
@@ -158,7 +155,7 @@ async def test_children_run_and_the_parent_reads_their_published_artifacts(engin
     table = await engine.run(root, timeout=10, scan_every=0.01)
     assert {r["id"]: r["view"] for r in table}[root] == "succeeded"
     assert (await engine.artifact(root, "total"))["payload"]["value"] == 14
-    files = await engine.workspace(root).list("home")
+    files = await engine.files(root, "home")
     assert any("/objects/" in f for f in files)
 
 
@@ -199,9 +196,9 @@ async def until(check, seconds: float = 20.0) -> None:
 
 async def test_stop_holds_an_agent_and_term_runs_on_term_and_ends_children(engine) -> None:
     root = await engine.spawn("t:parent")
-    executor = engine.executor(scan_every=0.01)
+    executor = Executor(engine, scan_every=0.01)
     stop = asyncio.Event()
-    task = asyncio.create_task(executor.run(stop))
+    task = asyncio.create_task(executor.run(stop, engine.wakeup))
     child = f"{root}/nap"
 
     async def stepped(n: int) -> bool:
@@ -212,7 +209,7 @@ async def test_stop_holds_an_agent_and_term_runs_on_term_and_ends_children(engin
         # stopped, and no step in flight: a step running when STOP came has committed
         record = await engine.store.load(child)
         lease = await engine.store.lease(child)
-        busy = lease is not None and lease.valid(engine.services.clock())
+        busy = lease is not None and lease.valid(engine.clock())
         return record.reason("stopped") is not None and not busy
 
     async def ended() -> bool:
@@ -232,7 +229,7 @@ async def test_stop_holds_an_agent_and_term_runs_on_term_and_ends_children(engin
     await task
     assert (await engine.store.load(root)).status == "terminated"
     assert (await engine.store.load(child)).status == "terminated"
-    cleaned = [f for f in await engine.workspace(root).list("shared") if "cleaned" in f]
+    cleaned = [f for f in await engine.files(root, "shared") if "cleaned" in f]
     assert len(cleaned) == 1 and "_cleanup_" in cleaned[0]
 
 

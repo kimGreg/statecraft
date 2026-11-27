@@ -166,7 +166,7 @@ class ClaimCheck(Agent):
         return Spawn(
             {
                 "verdict": (
-                    "core:decider",
+                    "agentic:decider",
                     {
                         "question": question_of(data["facts"]),
                         "schema": {"enum": ["true", "false"]},
@@ -388,7 +388,7 @@ record through faults, crashes and retries of that state, and is consumed when t
 - A state asks with a business **name**; the engine makes the **id**:
   `<agent id>/<step>/question/<name>`. A retry of the same state gets the same id; a later question
   (a later step) gets a new one, so an old answer is never reused for a new question.
-- `engine.answer(question_id, answer)` is checked atomically: the question is open on that agent,
+- `runtime.answer(question_id, answer)` is checked atomically: the question is open on that agent,
   not answered yet, and the answer matches its schema. A second answer is refused.
 - Timeouts: an answer wait may carry a deadline, then it clears with the question's default and
   `by: "timeout"`.
@@ -453,19 +453,19 @@ A **decision agent** (`decider`) is an `AgenticAgent` whose input is a question
 ### Interface for applications (non-blocking)
 
 ```python
-root = await engine.spawn("research:report", input={...})  # a new root and workspace
-await engine.signal(agent_id, "STOP" | "CONT" | "TERM" | "KILL" | ("USR", message))
-await engine.answer(question_id, answer)
-async for event in engine.events(root, since=seq):
+root = await runtime.spawn("research:report", input={...})  # a new root and workspace
+await runtime.signal(agent_id, "STOP" | "CONT" | "TERM" | "KILL" | ("USR", message))
+await runtime.answer(question_id, answer)
+async for event in runtime.events(root, since=seq):
     ...
 ```
 
-A root may be **attached** to another root's workspace (`engine.spawn(ref, input,
+A root may be **attached** to another root's workspace (`runtime.spawn(ref, input,
 workspace=<root>)`): its tools and files work in that session, so a conversation about a finished
 run reads the run's files and views; its own objects stay under its home, its input is written
 beside the run's, and it never rewrites the run's views.
 
-A root may be a **fork** (`engine.spawn(ref, input, inherit={"root": <run>, "agents": [...]})`):
+A root may be a **fork** (`runtime.spawn(ref, input, inherit={"root": <run>, "agents": [...]})`):
 it reads the earlier run's publications of the kept agents as its own (`ctx.read`, the cumulative
 state, the views), unless it runs an agent of that name itself; nothing is copied and the earlier
 run is left as it was. `ctx.describe(root)` reads another run's progress (status, the agents that
@@ -564,7 +564,7 @@ renew the leases of running steps
 - **Diagnostic events** (`tool.called`, `tool.returned`, `model.turn`) are emitted while a step runs
   and may be lost if the step does not commit; a committed step's turns and tool calls are also in
   its durable history (for `AgenticAgent`, in its history `data`).
-- `engine.events(root, since=seq)` subscribes to the live channel first, then reads the log after
+- `runtime.events(root, since=seq)` subscribes to the live channel first, then reads the log after
   `seq`, and on every notification reads the log again after the last sequence it delivered; the
   notification's payload is never trusted. Nothing falls between the read and the subscription.
   SSE is a notification path, not the source of truth. Delivery is at-least-once; consumers
@@ -578,7 +578,7 @@ renew the leases of running steps
 | `Files` (workspace) | a local folder, scoped per root | any store with `get`, `put`, `create` (a remote file service, object storage) |
 | `Tools` | `testing.MemoryTools` (plain functions) | anything with `async call(server, tool, arguments)`: in-process servers, MCP over HTTP |
 | `Model` | an OpenAI-compatible chat client (OpenRouter, vLLM); a scripted model for tests | any object with `complete(messages, tools)`, a wrapper that filters what is sent |
-| events | `engine.events(root, since)` from the durable log | a push channel (SSE) over it |
+| events | `runtime.events(root, since)` from the durable log | a push channel (SSE) over it |
 | envelope, state, views | `Artifact`, `agents_state`, `StateView` | its own envelope class, cumulative state and views |
 
 The engine imports no web framework, broker or model SDK beyond the chat client; a test enforces
@@ -586,27 +586,20 @@ it. A web deployment is a small HTTP gateway (control calls, events out) and exe
 
 ### Module layout
 
+The code is laid out in layers (see [architecture.md](architecture.md)):
+
 ```
 statecraft/
-  process.py      the record, lease, transition and fault (data only)
-  transitions.py  the pure lifecycle rules
-  agent.py        Agent, @state, Spawn, Wait, Done, running one state
-  store.py        the StateStore contract: fencing and atomicity over an adapter's tables
-  stores/         memory.py, sqlite.py
-  workspace.py    the Files port, LocalFiles, per-root scoping
-  catalog.py      feature packages -> agent specs and classes
-  spec.py         agent.yaml and SKILL.md as data
-  artifacts.py    the artifact envelope
-  views.py        views and the default cumulative state
-  testing.py      tools answered by plain functions
-  context.py      ctx for one step
-  executor.py     the loop
-  engine.py       spawn, signal, answer, events, run
-  agentic.py      AgenticAgent, the Model port, the decider
+  kernel/      process.py transitions.py store.py executor.py effects.py files.py
+  sdk/         agent.py (Agent, @state, Spawn, Wait, Done) context.py effect.py contracts.py
+  providers/   stores/ (memory, sqlite), workspaces.py, python_effects.py
+  runtime/     runtime.py registry.py effects.py context.py workspace.py config.py plugins.py
+  server/ client/ cli/ testing/
 ```
 
-`transitions.py` and `process.py` hold the pure rules; `executor.py` runs steps; `store.py` defines
-the contract.
+`kernel/transitions.py` and `kernel/process.py` hold the pure rules; `kernel/executor.py` runs
+steps; `kernel/store.py` defines the contract. The model loop (`AgenticAgent`) is the
+`statecraft-agentic` extension.
 
 ## 11. Workspace layout (logical)
 
@@ -631,7 +624,7 @@ the contract.
 
 ## 12. Advanced recovery (planned)
 
-**Setting an agent back** (`engine.set_state(agent, history_entry)`) restores an earlier execution
+**Setting an agent back** (`runtime.set_state(agent, history_entry)`) restores an earlier execution
 context, not the world: it starts a new **lineage** (part of every key and id from then on);
 children spawned after that point are terminated, and their names may be spawned again in the new
 lineage; artifacts published after it are marked stale in the index.

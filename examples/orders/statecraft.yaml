@@ -1,0 +1,21 @@
+# The orders sample, standalone: `statecraft run order --config examples/orders/statecraft.yaml
+#   --input '{"order_id": "o1", "item": "lamp", "qty": 2, "amount": 30, "address": "1 Main St"}'`
+store: {provider: sqlite, path: .statecraft/orders.db}
+workspace: {provider: local, root: .statecraft/orders}
+runtime: {concurrency: 8}
+effect_providers:
+  python: {provider: python, module: examples.orders.tools}
+agents:
+  order:
+    entry: examples.orders.agents:Order
+    input:
+      type: object
+      required: [order_id, item, qty, amount, address]
+    tools: [inventory.check, payments.charge, notify.send]
+    spawns: [shipping]
+    reads: [label]
+    writes: [receipt]
+  shipping:
+    entry: examples.orders.agents:Shipping
+    tools: [shipping.label]
+    writes: [label]

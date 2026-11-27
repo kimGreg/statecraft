@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import pytest
 
-from statecraft.process import Fault, Record, Transition
-from statecraft.store import Busy, Conflict, Fenced
-from statecraft.stores import MemoryStore, SqliteStore
-from statecraft.transitions import apply_signal
+from statecraft.kernel.process import Fault, Record, Transition
+from statecraft.kernel.store import Busy, Conflict, Fenced
+from statecraft.kernel.transitions import apply_signal
+from statecraft.providers.stores import MemoryStore, SqliteStore
 
 
 @pytest.fixture(params=["memory", "sqlite"])

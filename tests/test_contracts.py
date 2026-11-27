@@ -9,11 +9,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from statecraft.agent import Agent, Done, state
-from statecraft.catalog import Catalog
-from statecraft.engine import Engine
-from statecraft.stores import MemoryStore
-from statecraft.workspace import LocalFiles
+from statecraft.runtime.runtime import Runtime
+from statecraft.sdk.agent import Agent, Done, state
+from statecraft.testing import permissive_runtime
 
 
 class Contracts:
@@ -30,18 +28,13 @@ class Writer(Agent):
         return Done
 
 
-def engine(tmp_path, contracts: Any) -> Engine:
-    return Engine(
-        store=MemoryStore(),
-        files=LocalFiles(tmp_path),
-        tools=None,
-        catalog=Catalog({}, extra={"t:writer": (Writer, None)}),
-        contracts=contracts,
-    )
+async def engine(tmp_path, contracts: Any) -> Runtime:
+    e = permissive_runtime({"t:writer": Writer}, files_root=tmp_path, contracts=contracts)
+    return await e.start()
 
 
 async def test_a_broken_payload_is_refused_and_not_published(tmp_path) -> None:
-    e = engine(tmp_path, Contracts())
+    e = await engine(tmp_path, Contracts())
     root = await e.spawn("t:writer", {"other": 1})
     [row] = await e.run(root, scan_every=0.01)
     assert row["view"] == "suspended" and "count is required" in row["error"]
@@ -49,7 +42,7 @@ async def test_a_broken_payload_is_refused_and_not_published(tmp_path) -> None:
 
 
 async def test_a_payload_that_meets_it_is_published(tmp_path) -> None:
-    e = engine(tmp_path, Contracts())
+    e = await engine(tmp_path, Contracts())
     root = await e.spawn("t:writer", {"count": 2})
     [row] = await e.run(root, scan_every=0.01)
     assert row["view"] == "succeeded"
@@ -57,7 +50,7 @@ async def test_a_payload_that_meets_it_is_published(tmp_path) -> None:
 
 
 async def test_without_contracts_nothing_is_checked(tmp_path) -> None:
-    e = engine(tmp_path, None)
+    e = await engine(tmp_path, None)
     root = await e.spawn("t:writer", {"other": 1})
     [row] = await e.run(root, scan_every=0.01)
     assert row["view"] == "succeeded"

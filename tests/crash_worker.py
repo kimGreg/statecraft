@@ -11,18 +11,12 @@ import os
 import sys
 from typing import Any
 
-from statecraft.agent import Agent, Done, Spawn, Wait, state
-from statecraft.catalog import Catalog
-from statecraft.engine import Engine
-from statecraft.stores import SqliteStore
-from statecraft.workspace import LocalFiles
+from statecraft.providers.stores import SqliteStore
+from statecraft.runtime.runtime import Runtime
+from statecraft.sdk.agent import Agent, Done, Spawn, Wait, state
+from statecraft.testing import permissive_runtime
 
 ROOT = "crashroot"
-
-
-class NoTools:
-    async def call(self, server: str, tool: str, arguments: dict[str, Any]) -> Any:
-        raise KeyError(tool)
 
 
 class Leaf(Agent):
@@ -64,19 +58,14 @@ class Chain(Agent):
         return Done
 
 
-CATALOG = {"t:chain": (Chain, None), "t:leaf": (Leaf, None)}
+CATALOG = {"t:chain": Chain, "t:leaf": Leaf}
 
 
-def make_engine(db: str, workspace: str) -> Engine:
-    return Engine(
-        store=SqliteStore(db),
-        files=LocalFiles(workspace),
-        tools=NoTools(),
-        catalog=Catalog({}, extra=dict(CATALOG)),
-    )
+def make_engine(db: str, workspace: str) -> Runtime:
+    return permissive_runtime(CATALOG, store=SqliteStore(db), files_root=workspace)
 
 
-def arm(engine: Engine, point: str) -> None:
+def arm(engine: Runtime, point: str) -> None:
     """Make the store die at a crash point: `<method>:<before|after>:<nth call>`."""
     method, when, nth = point.split(":")
     store = engine.store
@@ -97,6 +86,7 @@ def arm(engine: Engine, point: str) -> None:
 
 async def main(db: str, workspace: str, point: str, spawn: bool, slow: bool) -> None:
     engine = make_engine(db, workspace)
+    await engine.start()
     if spawn:
         await engine.spawn("t:chain", {"slow": slow}, root_id=ROOT)
     if point != "-":

@@ -1,0 +1,16 @@
+store: {provider: sqlite, path: .statecraft/research.db}
+workspace: {provider: local, root: .statecraft/research}
+runtime: {concurrency: 4}
+effect_providers:
+  python: {provider: python, module: examples.research.tools}
+agents:
+  research:
+    entry: examples.research.agents:Research
+    input: {type: object, required: [topics]}
+    spawns: [searcher]
+    reads: [findings]
+    writes: [report]
+  searcher:
+    entry: examples.research.agents:Searcher
+    tools: [search.web, search.papers, text.rank]
+    writes: [findings]
