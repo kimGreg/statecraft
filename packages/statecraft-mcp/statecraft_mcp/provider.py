@@ -10,6 +10,13 @@ policy is **proposed** from the tool's annotations only when the provider is `tr
 tools, it is `non_repeatable` (refused) until the operator sets one (`policies` in the
 configuration). Annotations are hints, not guarantees.
 
+Idempotency (deduplicated tools): every attempt of a call carries the call's idempotency key in
+the request's `_meta` under `io.statecraft/idempotencyKey` (the same key on retries and on a
+rerun of the state). Sending a key is not deduplication: a server must apply each key once and
+return the first result again. A tool may be `deduplicated` only when its server declares that
+for it (the tool's `_meta` `io.statecraft/deduplicates: true` in the listing) or the operator
+says so (`deduplicating=[tool, ...]`); otherwise the runtime refuses to start.
+
 Sessions: with `session_header`, each root gets its own connection carrying the root's workspace
 id in that header (the server works in that session); otherwise one connection is shared.
 Failures: a connection that cannot be opened is `unavailable` (not sent); a tool's error result
@@ -27,6 +34,10 @@ from typing import Any
 from statecraft import EffectDefinition, EffectError, EffectPolicy
 
 UNANNOTATED = EffectPolicy(kind="non_repeatable")
+#: Where a call's idempotency key goes (request `_meta`), and where a server declares that a tool
+#: applies each key once (tool `_meta` in the listing).
+KEY_META = "io.statecraft/idempotencyKey"
+DEDUP_META = "io.statecraft/deduplicates"
 
 
 class MCPProvider:
@@ -44,6 +55,7 @@ class MCPProvider:
         concurrency: int | None = None,
         timeout: float = 30,
         max_sessions: int = 64,
+        deduplicating: list[str] | None = None,
     ) -> None:
         if sum(x is not None for x in (url, command, server)) != 1:
             raise ValueError("an MCP provider has exactly one of url, command, server")
@@ -55,6 +67,9 @@ class MCPProvider:
         self.concurrency = concurrency
         self.timeout = timeout
         self.max_sessions = max_sessions
+        #: tools the operator vouches apply each idempotency key once (besides declared ones)
+        self.deduplicating = set(deduplicating or [])
+        self._declared: set[str] = set()  # tools whose server declares deduplication
         self.server_version = ""
         self._sessions: OrderedDict[str, tuple[asyncio.Task[None], Any, asyncio.Event]] = (
             OrderedDict()
@@ -131,7 +146,24 @@ class MCPProvider:
         self._sessions.clear()
 
     # ---- the provider interface -------------------------------------------------------------
-    def _policy(self, annotations: Any) -> EffectPolicy:
+    def deduplicates(self, operation: str) -> bool:
+        """Whether a key sent with a call of this tool is applied once by its server."""
+        return operation in self._declared or operation in self.deduplicating
+
+    def policy_problem(self, definition: EffectDefinition) -> str | None:
+        """Why the tool's policy cannot hold with this server, or None (checked at start)."""
+        operation = definition.operation or definition.name
+        if definition.policy.kind == "deduplicated" and not self.deduplicates(operation):
+            return (
+                f"tool {definition.name} is deduplicated, but its server does not declare that it "
+                f"applies an idempotency key once ({DEDUP_META} in the tool's _meta) and the "
+                "operator did not vouch for it (deduplicating=[...]): keys alone do not deduplicate"
+            )
+        return None
+
+    def _policy(self, annotations: Any, declared: bool = False) -> EffectPolicy:
+        if self.trusted and declared:
+            return EffectPolicy(kind="deduplicated", timeout=self.timeout)
         if not self.trusted or annotations is None:
             return UNANNOTATED
         if getattr(annotations, "read_only_hint", None):
@@ -147,6 +179,9 @@ class MCPProvider:
         self.server_version = str(getattr(info, "version", "") or "") if info else ""
         found = []
         for tool in listed.tools:
+            declared = bool((tool.meta or {}).get(DEDUP_META))
+            if declared:
+                self._declared.add(tool.name)
             output = tool.output_schema
             if _wrapped(output):
                 output = output["properties"]["result"]
@@ -156,7 +191,7 @@ class MCPProvider:
                     description=tool.description or "",
                     input_schema=tool.input_schema or {"type": "object"},
                     output_schema=output,
-                    policy=self._policy(tool.annotations),
+                    policy=self._policy(tool.annotations, declared),
                     provider=self.name,
                     operation=tool.name,
                     version=self.server_version,
@@ -167,7 +202,9 @@ class MCPProvider:
     async def invoke(self, operation: str, arguments: dict[str, Any], context: Any) -> Any:
         client = await self._client(getattr(context, "workspace", None))
         try:
-            result = await client.call_tool(operation, arguments)
+            key = getattr(context, "key", None)
+            meta = {KEY_META: key} if key else None  # every attempt carries the same key
+            result = await client.call_tool(operation, arguments, meta=meta)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

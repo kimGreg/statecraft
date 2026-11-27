@@ -287,6 +287,11 @@ class Registry:
         for name, effect in self.effects.items():
             if effect.provider not in self.providers:
                 errors.append(f"tool {name}: provider {effect.provider!r} is not registered")
+                continue
+            check = getattr(self.providers[effect.provider], "policy_problem", None)
+            problem = check(effect) if check is not None else None
+            if problem:  # the provider cannot keep this policy (e.g. no deduplication)
+                errors.append(problem)
         return sorted(set(errors)), sorted(set(warnings))
 
     def lint(self) -> list[str]:
