@@ -186,14 +186,14 @@ async def run_state(agent: type, record: Record, ctx: Any) -> Transition | Fault
     crossings. An `Agent` dispatches to its `@state` method; any other `ExecutableAgent` gets
     `step(state, ctx, data)`."""
     data = copy.deepcopy(record.data)
-    if isinstance(agent, type) and issubclass(agent, Agent):
-        handler = agent.agent_states().get(record.state)
-        if handler is None:
-            return Fault(f"{agent.__name__} has no state {record.state!r}")
-        call = handler(agent(), ctx, data)
-    else:
-        call = agent().step(record.state, ctx, data)
-    try:
+    try:  # constructing the agent is part of the state: its errors are the state's fault
+        if isinstance(agent, type) and issubclass(agent, Agent):
+            handler = agent.agent_states().get(record.state)
+            if handler is None:
+                return Fault(f"{agent.__name__} has no state {record.state!r}")
+            call = handler(agent(), ctx, data)
+        else:
+            call = agent().step(record.state, ctx, data)
         result = await call
         return to_transition(agent, result, data, ctx.effects)
     except Exception as exc:

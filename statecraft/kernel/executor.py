@@ -14,6 +14,17 @@ its lease is lost (renewal fails) or it is killed: it then commits nothing. `sto
 steps finish for `drain` seconds, then cancels the rest and releases their leases, so another
 executor (or this runtime's next start) need not wait for them to expire.
 
+Failures stay where they happen (one agent's failure never stops the others):
+    an agent's code fails (its state, construction, context)   the step commits a Fault
+    a cancellation the executor did not make                    the step commits a Fault
+    an inbox message that is not valid                          rejected: recorded, skipped
+    a spawn whose agent cannot be created                       the parent faults (CONT retries)
+    the store is busy, or the record moved on                   tried again next pass
+    the lease is lost, or the agent is killed                   the step stops, commits nothing
+    anything else while handling one record                     logged in `failures`; the
+                                                                executor goes on with the rest
+A step that commits nothing always releases its lease.
+
 What a step needs that is not the kernel's (the agent's code, its context, its pinned effects,
 creating a child) comes from an `Environment` the runtime implements.
 """
@@ -28,16 +39,21 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .process import ChildView, Fault, Lease, Record, Transition
-from .store import Busy, Conflict, Ended, Fenced, StateStore, Unread
+from .store import Busy, Conflict, Ended, Fenced, StateStore, StoreError, Unread
 from .transitions import (
     InvalidAnswer,
     InvalidTransition,
     apply_answer,
+    apply_fault,
     apply_signal,
     is_runnable,
     mark_intent_done,
     resolve_wait,
+    signal_problem,
 )
+
+#: How many failures an executor keeps for inspection (`Executor.failures`).
+FAILURES_KEPT = 100
 
 log = logging.getLogger("statecraft.executor")
 
@@ -89,6 +105,11 @@ class Executor:
         self._work: dict[str, tuple[asyncio.Task[Any], Lease]] = {}
         self.stopping = False
         self.peak = 0  # the most steps that ran at once (observability, tests)
+        #: agents whose step this executor cancelled on purpose (KILL, lease loss, stop): any
+        #: other cancellation of a step is the state's own, and a fault
+        self._cancelled: set[str] = set()
+        #: failures while handling a record that were not the agent's (newest last)
+        self.failures: list[dict[str, Any]] = []
 
     @property
     def store(self) -> StateStore:
@@ -102,7 +123,10 @@ class Executor:
         try:
             while not stop.is_set():
                 wakeup.clear()
-                await self.tick()
+                try:
+                    await self.tick()
+                except Exception as exc:  # the scan itself failed (store unavailable): retry
+                    self._failed("", "scan", exc)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(wakeup.wait(), self.scan_every)
         finally:
@@ -115,7 +139,8 @@ class Executor:
         tasks = list(self.running.values())
         if tasks:
             _done, pending = await asyncio.wait(tasks, timeout=drain)
-            for work, _lease in list(self._work.values()):
+            for agent_id, (work, _lease) in list(self._work.items()):
+                self._cancelled.add(agent_id)
                 work.cancel()  # the step's own task then releases its lease
             if pending:
                 _done, stuck = await asyncio.wait(pending, timeout=5)
@@ -136,8 +161,16 @@ class Executor:
         if held is None:
             return False
         log.info("%s: step cancelled (%s)", agent_id, reason)
+        self._cancelled.add(agent_id)
         held[0].cancel()
         return True
+
+    def _failed(self, agent_id: str, phase: str, exc: BaseException) -> None:
+        log.error("%s: %s failed: %s: %s", agent_id or "-", phase, type(exc).__name__, exc)
+        self.failures.append(
+            {"agent": agent_id, "phase": phase, "error": f"{type(exc).__name__}: {exc}"[:500]}
+        )
+        del self.failures[:-FAILURES_KEPT]
 
     async def tick(self) -> bool:
         """One pass over every record with work left. True if anything changed or started."""
@@ -151,6 +184,10 @@ class Executor:
                 moved |= await self._process(record)
             except (Busy, Conflict):
                 moved = True  # someone else moved it; look again next pass
+            except StoreError as exc:  # the store is busy or unavailable: next pass
+                self._failed(record.id, "store", exc)
+            except Exception as exc:  # isolated: the other records go on
+                self._failed(record.id, "process", exc)
         return moved
 
     async def _process(self, record: Record) -> bool:
@@ -183,6 +220,17 @@ class Executor:
         for item in await self.store.read_inbox(record.id, record.inbox_applied):
             message = item["message"]
             n = item["n"]
+            problem = message_problem(message, record)
+            if problem is not None:  # rejected: recorded in the history, never applied
+                log.warning("%s: message %s rejected: %s", record.id, item.get("id"), problem)
+                record = await self._control(
+                    record,
+                    lambda r, n=n: r.but(inbox_applied=n),
+                    "rejected",
+                    message_id=item.get("id"),
+                    reason=problem,
+                )
+                continue
 
             def change(r: Record, message: dict[str, Any] = message, n: int = n) -> Record:
                 if message["kind"] == "answer":
@@ -237,7 +285,19 @@ class Executor:
     async def _carry_out(self, record: Record) -> Record:
         for intent in record.pending_intents:
             if intent["kind"] == "spawn":
-                child = await self.env.create_child(record, intent)
+                fault = record.reason("fault")
+                if fault is not None and fault.get("intent") == intent["id"]:
+                    continue  # this spawn failed; it is tried again after CONT
+                try:
+                    child = await self.env.create_child(record, intent)
+                except Exception as exc:  # the parent's problem, not the executor's
+                    error = f"cannot spawn {intent['name']} ({intent['agent']}): {exc}"
+                    return await self._control(
+                        record,
+                        lambda r, e=error, i=intent["id"]: _spawn_fault(r, e, i),
+                        "fault",
+                        intent=intent["id"],
+                    )
                 if await self.store.create(child):
                     await self.env.child_created(child)
             else:
@@ -287,40 +347,63 @@ class Executor:
 
     async def _run_and_commit(self, record: Record, lease: Lease) -> None:
         agent_id = record.id
-        await self.env.prepare(agent_id)
-        root = agent_id.split("/")[0]
-        root_input = (await self.store.load(root)).input if root != agent_id else {}
-        work = asyncio.create_task(self.env.run_step(record, lease, root_input))
-        self._work[agent_id] = (work, lease)
-        heart = asyncio.create_task(self._heartbeat(agent_id, lease, work))
+        self._cancelled.discard(agent_id)
+        committed = False
+        heart: asyncio.Task[None] | None = None
         try:
+            outcome: Transition | Fault
             try:
+                await self.env.prepare(agent_id)
+                root = agent_id.split("/")[0]
+                root_input = (await self.store.load(root)).input if root != agent_id else {}
+                work = asyncio.create_task(self.env.run_step(record, lease, root_input))
+                self._work[agent_id] = (work, lease)
+                heart = asyncio.create_task(self._heartbeat(agent_id, lease, work))
                 outcome = await work
             except asyncio.CancelledError:
                 if asyncio.current_task().cancelling():  # this executor is being cancelled
                     raise
-                log.warning("%s: step %d cancelled; nothing committed", agent_id, record.step)
-                with contextlib.suppress(Exception):
-                    await self.store.release(agent_id, lease)
-                return
+                if agent_id in self._cancelled:  # KILL, lease loss or stop: nothing committed
+                    log.warning("%s: step %d cancelled; nothing committed", agent_id, record.step)
+                    return
+                outcome = Fault("the state was cancelled from inside (CancelledError)")
+            except StoreError:
+                raise  # the store, not the agent: the step runs again later
+            except Exception as exc:  # the runtime failed preparing or running the step
+                outcome = Fault(f"the step could not run: {type(exc).__name__}: {exc}")
             current = await self.store.lease(agent_id)
             lease = current if current and current.epoch == lease.epoch else lease
             try:
                 await self.store.commit_step(agent_id, lease, record.step, outcome, self.now())
+                committed = True
             except Unread:
                 log.info("%s: messages arrived as it ended; running the state again", agent_id)
-                await self.store.release(agent_id, lease)
                 self.env.notify()
-            except InvalidTransition as exc:
-                await self.store.commit_step(
-                    agent_id, lease, record.step, Fault(f"invalid transition: {exc}"), self.now()
+            except (Fenced, Conflict, StoreError):
+                raise
+            except Exception as exc:  # the outcome cannot be stored (invalid transition, data)
+                kind = (
+                    "invalid transition"
+                    if isinstance(exc, InvalidTransition)
+                    else (f"the step's result could not be stored ({type(exc).__name__})")
                 )
+                await self.store.commit_step(
+                    agent_id, lease, record.step, Fault(f"{kind}: {exc}"), self.now()
+                )
+                committed = True
         except (Fenced, Conflict) as exc:
             log.warning("%s: step %d not committed: %s", agent_id, record.step, exc)
+        except StoreError as exc:
+            self._failed(agent_id, "step", exc)
         finally:
-            heart.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heart
+            if heart is not None:
+                heart.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heart
+            if not committed:  # never leave the lease to expire (stop, cancel, store errors)
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(self.store.release(agent_id, lease))
+            self._cancelled.discard(agent_id)
 
     async def _heartbeat(self, agent_id: str, lease: Lease, work: asyncio.Task[Any]) -> None:
         """Renew the lease; when renewal fails the step has lost it: cancel the step (it could
@@ -330,6 +413,7 @@ class Executor:
             renewed = await self.store.renew(agent_id, lease, self.lease_ttl, self.now())
             if renewed is None:
                 log.warning("%s: lease lost; cancelling the step", agent_id)
+                self._cancelled.add(agent_id)
                 work.cancel()
                 return
             lease = renewed
@@ -337,8 +421,31 @@ class Executor:
                 self._work[agent_id] = (work, lease)
 
 
+def message_problem(message: Any, record: Record) -> str | None:
+    """Why an inbox message cannot be applied, or None."""
+    if not isinstance(message, dict) or message.get("kind") not in ("signal", "answer", "repin"):
+        return f"not a message: {str(message)[:200]}"
+    if message["kind"] == "signal":
+        return signal_problem(message.get("signal"))
+    if message["kind"] == "answer":
+        try:
+            apply_answer(
+                record, message["question_id"], message["answer"], by=message.get("by", "person")
+            )
+        except (InvalidAnswer, KeyError) as exc:
+            return f"answer not applied: {exc}"
+    return None
+
+
+def _spawn_fault(record: Record, error: str, intent_id: str) -> Record:
+    faulted = apply_fault(record, error) if not record.ended else record
+    return faulted.but(
+        reasons=[{**r, "intent": intent_id} if r["kind"] == "fault" else r for r in faulted.reasons]
+    )
+
+
 def signal_name(signal: Any) -> str:
     return signal[0] if isinstance(signal, (list, tuple)) else signal
 
 
-__all__ = ["Environment", "Executor", "signal_name"]
+__all__ = ["Environment", "Executor", "message_problem", "signal_name"]

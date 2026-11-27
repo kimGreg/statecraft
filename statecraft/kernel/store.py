@@ -157,6 +157,8 @@ class StateStore:
             after = after.but(published=stamped)
         t.put(after)
         entry: dict[str, Any] = {"kind": kind, "record": after.to_dict()}
+        if detail:  # why (a rejected message, the signal applied, the intent carried out)
+            entry["detail"] = dict(detail)
         if crossings:
             entry["crossings"] = crossings
         t.history_append(after.id, after.revision, entry)

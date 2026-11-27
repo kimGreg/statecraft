@@ -178,6 +178,20 @@ def _wait_reason(record: Record, t: Transition, now: float) -> dict[str, Any]:
 # ---- control: signals, answers, waits, intents ------------------------------------------------
 
 
+SIGNALS = ("STOP", "CONT", "TERM", "KILL", "USR")
+
+
+def signal_problem(signal: Any) -> str | None:
+    """Why a value is not a signal, or None: STOP, CONT, TERM, KILL, or ("USR", message)."""
+    if isinstance(signal, str):
+        if signal in ("STOP", "CONT", "TERM", "KILL"):
+            return None
+        return f"unknown signal {signal!r}; signals are {', '.join(SIGNALS)}"
+    if isinstance(signal, (list, tuple)) and len(signal) == 2 and signal[0] == "USR":
+        return None
+    return f'not a signal: {signal!r} (a USR signal is ("USR", message))'
+
+
 def apply_signal(record: Record, signal: Any) -> Record:
     """STOP, CONT, TERM, KILL change the lifecycle; ("USR", message) goes to the mailbox."""
     name = _signal_name(signal)

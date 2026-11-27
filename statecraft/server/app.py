@@ -109,11 +109,15 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
 
     async def signal(request: Request) -> Response:
         body = await request.json()
+        if not isinstance(body, dict) or "signal" not in body:
+            return _json({"error": 'expected {"signal": ..., "message"?: ...}'}, 400)
         sent: Any = body["signal"]
         if sent == "USR":
             sent = ("USR", body.get("message"))
         try:
             await runtime.signal(request.path_params["id"], sent)
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 400)
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
         except Ended as exc:

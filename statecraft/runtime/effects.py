@@ -70,7 +70,11 @@ class EffectManager:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            # the caller gave up on this call (its own wait_for, a lost race, KILL): end it
+            # before going on, so it is not counted as still running when the state ends
             task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
             raise
         finally:
             if task.done():

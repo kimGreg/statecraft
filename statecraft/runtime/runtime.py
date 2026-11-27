@@ -30,7 +30,7 @@ import jsonschema
 from ..kernel.executor import Executor, signal_name
 from ..kernel.process import Fault, Lease, Record, Transition
 from ..kernel.store import Ended, StateStore
-from ..kernel.transitions import InvalidAnswer, apply_answer, view
+from ..kernel.transitions import InvalidAnswer, apply_answer, signal_problem, view
 from ..sdk.agent import run_state
 from ..sdk.contracts import Artifact
 from .context import StepContext, dumps
@@ -244,6 +244,8 @@ class Runtime:
         outcome = await run_state(cls, record, ctx)
         problem = await self.effects.settle(ctx)
         if problem is not None:
+            if isinstance(outcome, Fault):  # the state's own error comes first
+                return Fault(f"{outcome.error} ({problem})", crossings=list(ctx.effects.crossings))
             return Fault(problem, crossings=list(ctx.effects.crossings))
         if isinstance(outcome, Transition):
             problem = self._check_spawns(definition, outcome)
@@ -407,7 +409,11 @@ class Runtime:
         return root_id
 
     async def signal(self, agent_id: str, signal: Any, *, message_id: str | None = None) -> None:
-        """Raises `Ended` for an agent that has ended (the message would never be read)."""
+        """Raises `ValueError` for a value that is not a signal, and `Ended` for an agent that
+        has ended (the message would never be read)."""
+        problem = signal_problem(signal)
+        if problem is not None:
+            raise ValueError(problem)
         record = await self.store.load(agent_id)
         if record.ended:
             raise Ended(f"{agent_id} has ended ({record.status}); it takes no more signals")
