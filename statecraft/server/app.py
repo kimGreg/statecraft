@@ -13,6 +13,11 @@ GET  /agents/{root}/files?prefix=           workspace files; /file?path= one of 
 GET  /questions                             open questions
 POST /questions/{id}/answer                 {"answer", "by"?}
 GET  /registry/agents | /registry/tools | /registry/providers
+
+Every request passes the guard (`guard.py`): same-origin, JSON bodies, loopback names unless a
+token is given. Bad input is a 4xx with `{"error"}`: 400 for a body or parameter that is not what
+the route takes, 403 for a path that leaves the workspace, 404 for an unknown agent or file, 409
+for a change to an agent that has ended or a question that closed.
 """
 
 from __future__ import annotations
@@ -24,13 +29,16 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 from ..kernel.store import Ended
 from ..kernel.transitions import InvalidAnswer
+from ..providers.workspaces import Escape
 from ..runtime.runtime import Runtime
+from .guard import Guard
 
 KEEPALIVE_SECONDS = 15
 
@@ -43,24 +51,70 @@ def _json(value: Any, status: int = 200) -> Response:
     return Response(_dumps(value), status_code=status, media_type="application/json")
 
 
-def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
-    """`manage`: start the runtime with the app and close it on shutdown."""
+class BadRequest(ValueError):
+    """A body or parameter that is not what the route takes."""
+
+
+async def read_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise BadRequest("the body is not JSON") from None
+    if not isinstance(body, dict):
+        raise BadRequest("the body must be a JSON object")
+    return body
+
+
+def optional_field(body: dict[str, Any], key: str, kind: type, default: Any = None) -> Any:
+    value = body.get(key, default)
+    if value is not None and not isinstance(value, kind):
+        raise BadRequest(f"{key!r} must be {kind.__name__}, not {type(value).__name__}")
+    return value
+
+
+def since_of(request: Request) -> int:
+    raw = request.query_params.get("since") or request.headers.get("last-event-id") or "0"
+    try:
+        since = int(raw)
+    except ValueError:
+        raise BadRequest(f"since must be a whole number, not {raw!r}") from None
+    if since < 0:
+        raise BadRequest("since must not be negative")
+    return since
+
+
+async def refused(request: Request, exc: Exception) -> Response:
+    return _json({"error": str(exc)}, 400)
+
+
+def server_app(
+    runtime: Runtime,
+    *,
+    manage: bool = False,
+    token: str | None = None,
+    hosts: list[str] | tuple[str, ...] = (),
+) -> Starlette:
+    """`manage`: start the runtime with the app and close it on shutdown. `token`: every request
+    must carry it; `hosts`: names served besides loopback when there is no token."""
 
     async def runs(request: Request) -> Response:
         return _json(await runtime.runs())
 
     async def spawn(request: Request) -> Response:
-        body = await request.json()
+        body = await read_body(request)
+        agent = body.get("agent")
+        if not isinstance(agent, str) or not agent:
+            raise BadRequest("'agent' must name an agent")
         try:
             root = await runtime.spawn(
-                str(body["agent"]),
-                dict(body.get("input") or {}),
-                root_id=body.get("root"),
-                attach=body.get("attach"),
-                attach_mode=body.get("attach_mode", "ro"),
-                inherit=body.get("inherit"),
+                agent,
+                optional_field(body, "input", dict) or {},
+                root_id=optional_field(body, "root", str),
+                attach=optional_field(body, "attach", str),
+                attach_mode=optional_field(body, "attach_mode", str, "ro"),
+                inherit=optional_field(body, "inherit", dict),
             )
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             return _json({"error": str(exc)}, 400)
         return _json({"root": root}, 201)
 
@@ -75,11 +129,16 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             return _json({"error": "no such agent"}, 404)
 
     async def history(request: Request) -> Response:
-        return _json(await runtime.history(request.path_params["id"]))
+        agent_id = request.path_params["id"]
+        try:
+            await runtime.store.load(agent_id)
+        except KeyError:
+            return _json({"error": "no such agent"}, 404)
+        return _json(await runtime.history(agent_id))
 
     async def events(request: Request) -> Response:
         root = request.path_params["id"]
-        since = int(request.query_params.get("since") or request.headers.get("last-event-id") or 0)
+        since = since_of(request)
         follow = request.query_params.get("follow", "1") != "0"
 
         async def stream() -> AsyncIterator[str]:
@@ -108,8 +167,8 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
         )
 
     async def signal(request: Request) -> Response:
-        body = await request.json()
-        if not isinstance(body, dict) or "signal" not in body:
+        body = await read_body(request)
+        if "signal" not in body:
             return _json({"error": 'expected {"signal": ..., "message"?: ...}'}, 400)
         sent: Any = body["signal"]
         if sent == "USR":
@@ -129,6 +188,8 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             return _json(await runtime.repin(request.path_params["id"]))
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
 
     async def artifact(request: Request) -> Response:
         try:
@@ -143,25 +204,40 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             return _json({"error": str(exc)}, 404)
 
     async def files(request: Request) -> Response:
-        return _json(
-            await runtime.files(request.path_params["id"], request.query_params.get("prefix", ""))
-        )
+        prefix = request.query_params.get("prefix", "")
+        try:
+            return _json(await runtime.files(request.path_params["id"], prefix))
+        except Escape as exc:
+            return _json({"error": str(exc)}, 403)
+        except KeyError:
+            return _json({"error": "no such root"}, 404)
+        except (ValueError, OSError) as exc:
+            return _json({"error": str(exc)}, 400)
 
     async def file(request: Request) -> Response:
+        path = request.query_params.get("path")
+        if not path:
+            raise BadRequest("give ?path=")
         try:
-            body = await runtime.read_file(request.path_params["id"], request.query_params["path"])
-        except (KeyError, FileNotFoundError, ValueError):
+            body = await runtime.read_file(request.path_params["id"], path)
+        except Escape as exc:
+            return _json({"error": str(exc)}, 403)
+        except (KeyError, FileNotFoundError, IsADirectoryError):
             return _json({"error": "no such file"}, 404)
+        except (ValueError, OSError) as exc:
+            return _json({"error": str(exc)}, 400)
         return Response(body, media_type="application/octet-stream")
 
     async def questions(request: Request) -> Response:
         return _json(await runtime.questions(request.query_params.get("root")))
 
     async def answer(request: Request) -> Response:
-        body = await request.json()
+        body = await read_body(request)
         try:
             await runtime.answer(
-                request.path_params["id"], body.get("answer"), by=str(body.get("by") or "person")
+                request.path_params["id"],
+                body.get("answer"),
+                by=optional_field(body, "by", str) or "person",
             )
         except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
@@ -205,7 +281,9 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             Route("/registry/providers", providers),
         ],
         lifespan=lifespan,
+        middleware=[Middleware(Guard, token=token, hosts=tuple(hosts))],
+        exception_handlers={BadRequest: refused},
     )
 
 
-__all__ = ["server_app"]
+__all__ = ["BadRequest", "optional_field", "read_body", "refused", "server_app", "since_of"]

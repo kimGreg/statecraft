@@ -64,7 +64,7 @@ def _api(args: argparse.Namespace) -> Any:
     if args.url:
         from ..client import StatecraftClient
 
-        return StatecraftClient(args.url)
+        return StatecraftClient(args.url, token=args.token)
     if args.config:
         return _Embedded(args.config)
     raise SystemExit("give --config FILE (embedded) or --url URL (a server)")
@@ -86,6 +86,9 @@ async def _call(args: argparse.Namespace) -> int:
             return 0 if head == "succeeded" else WAITING if head == "suspended" else 1
     if command == "resume":
         async with _Embedded(args.config) as runtime:
+            if args.root not in {r.id for r in await runtime.store.roots()}:
+                print(f"no root {args.root!r}", file=sys.stderr)
+                return 1
             rows = await runtime.run(args.root, timeout=args.timeout)
             show([{k: r[k] for k in ("id", "state", "view", "error")} for r in rows])
             head = rows[0]["view"]
@@ -125,12 +128,13 @@ def _serve(args: argparse.Namespace) -> int:
 
     from ..runtime.runtime import Runtime
     from ..server import server_app
+    from ..server.guard import require_token
 
+    token = require_token(args.host, args.token)
     overrides = {} if args.executors is None else {"executors": args.executors}
     runtime = Runtime.from_config(args.config, **overrides)
-    uvicorn.run(
-        server_app(runtime, manage=True), host=args.host, port=args.port, log_level="warning"
-    )
+    app = server_app(runtime, manage=True, token=token, hosts=args.allow_host or ())
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
 
@@ -141,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     def target(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         p.add_argument("--config")
         p.add_argument("--url")
+        p.add_argument("--token", help="bearer token for --url (default: $STATECRAFT_TOKEN)")
         return p
 
     serve = sub.add_parser("serve")
@@ -148,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--executors", type=int)
+    serve.add_argument("--token", help="require this bearer token (default: $STATECRAFT_TOKEN)")
+    serve.add_argument(
+        "--allow-host", action="append", help="a Host name served without a token (repeatable)"
+    )
     run = sub.add_parser("run")
     run.add_argument("name")
     run.add_argument("--config", required=True)

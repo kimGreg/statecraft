@@ -29,12 +29,17 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from statecraft.kernel.store import Ended
 from statecraft.kernel.transitions import InvalidAnswer
+from statecraft.providers.workspaces import Escape
+from statecraft.server.app import BadRequest, optional_field, read_body, refused, since_of
+from statecraft.server.guard import Guard
 
 from . import model
 
@@ -55,7 +60,16 @@ def _sse(event: dict[str, Any]) -> str:
     return f"id: {event['seq']}\ndata: {_dumps(event)}\n\n"
 
 
-def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
+def console_app(
+    runtime: Any,
+    *,
+    title: str = "statecraft",
+    token: str | None = None,
+    hosts: list[str] | tuple[str, ...] = (),
+) -> Starlette:
+    """Every request passes the runtime's HTTP guard (`statecraft.server.guard`); with a token,
+    open `/?token=<token>` once and the page keeps it as a same-site cookie."""
+
     async def page(request: Request) -> Response:
         return FileResponse(STATIC / "index.html")
 
@@ -106,8 +120,12 @@ def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
             found = await model.read_file(
                 runtime, request.path_params["root"], request.query_params["path"]
             )
-        except (KeyError, FileNotFoundError, ValueError):
+        except Escape as exc:
+            return _json({"error": str(exc)}, 403)
+        except (KeyError, FileNotFoundError, IsADirectoryError):
             return _json({"error": "no such file"}, 404)
+        except (ValueError, OSError) as exc:
+            return _json({"error": str(exc)}, 400)
         return _json(found)
 
     def stream(roots: Callable[[], Awaitable[list[str]]], since: int) -> StreamingResponse:
@@ -133,7 +151,7 @@ def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
 
     async def run_events(request: Request) -> Response:
         root = request.path_params["root"]
-        since = int(request.query_params.get("since") or request.headers.get("last-event-id") or 0)
+        since = since_of(request)
 
         async def one() -> list[str]:
             return [root]
@@ -144,35 +162,50 @@ def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
         async def every() -> list[str]:
             return [r.id for r in await runtime.store.roots()]
 
-        return stream(every, int(request.query_params.get("since") or 0))
+        return stream(every, since_of(request))
 
     async def spawn(request: Request) -> Response:
-        body = await request.json()
+        body = await read_body(request)
+        agent = body.get("agent")
+        if not isinstance(agent, str) or not agent:
+            raise BadRequest("'agent' must name an agent")
         try:
             root = await runtime.spawn(
-                str(body["agent"]), dict(body.get("input") or {}), root_id=body.get("root")
+                agent,
+                optional_field(body, "input", dict) or {},
+                root_id=optional_field(body, "root", str),
             )
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             return _json({"error": str(exc)}, 400)
         return _json({"root": root}, 201)
 
     async def answer(request: Request) -> Response:
-        body = await request.json()
+        body = await read_body(request)
+        question = body.get("question_id")
+        if not isinstance(question, str):
+            raise BadRequest("'question_id' must name a question")
         try:
-            await runtime.answer(str(body["question_id"]), body.get("answer"))
-        except (InvalidAnswer, KeyError) as exc:
+            await runtime.answer(question, body.get("answer"))
+        except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
         return Response(status_code=204)
 
     async def signal(request: Request) -> Response:
-        body = await request.json()
+        body = await read_body(request)
+        agent = body.get("agent")
+        if not isinstance(agent, str) or "signal" not in body:
+            raise BadRequest('expected {"agent", "signal", "message"?}')
         sent: Any = body["signal"]
         if sent == "USR":
             sent = ("USR", body.get("message"))
         try:
-            await runtime.signal(str(body["agent"]), sent)
+            await runtime.signal(agent, sent)
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 400)
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
         return Response(status_code=204)
 
     async def repin(request: Request) -> Response:
@@ -180,6 +213,8 @@ def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
             return _json(await runtime.repin(request.path_params["agent"]))
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
 
     return Starlette(
         routes=[
@@ -200,7 +235,9 @@ def console_app(runtime: Any, *, title: str = "statecraft") -> Starlette:
             Route("/api/answers", answer, methods=["POST"]),
             Route("/api/signals", signal, methods=["POST"]),
             Mount("/static", StaticFiles(directory=STATIC), name="static"),
-        ]
+        ],
+        middleware=[Middleware(Guard, token=token, hosts=tuple(hosts), cookie=True)],
+        exception_handlers={BadRequest: refused},
     )
 
 

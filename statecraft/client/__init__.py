@@ -8,6 +8,7 @@ async with StatecraftClient("http://localhost:8080") as client:
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote
@@ -26,8 +27,14 @@ def _path(agent_id: str) -> str:
 
 
 class StatecraftClient:
-    def __init__(self, base_url: str, *, timeout: float = 60, http: Any = None) -> None:
+    def __init__(
+        self, base_url: str, *, timeout: float = 60, http: Any = None, token: str | None = None
+    ) -> None:
+        """`token`: sent as `Authorization: Bearer`; defaults to `$STATECRAFT_TOKEN`."""
+        token = token or os.environ.get("STATECRAFT_TOKEN") or None
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         self.http = http or httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout)
+        self.http.headers.update(headers)
 
     async def __aenter__(self) -> StatecraftClient:
         return self

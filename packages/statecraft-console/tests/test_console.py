@@ -110,7 +110,7 @@ async def test_a_run_over_the_api() -> None:
     async with runtime:
         root = await runtime.spawn("calc:total", root_id="job1")
         await runtime.run(root, timeout=10)
-        with TestClient(console_app(runtime, title="demo")) as client:
+        with TestClient(console_app(runtime, title="demo"), base_url="http://localhost") as client:
             assert "statecraft console" in client.get("/").text
             assert client.get("/static/app.js").status_code == 200
             assert client.get("/api/overview").json()["runs"] == 1
@@ -130,7 +130,7 @@ async def test_a_run_over_the_api() -> None:
             )
             assert ok.status_code == 204
         await runtime.run(root, timeout=10)
-        with TestClient(console_app(runtime)) as client:
+        with TestClient(console_app(runtime), base_url="http://localhost") as client:
             agent = client.get("/api/agents/job1").json()
             assert agent["record"]["status"] == "succeeded"
             assert agent["definition"]["machine"]["start"] == "split"
@@ -156,7 +156,7 @@ async def test_the_events_stream_and_resume() -> None:
         root = await runtime.spawn("calc:total", root_id="job1")
         await runtime.run(root, timeout=10)
         log = await runtime.store.read_events("job1")
-        client = TestClient(console_app(runtime))
+        client = TestClient(console_app(runtime), base_url="http://localhost")
         with client, client.stream("GET", "/api/runs/job1/events", params={"since": 2}) as response:
             seen = []
             for line in response.iter_lines():
