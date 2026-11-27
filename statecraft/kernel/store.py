@@ -562,7 +562,8 @@ class StateStore:
         """Hold `amounts` for one send of a metered call, or refuse (`OverBudget`) when what was
         spent, what is held and this would pass a limit. False when the tree has no budget.
         Holds of the agent's earlier attempts (lower epochs: those attempts are gone, and their
-        calls may have been charged) are counted as spent first. Holding a key twice holds once."""
+        calls may have been charged), and of agents that ended, are counted as spent first.
+        A unit already at its limit refuses every call. Holding a key twice holds once."""
         amounts = jsonable(amounts)
 
         def body(t: Tables) -> bool:
@@ -571,17 +572,19 @@ class StateStore:
                 return False
             spent, held = found["spent"], found["held"]
             for other, hold in list(held.items()):
-                if hold["agent"] == agent and hold["epoch"] < epoch:
+                holder = t.get(hold["agent"])
+                gone = holder is None or (holder.ended and not has_work(holder))
+                if gone or (hold["agent"] == agent and hold["epoch"] < epoch):
                     _add(spent, hold["amounts"])
                     del held[other]
             if key not in held:
                 for unit, most in (found.get("limit") or {}).items():
-                    total = (
-                        spent.get(unit, 0)
-                        + sum(h["amounts"].get(unit, 0) for h in held.values())
-                        + amounts.get(unit, 0)
+                    used = spent.get(unit, 0) + sum(
+                        h["amounts"].get(unit, 0) for h in held.values()
                     )
-                    if total > most:
+                    total = used + amounts.get(unit, 0)
+                    # a unit at its limit refuses every call, held for that unit or not
+                    if total > most or used >= most:
                         raise OverBudget(
                             f"budget {unit}={most}: this call would bring {root} to {total:g}"
                         )
@@ -601,8 +604,8 @@ class StateStore:
             if found is None or key not in found["held"]:
                 return
             hold = found["held"].pop(key)
-            if used is not None:
-                _add(found["spent"], used or hold["amounts"])
+            if used is not None:  # each unit the call did not report counts its hold
+                _add(found["spent"], {**hold["amounts"], **used})
             t.setting_put(_budget_name(root), found)
 
         await self._txn(body)
@@ -662,11 +665,19 @@ class StateStore:
             if not all(r.ended and not has_work(r) for r in records):
                 raise Busy(f"{root} is still at work; it can be forgotten once it has ended")
             for other_id in t.root_ids():
-                other = t.get(other_id)
-                if other is None or other_id == root:
+                if other_id == root:
                     continue
-                if other.workspace == root or (other.inherits or {}).get("root") == root:
-                    raise Busy(f"{other_id} reads {root}; forget {other_id} first")
+                for other in (t.get(i) for i in t.tree_ids(other_id)):
+                    if other is None:
+                        continue
+                    pending = [
+                        i
+                        for i in other.intents
+                        if i["kind"] == "spawn" and not i["done"] and i.get("workspace") == root
+                    ]
+                    reads = other.workspace == root or (other.inherits or {}).get("root") == root
+                    if reads or pending:  # attached (even when ended) or inheriting, or about to
+                        raise Busy(f"{other.id} reads {root}; forget {other_id} first")
             if not dry_run:
                 t.forget(ids, root)
                 if t.setting_get(_budget_name(root)) is not None:

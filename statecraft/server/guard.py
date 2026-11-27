@@ -21,10 +21,12 @@ What must hold
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import ipaddress
 import json
 import os
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -35,6 +37,8 @@ TOKEN_ENV = "STATECRAFT_TOKEN"
 COOKIE = "statecraft_token"
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 UNSAFE = ("POST", "PUT", "PATCH", "DELETE")
+#: what a token (and so the console's cookie) may contain
+COOKIE_VALUE = re.compile(r"[A-Za-z0-9_.\-]{1,200}")
 #: paths served to anyone (GET only), saying nothing about runs: health probes
 OPEN = ("/health",)
 
@@ -93,13 +97,20 @@ class Guard:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        problem = self.problem(scope, headers)
+        presented = self._presented(scope, headers)
+        signed: Principal | None = None
+        if self._signs_in and presented is not None:  # the slow hash runs off the event loop
+            signed = await asyncio.to_thread(self._principal, presented)
+        problem = self.problem(scope, headers, signed=signed)
         if problem is not None:
             status, message = problem
             return await _refuse(send, status, message)
         given = _query_token(scope)
         if self.cookie and self._signs_in and given is not None:
-            return await _set_cookie(send, given)  # the token was checked above
+            # only the query token itself becomes the cookie, once it proved to be a token
+            if given == presented and signed is not None and COOKIE_VALUE.fullmatch(given):
+                return await _set_cookie(send, given)
+            return await _refuse(send, 401, "that token is not valid")
         return await self.app(scope, receive, send)
 
     @property
@@ -110,6 +121,8 @@ class Guard:
         given = headers.get("authorization", "")
         if given.lower().startswith("bearer "):
             return given[7:]
+        if self.cookie and _query_token(scope) is not None:  # signing in: the address's token
+            return _query_token(scope)
         if self.cookie:
             for part in headers.get("cookie", "").split(";"):
                 name, _, value = part.strip().partition("=")
@@ -125,14 +138,16 @@ class Guard:
             return OPERATOR
         return self.tokens.verify(presented) if self.tokens is not None else None
 
-    def problem(self, scope: dict[str, Any], headers: dict[str, str]) -> tuple[int, str] | None:
+    def problem(
+        self, scope: dict[str, Any], headers: dict[str, str], signed: Principal | None = None
+    ) -> tuple[int, str] | None:
         host = headers.get("host", "")
         principal: Principal | None = OPERATOR  # local, without tokens: the machine's operator
         if scope.get("path") in OPEN and scope.get("method") in ("GET", "HEAD"):
             scope.setdefault("state", {})["principal"] = None
             return None  # a liveness probe: it says only that the server answers
         if self._signs_in:
-            principal = self._principal(self._presented(scope, headers))
+            principal = signed
             if principal is None:
                 return 401, "a token is required (Authorization: Bearer <token>)"
             needed = "read" if scope.get("method") in ("GET", "HEAD") else "control"

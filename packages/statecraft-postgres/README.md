@@ -24,7 +24,8 @@ The same as the SQLite store; the core's store contract suite runs unchanged aga
 - Fencing: a step commits only under the lease (owner, epoch) it read in its own transaction; a
   concurrent acquisition of that lease writes the same row, so one of the two is retried and
   sees the other.
-- A broken connection is replaced; the operation that saw it reports `Unavailable`.
+- A broken connection is replaced; the operation that saw it reports `Unavailable`. For a write
+  that broke while committing the outcome is unknown; the kernel looks again.
 - The data format is the core's (3), recorded in the schema's `meta` table; another is refused.
 
 ## Tested

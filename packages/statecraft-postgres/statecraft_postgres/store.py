@@ -12,7 +12,10 @@ that lease conflicts with it, so one of the two is retried and sees the other.
 
 Connection ownership: one connection per store and process, used by one thread of the store's
 own (the event loop never waits on the database); a process that forks gets its own; a broken
-connection is replaced and the operation reports `Unavailable` (nothing was done).
+connection is replaced and the operation reports `Unavailable`. For a write that broke while
+committing, the outcome is unknown: the kernel's operations are safe to look at again (a commit
+that landed shows in the record; a step that did not runs again; a budget hold left behind is
+counted as spent when its agent reserves again or ends).
 
 The data format is the core's (`meta.format`, 3); a newer one is refused, an older one does not
 exist for this store yet.
@@ -254,16 +257,22 @@ class PostgresStore(StateStore):
             )
         except psycopg.OperationalError as exc:
             raise Unavailable(f"cannot connect to PostgreSQL: {exc}") from exc
-        db.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
-        db.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
-        self._prepare(db)
+        try:
+            self._prepare(db)
+        except BaseException:
+            db.close()
+            raise
         self._db, self._pid = db, os.getpid()
 
     def _prepare(self, db: psycopg.Connection) -> None:
-        """Create the tables, or check the format, under an advisory lock: concurrent openers
-        never see half a schema."""
+        """Create the schema and tables, or check the format, under an advisory lock taken
+        first: concurrent openers never race on `CREATE SCHEMA` or see half a schema."""
         with db.transaction():
             db.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"statecraft:{self.schema}",))
+            db.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema))
+            )
+            db.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
             for statement in [p.strip() for p in SCHEMA.split(";") if p.strip()]:
                 db.execute(statement)
             row = db.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()

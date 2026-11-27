@@ -216,3 +216,67 @@ async def test_the_console_signs_in_a_principal(book) -> None:
             assert page.get("/api/runs/other").status_code == 403
             refused = page.post("/api/signals", json={"agent": "other", "signal": "TERM"})
             assert refused.status_code == 403
+
+
+async def test_review_regressions_for_tokens_and_runs(tmp_path) -> None:
+    """A token revoked by another process is refused by a running server; a restricted admin
+    cannot change store-wide maintenance or read store-wide metrics; an attachment through an
+    owned run cannot reach (or write) a run the token does not own; a spawn's audit names its
+    attachment, inheritance and budget; an unknown token costs no slow hash."""
+    import time
+
+    book = TokenBook(tmp_path / "t.json")
+    ops = book.add("ops", scopes=["admin"])
+    ci = book.add("ci", scopes=["admin"], roots=["ci-"])
+    async with runtime() as rt:
+        await rt.spawn("holder", root_id="other")
+        await rt.spawn("holder", root_id="ci-shared", attach="other")  # read-only
+        app = server_app(rt, tokens=book)
+        async with client(app, ci) as c:
+            assert (await c.post("/maintenance", json={"on": True})).status_code == 403
+            assert (await c.get("/metrics")).status_code == 403
+            chained = await c.post(
+                "/agents",
+                json={
+                    "agent": "holder",
+                    "root": "ci-x",
+                    "attach": "ci-shared",
+                    "attach_mode": "rw",
+                },
+            )
+            assert chained.status_code == 403  # it works in `other`
+            made = await c.post(
+                "/agents", json={"agent": "holder", "root": "ci-b", "budget": {"usd": 1}}
+            )
+            assert made.status_code == 201
+        [spawned] = [e for e in await rt.store.read_events("ci-b") if e["kind"] == "audit"]
+        assert spawned["budget"] == {"usd": 1} and "attach_mode" in spawned
+        with pytest.raises(ValueError, match="read-only"):
+            await rt.spawn("holder", root_id="w2", attach="ci-shared", attach_mode="rw")
+        TokenBook(book.path).revoke("ci")  # another process
+        async with client(app, ci) as c:
+            assert (await c.get("/agents")).status_code == 401
+        async with client(app, ops) as c:
+            assert (await c.get("/metrics")).status_code == 200
+    started = time.perf_counter()
+    for n in range(20):
+        assert book.verify(f"sc_unknown{n}.x") is None
+    assert time.perf_counter() - started < 0.5
+
+
+def test_the_console_cookie_is_only_a_proven_token(tmp_path) -> None:
+    from statecraft_console.app import console_app
+
+    book = TokenBook(tmp_path / "t.json")
+    ops = book.add("ops", scopes=["admin"])
+    app = console_app(memory_runtime(), tokens=book)
+    with TestClient(app, base_url="http://console.example") as page:
+        injected = page.get(
+            "/?token=garbage%3B%20Domain%3Dexample.org",
+            headers={"authorization": f"Bearer {ops}"},
+            follow_redirects=False,
+        )
+        assert injected.status_code == 401 and "set-cookie" not in injected.headers
+        assert page.get("/?token=sc_nope.x", follow_redirects=False).status_code == 401
+        signed = page.get(f"/?token={ops}", follow_redirects=False)
+        assert signed.status_code == 303 and ops in signed.headers["set-cookie"]

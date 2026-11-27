@@ -191,11 +191,12 @@ async def test_operator_routes_over_http(tmp_path) -> None:
             assert (await anyone.get("/metrics")).status_code == 401
         async with client(reader) as c:
             assert [f["agent"] for f in (await c.get("/faults")).json()] == ["mine-1"]
-            text = (await c.get("/metrics")).text
-            assert 'statecraft_agents{view="suspended"} 2' in text
+            assert (await c.get("/metrics")).status_code == 403  # store-wide: unrestricted only
             assert (await c.get("/maintenance")).json() == {"on": False}
             assert (await c.post("/maintenance", json={"on": True})).status_code == 403
         async with client(ops) as c:
+            text = (await c.get("/metrics")).text
+            assert 'statecraft_agents{view="suspended"} 2' in text
             assert (await c.post("/maintenance", json={"on": True})).json() == {"on": True}
             assert (await c.post("/maintenance", json={"on": "yes"})).status_code == 400
         assert await rt.maintenance() is True

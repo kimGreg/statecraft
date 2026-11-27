@@ -529,8 +529,14 @@ class Runtime:
         if problem:
             raise ValueError(problem)
         if attach is not None:
-            if "/" in attach or await self.store.find(attach) is None:
+            target = await self.store.find(attach) if "/" not in attach else None
+            if target is None:
                 raise ValueError(f"no root {attach} to attach to")
+            if attach_mode == "rw" and target.workspace and target.workspace_mode != "rw":
+                raise ValueError(
+                    f"{attach} works read-only in {target.workspace}: an attachment through it "
+                    "cannot write there"
+                )
             attach = await self.attach_target(attach)
         if attach_mode not in ("ro", "rw"):
             raise ValueError("attach_mode is 'ro' or 'rw'")

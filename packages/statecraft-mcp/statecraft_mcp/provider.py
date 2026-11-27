@@ -196,7 +196,7 @@ class MCPProvider:
         async with self._lock:
             self._sessions[key] = _Session(task, client, closing)
             self._connecting.pop(key, None)
-            self._evict()
+            self._evict(keep=key)  # it was opened to be used now: never its own victim
         if not pending.done():
             pending.set_result(None)
 
@@ -213,12 +213,14 @@ class MCPProvider:
         if held is not None:
             held.closing.set()
 
-    def _evict(self) -> None:
-        """Close the least recently used sessions over `max_sessions`, never one in use."""
+    def _evict(self, keep: str | None = None) -> None:
+        """Close the least recently used sessions over `max_sessions`, never one in use (nor
+        `keep`, a session just opened for a caller): when all are busy, the limit is passed for
+        a while instead of connecting again and again."""
         for key in list(self._sessions):
             if len(self._sessions) <= self.max_sessions:
                 return
-            if self._sessions[key].active == 0:
+            if self._sessions[key].active == 0 and key != keep:
                 self._drop(key)
 
     async def _release(self, held: _Session) -> None:

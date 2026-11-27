@@ -54,10 +54,11 @@ def patch(old: Any, delta: dict[str, Any] | None) -> Any:
     if "=" in delta:
         return delta["="]
     if "+" in delta:
-        return [*old, *delta["+"]]
-    result = {k: v for k, v in old.items() if k not in set(delta.get("-", ()))}
+        return [*(old if isinstance(old, list) else []), *delta["+"]]
+    base = old if isinstance(old, dict) else {}  # a base that lacked the field (an older record)
+    result = {k: v for k, v in base.items() if k not in set(delta.get("-", ()))}
     for key, inner in delta["{"].items():
-        result[key] = patch(old.get(key), inner) if key in old else inner["="]
+        result[key] = patch(base.get(key), inner)
     return result
 
 

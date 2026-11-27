@@ -267,14 +267,17 @@ class EffectManager:
         try:
             result = await send()
         except EffectError as exc:
-            await self.store.settle(root, hold, None if not exc.sent else {})
+            await asyncio.shield(self.store.settle(root, hold, None if not exc.sent else {}))
             raise
         except BaseException:
             await asyncio.shield(self.store.settle(root, hold, {}))  # it may have been sent
             raise
         charge = getattr(provider, "charge_of", None)
-        used = dict(charge(operation, result) or {}) if charge is not None else {}
-        await self.store.settle(root, hold, used)
+        try:
+            used = dict(charge(operation, result) or {}) if charge is not None else {}
+        except Exception:  # the call succeeded; what it used is unknown: its hold counts
+            used = {}
+        await asyncio.shield(self.store.settle(root, hold, used))
         return result
 
     async def _settle_earlier(

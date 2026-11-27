@@ -327,3 +327,29 @@ __all__ += [
     "test_forgetting_needs_an_ended_run_nobody_reads",
     "test_history_reads_back_every_record_from_checkpoints_and_deltas",
 ]
+
+
+async def test_event_numbers_keep_growing_after_compaction(store) -> None:
+    await _ended_run(store, steps=3)
+    last = (await store.read_events("root"))[-1]["seq"]
+    await store.compact("root")
+    await store.audit("root", {"op": "a"})
+    await store.audit("root", {"op": "b"})
+    seqs = [e["seq"] for e in await store.read_events("root")]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs) and seqs[-2] > last
+    assert [e["op"] for e in await store.read_events("root", last)] == ["a", "b"]
+
+
+async def test_a_run_a_live_child_works_in_is_not_forgotten(store) -> None:
+    await _ended_run(store, "old", steps=2)
+    await store.create(rec("other"))
+    await store.create(rec("other/c", parent="other", workspace="old", workspace_mode="rw"))
+    with pytest.raises(Busy, match="other/c"):
+        await store.forget("old")
+    assert await store.find("old") is not None
+
+
+__all__ += [
+    "test_a_run_a_live_child_works_in_is_not_forgotten",
+    "test_event_numbers_keep_growing_after_compaction",
+]

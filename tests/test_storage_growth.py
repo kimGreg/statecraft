@@ -82,3 +82,25 @@ async def test_scan_work_reads_only_agents_with_work(tmp_path) -> None:
     )
     assert "agents_work" in str(plan)
     store.close()
+
+
+def test_a_delta_applies_to_a_base_that_lacked_the_field() -> None:
+    """A record written before a field existed: its delta adds into the field."""
+    assert patch({"a": 1}, {"{": {"notes": {"{": {"k": {"=": 1}}}}}) == {"a": 1, "notes": {"k": 1}}
+
+
+def test_migrating_backs_up_what_is_still_in_the_log(tmp_path) -> None:
+    from statecraft.providers.stores.sqlite import migrate
+
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path, isolation_level=None)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA wal_autocheckpoint=0")
+    db.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, work INTEGER NOT NULL, body TEXT)")
+    for n in range(20):
+        db.execute("INSERT INTO agents VALUES (?, 0, '{}')", (f"a{n}",))
+    db.close()  # (closing checkpoints; the backup API is what holds the log in general)
+    assert migrate(path) == (1, 3)
+    backup = sqlite3.connect(tmp_path / "old.db.format-1.bak")
+    assert backup.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 20
+    backup.close()

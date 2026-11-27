@@ -147,3 +147,49 @@ def test_long_output_keeps_head_and_tail() -> None:
     shaped = clip(text, 1000)
     assert shaped.startswith("line 0") and shaped.endswith("line 4999")
     assert "lines" in shaped and "characters cut" in shaped and len(shaped) < 1200
+
+
+async def test_an_insert_after_an_anchor_is_not_applied_twice() -> None:
+    """The same tool call again (its state ran again after a crash): `new` contains `old`, so
+    the text alone cannot tell; the edit's note can."""
+    from statecraft.runtime.workspace import FileChanged, content_digest
+
+    class Files:
+        def __init__(self):
+            self.data = {"shared/a.py": "import os\n\ndef main():\n    pass\n"}
+
+        async def read_text(self, path):
+            if path not in self.data:
+                raise FileNotFoundError(path)
+            return self.data[path]
+
+        async def write(self, path, text):
+            self.data[path] = text
+
+        async def edit(self, path, text, *, expected):
+            if content_digest(self.data[path].encode()) != expected:
+                raise FileChanged(path)
+            self.data[path] = text
+            return "applied"
+
+    class Ctx:
+        id, step, files = "c", 3, Files()
+
+    agent = CodingAgent.__new__(CodingAgent)
+    args = {"path": "a.py", "old": "import os\n", "new": "import os\nimport sys\n"}
+    first = await agent._coding_tool(Ctx, "edit_file", args, "tool/x")
+    again = await agent._coding_tool(Ctx, "edit_file", args, "tool/x")
+    assert first.startswith("applied") and again.startswith("already")
+    assert Ctx.files.data["shared/a.py"].count("import sys") == 1
+    other = await agent._coding_tool(Ctx, "edit_file", args, "tool/y")  # a new call: applies
+    assert other.startswith("applied")
+
+
+def test_paths_stay_in_the_project() -> None:
+    import pytest
+    from statecraft_coding import project_path
+
+    assert project_path("src/a.py") == "shared/src/a.py" and project_path(".") == "shared"
+    for outside in ("../home/c/private/x", "src/../../run/views.json"):
+        with pytest.raises(PermissionError):
+            project_path(outside)

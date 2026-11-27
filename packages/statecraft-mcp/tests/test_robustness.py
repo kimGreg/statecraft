@@ -107,3 +107,34 @@ async def test_a_cancelled_connect_leaves_nothing_running() -> None:
 def test_failures_say_what_happened(exc, cls, sent) -> None:
     failure = MCPProvider._failure(exc, "calc.x")
     assert (failure.cls, failure.sent) == (cls, sent)
+
+
+async def test_a_new_session_is_not_evicted_while_the_others_are_busy() -> None:
+    """With every older session in use, the one just opened is used, not closed and opened again
+    in a loop (the limit is passed for a while)."""
+    from calc_server import server
+    from statecraft_mcp import MCPProvider
+
+    from statecraft.ports.effects import EffectContext
+
+    def on(session):
+        return EffectContext(
+            root="r", agent="r", step=0, state="s", workspace=session, key=None, deadline=None
+        )
+
+    provider = MCPProvider("calc", server=server, session_header="X-S", max_sessions=1)
+    connects = {"two": 0}
+    hold = provider._hold
+
+    async def counting(key, ready, closing):
+        if key == "two":
+            connects["two"] += 1
+        await hold(key, ready, closing)
+
+    provider._hold = counting
+    slow = asyncio.ensure_future(provider.invoke("slow", {"seconds": 0.5}, on("one")))
+    await asyncio.sleep(0.1)
+    assert await provider.invoke("add", {"a": 1, "b": 1}, on("two")) == 2
+    await slow
+    await provider.close()
+    assert connects["two"] == 1

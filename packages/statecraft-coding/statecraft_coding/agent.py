@@ -21,9 +21,10 @@ paths, through these tools:
 
 What must hold
   * every file change is safe to repeat (a state runs again after a crash): writing the same
-    content again changes nothing, and an edit whose new text is already there (and old text is
-    not) reports `already` instead of failing; an edit made against text someone else changed
-    meanwhile is refused (`ctx.files.edit` with the digest it read);
+    content again changes nothing; an edit keeps a note of the file's digests before and after
+    (in the agent's private folder, under the model's tool call) before it changes the file, so
+    a repeat reports `already` instead of applying it twice; an edit made against text someone
+    else changed meanwhile is refused;
   * a command goes through the granted shell effect, keyed by the model's tool call, so a state
     that runs again never runs it twice (the effect's own contract);
   * long outputs and files are cut to their head and tail with what was cut said;
@@ -33,6 +34,9 @@ What must hold
 
 from __future__ import annotations
 
+import hashlib
+import posixpath
+import json
 from typing import Any, ClassVar
 
 from statecraft_agentic import AgenticAgent
@@ -77,7 +81,10 @@ def project_path(path: Any) -> str:
         text = text.removeprefix("workspace/")
     if text in ("", "."):
         return ROOT.rstrip("/")
-    return ROOT + text
+    found = posixpath.normpath(ROOT + text)
+    if found != ROOT.rstrip("/") and not found.startswith(ROOT):
+        raise PermissionError(f"{path} is outside the project")
+    return found
 
 
 class CodingAgent(AgenticAgent):
@@ -187,7 +194,7 @@ class CodingAgent(AgenticAgent):
             return {"error": {"class": exc.cls, "message": exc.message}}
         except FileNotFoundError:
             return {"error": f"no such file: {arguments.get('path')}"}
-        except (PermissionError, ValueError, UnicodeDecodeError) as exc:
+        except (PermissionError, ValueError, TypeError, UnicodeDecodeError) as exc:
             return {"error": f"{type(exc).__name__}: {exc}"[:500]}
 
     async def _coding_tool(
@@ -227,27 +234,51 @@ class CodingAgent(AgenticAgent):
             await files.write(path, content)
             return f"wrote {arguments.get('path')} ({len(content.encode('utf-8'))} bytes)"
         if name == "edit_file":
-            old, new = str(arguments.get("old") or ""), str(arguments.get("new") or "")
-            if not old:
-                return {"error": "`old` must not be empty (use write_file for a new file)"}
-            text = await files.read_text(path)
-            count = text.count(old)
-            if count == 0:
-                if new and new in text:
-                    return f"already: {arguments.get('path')} has the new text"
-                return {"error": "`old` was not found; read the file and copy the text exactly"}
-            if count > 1:
-                return {"error": f"`old` appears {count} times; add lines around it"}
-            try:
-                outcome = await files.edit(
-                    path,
-                    text.replace(old, new, 1),
-                    expected=content_digest(text.encode("utf-8")),
-                )
-            except FileChanged:
-                return {"error": "the file changed while editing; read it again"}
-            return f"{outcome}: {arguments.get('path')}"
+            return await self._edit(ctx, path, arguments, identity)
         return {"error": f"unknown tool {name}"}
+
+    async def _edit(self, ctx, path: str, arguments: dict[str, Any], identity: str | None) -> Any:
+        """Replace one unique `old` with `new`, safe to repeat: before the file changes, the
+        edit's file digests before and after are kept in the agent's private folder under the
+        model's tool call (stable when the state runs again). A repeat finds that note: the
+        file already at the after digest is `already`; at the before digest it is applied
+        again; anything else changed meanwhile. (Text alone cannot tell: `new` may contain
+        `old`, as when inserting after an anchor.)"""
+        files, shown = ctx.files, arguments.get("path")
+        old, new = str(arguments.get("old") or ""), str(arguments.get("new") or "")
+        if not old:
+            return {"error": "`old` must not be empty (use write_file for a new file)"}
+        note = (
+            f"home/{ctx.id}/private/.edits/"
+            + hashlib.sha256(f"{ctx.step}/{identity}".encode()).hexdigest()[:32]
+            + ".json"
+        )
+        text = await files.read_text(path)
+        current = content_digest(text.encode("utf-8"))
+        try:
+            earlier = json.loads(await files.read_text(note))
+        except FileNotFoundError:
+            earlier = None
+        if earlier is not None and earlier.get("path") == path:
+            if current == earlier["after"]:
+                return f"already: {shown}"
+            if current != earlier["before"]:
+                return {"error": "the file changed since this edit was made; read it again"}
+        count = text.count(old)
+        if count == 0:
+            if new and new in text:  # nothing to apply; most likely done by an earlier call
+                return f"already: {shown} has the new text"
+            return {"error": "`old` was not found; read the file and copy the text exactly"}
+        if count > 1:
+            return {"error": f"`old` appears {count} times; add lines around it"}
+        changed = text.replace(old, new, 1)
+        after = content_digest(changed.encode("utf-8"))
+        await files.write(note, json.dumps({"path": path, "before": current, "after": after}))
+        try:
+            outcome = await files.edit(path, changed, expected=current)
+        except FileChanged:
+            return {"error": "the file changed while editing; read it again"}
+        return f"{outcome}: {shown}"
 
 
 __all__ = ["PROMPT", "CodingAgent", "project_path"]
