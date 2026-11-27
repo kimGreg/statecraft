@@ -49,13 +49,31 @@ Settings come from the definition's `extensions.agentic`:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from typing import Any, ClassVar
 
 from statecraft import Agent, Done, EffectError, Spawn, Wait, state
 
-from .context import cut_for, estimate, project, summary_request
+from .context import boundaries, covered, cut_for, estimate, project, summary_request
+
+#: how many times a compaction halves its chunk when the summary request itself overflows
+COMPACTION_SHRINKS = 4
+
+
+def chunk_end(
+    messages: list[dict[str, Any]], compaction: dict[str, Any] | None, cut: int, limit: int | None
+) -> int:
+    """How far one summary request reaches: the furthest message boundary up to `cut` whose
+    request fits `limit` tokens (the nearest boundary when none fits; `cut` without a limit)."""
+    if limit is None:
+        return cut
+    start = covered(compaction)
+    candidates = [i for i in boundaries(messages, start) if start < i <= cut] or [cut]
+    fitting = [i for i in candidates if estimate(summary_request(messages, compaction, i)) <= limit]
+    return max(fitting) if fitting else min(candidates)
+
 
 GENERAL = """You are one agent in a larger procedure. Work only with the tools you are given.
 - Computed values (coordinates, distances, areas, counts) come from tools; never invent them.
@@ -144,6 +162,14 @@ class AgenticAgent(Agent):
             return await self._skill_text(ctx, data, skills[0])
         return ""
 
+    def loadable_skills(self, ctx, data: dict[str, Any]) -> list[str]:
+        """The pinned skills the model loads with `load_skill`: all of them, except the first
+        when it is the task instruction (no class or configured instruction)."""
+        skills = list(data.get("available_skills") or {})
+        if self.instruction is None and not ctx.extension("agentic").get("instruction"):
+            return skills[1:]
+        return skills
+
     def check_output(self, ctx, data: dict[str, Any], payload: Any) -> str | None:
         """A problem with the final answer (asked again), or None."""
         return None
@@ -170,7 +196,7 @@ class AgenticAgent(Agent):
             await catalog.keep(ctx, name)  # the immutable copy recovery reloads
         output = self._output_type(ctx)
         shape = " as one JSON object" if self.json_output else ""
-        others = list(data["available_skills"])[1:]
+        others = self.loadable_skills(ctx, data)
         system = "\n\n".join(
             p
             for p in (
@@ -203,9 +229,12 @@ class AgenticAgent(Agent):
 
     @state
     async def think(self, ctx, data):
-        if data["turns"] >= self.max_model_turns:
-            raise RuntimeError(f"more than {self.max_model_turns} model turns")
-        self._take_signals(ctx, data)
+        self._take_signals(ctx, data)  # an `extend` sent with a CONT counts before the check
+        if data["turns"] >= self.max_model_turns + data.get("extra_turns", 0):
+            raise RuntimeError(
+                f"more than {self.max_model_turns + data.get('extra_turns', 0)} model turns "
+                '(raise it: USR {"type": "extend", "turns": n}, then CONT)'
+            )
         budget, keep = self._budget(ctx)
         over = budget is not None and self._context_tokens(data) > budget
         if over and cut_for(data["messages"], data.get("compaction"), keep) is not None:
@@ -247,6 +276,12 @@ class AgenticAgent(Agent):
             ]
         data["messages"].append(message)
         if calls:
+            limit = self.max_tool_calls + data.get("extra_calls", 0)
+            if data["calls"] + len(calls) > limit:  # checked here, after an `extend` was read
+                raise RuntimeError(
+                    f"more than {limit} tool calls "
+                    '(raise it: USR {"type": "extend", "tool_calls": n}, then CONT)'
+                )
             data.update(pending=calls, cursor=0)
             return "act_one"
         data["final"] = content
@@ -263,37 +298,64 @@ class AgenticAgent(Agent):
             if forced:
                 raise RuntimeError("over the model's context window, and nothing to compact")
             return "think"
-        reply = await ctx.call(
-            f"model.{self._model(ctx)}",
-            messages=summary_request(data["messages"], earlier, cut),
-            tools=[],
-        )
+        budget, _keep = self._budget(ctx)
+        limit = budget or None  # a summary request fits the context window the budget stands for
+        end = chunk_end(data["messages"], earlier, cut, limit)
+        for _ in range(COMPACTION_SHRINKS + 1):
+            try:
+                reply = await ctx.call(
+                    f"model.{self._model(ctx)}",
+                    messages=summary_request(data["messages"], earlier, end),
+                    tools=[],
+                )
+                break
+            except EffectError as exc:  # the summary request itself is too big: a smaller chunk
+                smaller = chunk_end(
+                    data["messages"],
+                    earlier,
+                    end,
+                    estimate(summary_request(data["messages"], earlier, end)) // 2,
+                )
+                if exc.code != "context_overflow" or smaller >= end:
+                    raise
+                end = smaller
+        else:  # pragma: no cover - the loop always breaks or raises
+            raise RuntimeError("compaction could not fit the model's context window")
         self._count(data, reply)
         summary = str(reply.get("content") or "").strip()
         if not summary:
             raise RuntimeError("the model gave no summary to compact the context with")
         data["compaction"] = {
-            "covered_until": cut,
+            "covered_until": end,
             "summary": summary,
             "count": (earlier or {}).get("count", 0) + 1,
         }
         data.pop("last_prompt", None)
+        if end < cut:  # summarized in chunks: the next chunk, with the summary so far
+            data["force_compact"] = forced
+            return "compact"
         return "think"
 
     @state
     async def act_one(self, ctx, data):
         call_ = data["pending"][data["cursor"]]
         data["calls"] += 1
-        if data["calls"] > self.max_tool_calls:
-            raise RuntimeError(f"more than {self.max_tool_calls} tool calls")
+
         name, arguments = call_["name"], call_["arguments"]
         offered = {t["function"]["name"] for t in self._tools(ctx, data)}
         if name == "wait_for" and "join_agents" in offered:
             name = "join_agents"  # the earlier name of join_agents
         if name not in offered:  # what the model was not offered is never run
             return self._answer(data, {"error": f"unknown tool {name!r}: not offered to you"})
+        if not isinstance(arguments, dict):  # the model's mistake: told, not a fault
+            return self._answer(data, {"error": f"{name}: arguments must be a JSON object"})
         if name in BOUNDARY:
-            boundary = await self._boundary(ctx, data, name, arguments)
+            try:
+                boundary = await self._boundary(ctx, data, name, arguments)
+            except (TypeError, ValueError, AttributeError, KeyError) as exc:
+                return self._answer(
+                    data, {"error": f"{name}: bad arguments: {type(exc).__name__}: {exc}"[:500]}
+                )
             if isinstance(boundary, (Spawn, Wait)):
                 data["boundary"] = {"name": name, "arguments": arguments}
                 return boundary
@@ -333,11 +395,17 @@ class AgenticAgent(Agent):
         except (ValueError, json.JSONDecodeError) as exc:
             problem = f"{type(exc).__name__}: {exc}"
             payload = None
+        steered = data.get("steered", 0)
         self._take_signals(ctx, data)
-        if not problem and not data.get("children_told"):
+        if data.get("steered", 0) > steered:  # a steer came as it finished: the model sees it
+            data["final"] = None
+            return "think"
+        if not problem:
             live = [c for c in await ctx.children_view() if c.get("phase") not in ENDED]
-            if live:
-                data["children_told"] = True
+            told = set(data.get("children_told") or [])  # names it was told about (once each)
+            new = [c for c in live if c["name"] not in told]
+            if new:
+                data["children_told"] = sorted(told | {c["name"] for c in live})
                 names = ", ".join(f"{c['name']} ({c['phase']})" for c in live)
                 data["messages"].append(
                     {
@@ -355,7 +423,7 @@ class AgenticAgent(Agent):
             return "think"
         if problem:
             data["retries"] += 1
-            if data["retries"] > self.max_output_retries:
+            if data["retries"] > self.max_output_retries + data.get("extra_retries", 0):
                 raise RuntimeError(f"no usable final answer: {problem}")
             data["messages"].append(
                 {
@@ -394,8 +462,21 @@ class AgenticAgent(Agent):
                 data["steered"] = data.get("steered", 0) + 1
             elif kind == "follow_up" and text:
                 data.setdefault("follow_ups", []).append(text)
+            elif kind == "extend":
+                self._extend(data, message)
             else:
                 self.on_signal(ctx, data, message)
+
+    @staticmethod
+    def _extend(data: dict[str, Any], message: dict[str, Any]) -> None:
+        """An operator raises the loop's limits (then CONTs a fault the limit made)."""
+        for field, extra in (
+            ("turns", "extra_turns"),
+            ("tool_calls", "extra_calls"),
+            ("retries", "extra_retries"),
+        ):
+            with contextlib.suppress(TypeError, ValueError):
+                data[extra] = data.get(extra, 0) + max(0, int(message.get(field) or 0))
 
     def _budget(self, ctx) -> tuple[int | None, int]:
         settings = ctx.extension("agentic").get("context") or {}
@@ -533,7 +614,7 @@ class AgenticAgent(Agent):
                 },
             )
         )
-        if len(data.get("available_skills") or {}) > 1:
+        if self.loadable_skills(ctx, data):
             out.append(
                 _function(
                     "load_skill",

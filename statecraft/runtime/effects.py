@@ -391,6 +391,16 @@ class EffectManager:
         started = time.monotonic()
         try:
             if binding is None:
+                provider_name = name.split(".", 1)[0]
+                if provider_name in self.registry.unreachable:
+                    raise EffectError(
+                        "unavailable",
+                        f"its provider {provider_name} could not be reached when the runtime "
+                        "started, so this agent was not bound to it; restart when it is "
+                        "reachable, then repin the agent",
+                        effect=name,
+                        sent=False,
+                    )
                 raise EffectError("refused", "this agent may not call it", effect=name, sent=False)
             definition = self.registry.effect(name, binding)
             if definition is None:

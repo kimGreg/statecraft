@@ -135,20 +135,46 @@ def tool_name_of(raw: str) -> str:
     return FORMAT_TOKEN.sub("", str(raw)).strip()
 
 
+def body_error(error: Any) -> EffectError:
+    """An error a model endpoint put in a 200 answer (the whole answer, or one choice): by its
+    code like an HTTP status (429 and 5xx transient, 408 timeout, 401/403 auth, a context
+    overflow `invalid`), `failed` without a usable code."""
+    detail = error if isinstance(error, dict) else {"message": str(error)}
+    message = str(detail.get("message") or detail)[:300]
+    try:
+        code = int(detail.get("code"))
+    except (TypeError, ValueError):
+        code = 0
+    if 400 <= code < 600:
+        return model_failure(code, message)
+    if any(p in message.lower() for p in CONTEXT_OVERFLOW):
+        return model_failure(400, message)
+    return EffectError("failed", f"model error: {message}")
+
+
 def reply_of(raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("error"):
-        raise ModelError(f"model error: {str(raw['error'])[:300]}")
+        raise body_error(raw["error"])
     choices = raw.get("choices") or []
     if not choices:
         raise ModelError("model answered no choices")
-    message = choices[0].get("message") or {}
+    choice = choices[0]
+    if choice.get("error") or choice.get("finish_reason") == "error":
+        raise body_error(choice.get("error") or "the model's answer ended in an error")
+    message = choice.get("message") or {}
     calls = []
     for call_ in message.get("tool_calls") or []:
         function = call_.get("function") or {}
-        try:
-            arguments = json.loads(function.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            arguments = {"_unparsed": function.get("arguments")}
+        raw_arguments = function.get("arguments")
+        if isinstance(raw_arguments, dict):  # some endpoints send an object, not a string
+            arguments = raw_arguments
+        else:
+            try:
+                arguments = json.loads(raw_arguments or "{}")
+            except (json.JSONDecodeError, TypeError):
+                arguments = {"_unparsed": raw_arguments}
+            if not isinstance(arguments, dict):
+                arguments = {"_unparsed": raw_arguments}
         calls.append(
             {
                 "id": call_.get("id") or f"call_{len(calls)}",

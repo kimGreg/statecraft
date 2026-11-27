@@ -32,7 +32,8 @@ from ..sdk.agent import Agent, AgentDefinitionError, states_of
 from ..sdk.effect import EffectDefinition, definition_of
 
 AGENT_FILE = "agent.yaml"
-#: Keys of `agent.yaml` the runtime reads; others are kept in `meta`.
+#: Keys of `agent.yaml` the runtime reads. Any other key must be namespaced (`x-...`), and is
+#: kept in `meta`; an unknown plain key (a typo such as `tool:`) refuses the start.
 AGENT_KEYS = frozenset(
     {
         "id",
@@ -241,8 +242,15 @@ class Registry:
                     definition = definition.but(
                         policy=EffectPolicy.of({**definition.policy.as_dict(), **override})
                     )
-                if definition.name not in self.effects:
+                existing = self.effects.get(definition.name)
+                if existing is None:
                     self.effects[definition.name] = definition
+                elif existing.provider != definition.provider:
+                    self.problems.append(
+                        f"tool {definition.name} is offered by {existing.provider} and by "
+                        f"{definition.provider}: rename one (a provider names its tools "
+                        f"<provider>.<tool>)"
+                    )
         return warnings
 
     def freeze(self) -> None:
@@ -503,6 +511,12 @@ class _Agents:
         self, name: str, declared: dict[str, Any], *, folder: Path | None = None
     ) -> AgentDefinition:
         """A definition from a manifest entry or an `agent.yaml`."""
+        unknown = sorted(k for k in declared if k not in AGENT_KEYS and not str(k).startswith("x-"))
+        if unknown:
+            self._r.problems.append(
+                f"agent {name}: unknown keys {unknown} (namespace your own as x-...); "
+                f"known: {sorted(AGENT_KEYS)}"
+            )
         return self.register(
             name,
             str(declared["entry"]),

@@ -146,7 +146,7 @@ async def test_manifest_and_package_registration(tmp_path, monkeypatch) -> None:
         description: Doubles a number with the add tool.
         tools: [math.add]
         writes: [double]
-        owner: research
+        x-owner: research
     """)
     )
     (folder / "agent.py").write_text(
@@ -187,7 +187,7 @@ async def test_manifest_and_package_registration(tmp_path, monkeypatch) -> None:
         names = [a["name"] for a in runtime.agents()]
         assert names == ["s:double", "twice"]
         described = runtime.registry.describe_agent("s:double")
-        assert described["meta"] == {"owner": "research"} and described["states"] == ["go"]
+        assert described["meta"] == {"x-owner": "research"} and described["states"] == ["go"]
         for name in names:
             root = await runtime.spawn(name, {"n": 4})
             await runtime.run(root, timeout=10)
