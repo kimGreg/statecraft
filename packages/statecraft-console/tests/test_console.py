@@ -70,6 +70,19 @@ def make():
     return runtime
 
 
+def test_an_agent_kind_is_named_by_its_base_class() -> None:
+    from statecraft_console.model import _kind
+
+    class AgenticAgent(Agent):
+        start = "a"
+
+    class Mine(AgenticAgent):
+        pass
+
+    assert _kind(Mine, {}) == "agentic"  # only the suffix goes: not "ic"
+    assert _kind(Total, {}) == "state machine"
+
+
 def test_a_state_machine_is_read_from_its_class() -> None:
     m = machine(Total)
     assert m["start"] == "split" and m["states"] == ["split", "wait", "ask", "finish"]

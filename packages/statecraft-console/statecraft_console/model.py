@@ -71,7 +71,7 @@ def _kind(cls: type | None, definition: dict[str, Any]) -> str:
         return "unloaded"
     bases = [k.__name__ for k in cls.__mro__[1:] if k not in (object, Agent)]
     if bases:
-        return bases[-1].replace("Agent", "").lower() or "state machine"
+        return bases[-1].removesuffix("Agent").lower() or "state machine"
     return "state machine"
 
 
