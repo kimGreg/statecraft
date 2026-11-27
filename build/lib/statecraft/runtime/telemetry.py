@@ -5,7 +5,7 @@ application its spans cost nothing, and with one they go wherever the applicatio
 A runtime may also be given any tracer with the API's shape (`start_as_current_span`,
 `start_span`), which is how the tests watch it.
 
-    step span    statecraft.step    agent, root, state, step, outcome (transition|fault), error
+    step span    statecraft.step    agent, root, state, step, outcome (transition|fault)
     effect span  statecraft.effect  effect, provider, operation, attempts, waited, ok, failure,
                                     a child of its step's span, timed from the call's crossing
 
@@ -59,9 +59,8 @@ def step_outcome(span: Any, outcome: Any) -> None:
         return
     error = getattr(outcome, "error", None)
     span.set_attribute("statecraft.outcome", "fault" if error is not None else "transition")
-    if error is not None:
-        span.set_attribute("statecraft.error", str(error)[:300])
-        _error_status(span, str(error)[:300])
+    if error is not None:  # the state's error text may quote its arguments: not recorded
+        _error_status(span, "the step faulted")
 
 
 def effect_span(tracer: Any, crossing: dict[str, Any]) -> None:
@@ -73,7 +72,7 @@ def effect_span(tracer: Any, crossing: dict[str, Any]) -> None:
     attributes = _clean({f"statecraft.{k}": crossing.get(k) for k in EFFECT_FIELDS})
     span = tracer.start_span("statecraft.effect", attributes=attributes, start_time=start)
     if crossing.get("failure"):
-        _error_status(span, f"{crossing['failure']}: {crossing.get('error', '')}"[:300])
+        _error_status(span, f"failure class {crossing['failure']}")
     span.end(end_time=end)
 
 

@@ -6,7 +6,7 @@ A provider is any object with `invoke(operation, arguments, context)`; `start()`
 after it started) are optional. It may declare:
 
     capabilities: frozenset of CAPABILITIES       optional contracts it implements (tested by
-                                                  `statecraft.testing.contracts` when declared)
+                                                  `statecraft.testing.effect_contract`)
     capacity_scope: one of CAPACITY_SCOPES        where its `concurrency` limit holds
     workspace_requires: frozenset of str          workspace capabilities it needs (`mountable`),
                                                   checked at start

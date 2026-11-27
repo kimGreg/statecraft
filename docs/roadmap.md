@@ -48,6 +48,15 @@ store contract and configuration listed in `tests/test_public_api.py`; deprecati
 formats and a compatibility matrix in `docs/stability.md`; packages in lockstep at 0.3.0, each
 requiring statecraft 0.3; `scripts/check_wheels.sh` installs each extension alone from its wheel;
 `docs/guarantees.md` and `docs/providers.md`; `mkdocs.yml` for a site, not built here).
+R2 gate passed on the branch: three independent reviews of B2 to F1 (23 findings, all fixed with
+regression tests, three limits recorded in the finding map); mutants 62/62 caught
+(`scripts/run_mutants.py`: the 40 audit mutants, the A1 ones and one per guarantee this plan
+added); chaos at HEAD: the 11 original seeds on SQLite with the shell effect (seed 31 first
+stopped the harness itself: its driver waited on a lock held by a worker it had paused; the
+driver now moves on, and 31, 34, 35 pass), 3 seeds on PostgreSQL with 4 to 6 workers; the §17
+acceptance samples, item 23 included, pass from a clean environment with only the built wheels
+installed. Left to the owner: merging to `main` and publishing the packages. Not in 1.0: D2
+(isolated workers), C4, A6, E2, F2 (command-agentic stays pinned at `2e56619`).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.
@@ -82,20 +91,21 @@ Done: kernel, runtime, SQLite and memory stores, local and memory workspaces, Py
 effects, agentic extension, console, HTTP server, CLI; P0 (finish rule, message accounting, spawn
 schemas, failure classes); P0.5 audit; P0.6 remediation of AUD-01 to AUD-12 with the P0.7 gate.
 
-Known open items, carried into this plan:
+Known open items, carried into this plan, and where each ended up:
 
-| Source | Open |
-|---|---|
-| Audit AUD-13 | K4 (STOP/TERM/answer applied one step late), K6 (re-wait woken by the same fault), K9 (TERM while stopped), K10 (signal to a missing target, answer atomicity, stranded on_term child), R9 (stop then start) |
-| Audit AUD-14 | M2 to M8 (dead stdio server, eviction with calls in flight, connect lock, connect-cancel leak, JSON-RPC errors as transient, refused on held session, list-changed) |
-| Audit AUD-15 | A4 (bad arguments to offered boundary tools), A6, A7, A8, A11, A12, A13; V8 (unknown manifest keys) |
-| Audit AUD-16 | R7 (name collisions), R8 (unreachable provider pins nothing), R11 (crossings of uncommitted steps) |
-| Audit AUD-18/19/20 | A10, S6 (storage growth), W12 (`create` without folder fsync), W13 (POSIX only), CHLD and per-attempt diagnostics documented but missing |
-| Audit tests | T8, T9, T10, T13, T14 |
-| Workspace | W9 (attached root reading the run's publications), W10 (`exists` vs `read` across workspaces) |
-| Release gates | HTTP authentication; store format version and migrations |
-| Code review of the P1 design | agentic loop never passes an idempotency key; `non_repeatable` always refused; no unknown-outcome class; no reconciliation source for providers; all symlinks refused |
-| Integration | command-agentic pinned at `2e56619` |
+| Source | Open | Status |
+|---|---|---|
+| Audit AUD-13 | K4 (STOP/TERM/answer applied one step late), K6 (re-wait woken by the same fault), K9 (TERM while stopped), K10 (signal to a missing target, answer atomicity, stranded on_term child), R9 (stop then start) | fixed (B1) |
+| Audit AUD-14 | M2 to M8 (dead stdio server, eviction with calls in flight, connect lock, connect-cancel leak, JSON-RPC errors as transient, refused on held session, list-changed) | fixed (B2); M7 partly: a connection closed with a request out stays `transient` (the client cannot prove it unsent); the review's reconnect loop fixed |
+| Audit AUD-15 | A4 (bad arguments to offered boundary tools), A6, A7, A8, A11, A12, A13; V8 (unknown manifest keys) | fixed (B3) |
+| Audit AUD-16 | R7 (name collisions), R8 (unreachable provider pins nothing), R11 (crossings of uncommitted steps) | fixed (B3; R11 with E1) |
+| Audit AUD-18/19/20 | A10, S6 (storage growth), W12 (`create` without folder fsync), W13 (POSIX only), CHLD and per-attempt diagnostics documented but missing | S6, W12, CHLD, per-attempt diagnostics fixed (C2, A3, E1); A10 out of scope for 1.0 (history is linear; the record still holds the conversation); W13 out of scope (POSIX only, documented) |
+| Audit tests | T8, T9, T10, T13, T14 | fixed (B3); T13 partly (the `run()` races behind the flaky tests fixed) |
+| Workspace | W9 (attached root reading the run's publications), W10 (`exists` vs `read` across workspaces) | fixed (A3) |
+| Release gates | HTTP authentication; store format version and migrations | fixed (D1, C1) |
+| Code review of the P1 design | agentic loop never passes an idempotency key; `non_repeatable` always refused; no unknown-outcome class; no reconciliation source for providers; all symlinks refused | fixed (A1, A3); `non_repeatable` stays refused from states by design (docs/guarantees.md) |
+| Review of B2 to F1 | 23 findings (kernel and stores 8, runtime 6, server and extensions 9) | fixed with regression tests (`b889253`); left: metrics read every journaled call (cost on large stores), a `usd` limit without client prices may be passed by one call, GC holds an agent's lease for its sweep (signals wait for it) |
+| Integration | command-agentic pinned at `2e56619` | independent track (F2): stays pinned |
 
 ## 2. Principles (from the revised architecture)
 

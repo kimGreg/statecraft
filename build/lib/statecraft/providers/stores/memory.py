@@ -46,8 +46,9 @@ class _Tables:
         for e in log:
             if e["id"] == event_id:
                 return e["seq"]
-        log.append({**copy.deepcopy(event), "seq": len(log) + 1})
-        return len(log)
+        seq = max((e["seq"] for e in log), default=0) + 1  # never reused after compaction
+        log.append({**copy.deepcopy(event), "seq": seq})
+        return seq
 
     def event_read(self, root: str, after: int) -> list[dict[str, Any]]:
         return copy.deepcopy([e for e in self.s["events"].get(root, []) if e["seq"] > after])

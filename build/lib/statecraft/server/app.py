@@ -133,6 +133,14 @@ def must_own(request: Request, agent_id: str) -> Principal:
     return principal
 
 
+def must_see_everything(request: Request) -> Principal:
+    """Store-wide operations are for principals not restricted to some runs."""
+    principal = principal_of(request)
+    if principal.roots is not None:
+        raise Forbidden(f"{principal.name} is restricted to some runs; this is store-wide")
+    return principal
+
+
 def must_allow(request: Request, scope: str) -> Principal:
     principal = principal_of(request)
     if not principal.allows(scope):
@@ -175,6 +183,8 @@ def server_app(
         for touched in (root_id, attach, (inherit or {}).get("root")):
             if touched is not None:
                 must_own(request, str(touched))
+        if attach is not None and "/" not in attach:  # and the run it works in, if attached
+            must_own(request, await runtime.attach_target(attach))
         try:
             root = await runtime.spawn(
                 agent,
@@ -187,7 +197,16 @@ def server_app(
             )
         except (KeyError, ValueError, TypeError) as exc:
             return _json({"error": str(exc)}, 400)
-        await audit(request, root, "spawn", definition=agent, attach=attach)
+        await audit(
+            request,
+            root,
+            "spawn",
+            definition=agent,
+            attach=attach,
+            attach_mode=body.get("attach_mode"),
+            inherit=inherit,
+            budget=body.get("budget"),
+        )
         return _json({"root": root}, 201)
 
     async def get(request: Request) -> Response:
@@ -392,6 +411,7 @@ def server_app(
         return _json([f for f in await runtime.faults() if principal.owns(f["root"])])
 
     async def metrics(request: Request) -> Response:
+        must_see_everything(request)  # store-wide counts
         found = await runtime.metrics()
         if request.query_params.get("format") == "json":
             return _json(found)
@@ -401,6 +421,7 @@ def server_app(
         if request.method == "GET":
             return _json({"on": await runtime.maintenance()})
         principal = must_allow(request, "admin")
+        must_see_everything(request)  # it holds every run
         on = (await read_body(request)).get("on")
         if not isinstance(on, bool):
             raise BadRequest("'on' must be true or false")

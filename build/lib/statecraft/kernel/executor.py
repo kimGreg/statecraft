@@ -432,6 +432,8 @@ class Executor:
         async with self.slots:
             if self.stopping:
                 return
+            if await self.store.setting("maintenance"):  # turned on while it waited for a slot
+                return
             lease = await self.store.try_acquire(agent_id, self.owner, self.lease_ttl, self.now())
             if lease is None:
                 return

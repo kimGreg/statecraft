@@ -202,7 +202,10 @@ class StepContext:
         body = dumps(artifact.model_dump())
         sha = hashlib.sha256(body).hexdigest()
         path = f"{home(self.id)}/objects/{sha}.json"
-        await self._files.create(path, body)
+        if not await self._files.create(path, body):
+            # the same content as an object written before (perhaps by an attempt that never
+            # committed): written again, so its age starts now and collection's grace covers it
+            await self._files.put(path, body)
         n = len(self.effects.published)
         self.effects.published[kind] = {"path": path, "sha256": sha, "step": self.step, "n": n}
         return path

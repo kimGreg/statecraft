@@ -12,9 +12,10 @@ What must hold
     agent's record and every entry of its retained history (forks read those records, so their
     references count), and it is older than `grace`;
   * collection never races a commit: an agent's home is swept while collection holds that
-    agent's lease (no attempt runs, so nothing is published meanwhile), and its references are
-    read after the lease was taken; an agent with a running step is skipped, an ended agent
-    needs no lease (it never runs again);
+    agent's lease (no attempt runs, so nothing is published meanwhile), its references are read
+    after the lease was taken, and the lease is renewed as removals go (lost: the sweep stops);
+    an agent with a running step is skipped, an ended agent needs no lease (it never runs
+    again), and a dry run takes none (it removes nothing);
   * a dry run reports and removes nothing; a workspace that is not `collectable` is reported;
   * forgetting a run is refused while it works or another run reads it (`StateStore.forget`).
 """
@@ -31,6 +32,18 @@ if TYPE_CHECKING:
     from .runtime import Runtime
 
 OWNER = "statecraft-upkeep"
+
+
+class LeaseLost(Exception):
+    """Collection's lease on an agent expired during its sweep: the sweep stopped."""
+
+
+def _collectable(runtime: Runtime, files: Any) -> bool:
+    declared = getattr(runtime.workspaces.provider, "capabilities", None) or ()
+    has = all(hasattr(files, m) for m in ("remove", "modified", "prune"))
+    return has and ("collectable" in declared or bool(getattr(files, "collectable", False)))
+
+
 LEASE_SECONDS = 120.0
 
 
@@ -50,7 +63,14 @@ def _staging_step(path: str, prefix: str) -> int | None:
 
 
 async def _sweep(
-    runtime: Runtime, record: Record, files: Any, *, dry_run: bool, grace: float, now: float
+    runtime: Runtime,
+    record: Record,
+    files: Any,
+    *,
+    dry_run: bool,
+    grace: float,
+    now: float,
+    still_held: Any = None,
 ) -> dict[str, list[str]]:
     found: dict[str, list[str]] = {"staging": [], "objects": []}
     staging = f"{home(record.id)}/staging/"
@@ -65,12 +85,14 @@ async def _sweep(
             continue
         try:
             age = now - await files.modified(path)
-        except FileNotFoundError:
+        except OSError:  # gone, or not a plain file: not this sweep's to remove
             continue
         if age >= grace:
             found["objects"].append(path)
     if not dry_run:
-        for path in [*found["staging"], *found["objects"]]:
+        for n, path in enumerate([*found["staging"], *found["objects"]]):
+            if n % 32 == 0 and still_held is not None and not await still_held():
+                raise LeaseLost(record.id)  # an attempt may run now: stop before it publishes
             await files.remove(path)
         if found["staging"]:
             await files.prune(staging)
@@ -83,17 +105,26 @@ async def collect(runtime: Runtime, *, dry_run: bool = True, grace: float = 3600
     for root in await runtime.store.roots():
         for record in await runtime.store.tree(root.id):
             files = await runtime.workspaces.files_of(record.id)
-            if not getattr(files, "collectable", False):
+            if not _collectable(runtime, files):
                 report["skipped"].append({"agent": record.id, "why": "workspace not collectable"})
                 continue
             lease = None
-            if not record.ended:
+            if not record.ended and not dry_run:  # a dry run removes nothing: no lease
                 lease = await runtime.store.try_acquire(
                     record.id, OWNER, LEASE_SECONDS, runtime.clock()
                 )
                 if lease is None:
                     report["skipped"].append({"agent": record.id, "why": "a step is running"})
                     continue
+            held = {"lease": lease}
+
+            async def still_held(agent_id: str = record.id, held: dict = held) -> bool:
+                renewed = await runtime.store.renew(
+                    agent_id, held["lease"], LEASE_SECONDS, runtime.clock()
+                )
+                held["lease"] = renewed or held["lease"]
+                return renewed is not None
+
             try:
                 current = await runtime.store.load(record.id)  # read after the lease was taken
                 found = await _sweep(
@@ -103,14 +134,17 @@ async def collect(runtime: Runtime, *, dry_run: bool = True, grace: float = 3600
                     dry_run=dry_run,
                     grace=grace,
                     now=time.time(),  # file times are wall-clock times
+                    still_held=still_held if lease is not None else None,
                 )
+            except LeaseLost:
+                report["skipped"].append({"agent": record.id, "why": "the lease ran out"})
+                continue
             finally:
                 if lease is not None:
-                    await runtime.store.release(record.id, lease)
+                    await runtime.store.release(record.id, held["lease"])
             report["staging"] += found["staging"]
             report["objects"] += found["objects"]
-    if not dry_run:
-        runtime.notify()  # agents whose lease collection held may run again
+    runtime.notify()  # agents whose lease collection held may run again
     return report
 
 
@@ -118,13 +152,17 @@ async def forget(
     runtime: Runtime, root: str, *, files: bool = False, dry_run: bool = False
 ) -> dict:
     """Delete an ended run from the store; with `files`, its files too: its own workspace, or,
-    when it worked attached to another run's, its homes there."""
+    when it worked attached to another run's, its homes there. The store forgets it first (the
+    check that nobody reads it is in that transaction), then the files go: a run never loses
+    its files while something can still read them. Empty folders may stay."""
     record = await runtime.store.load(root)
-    found = await runtime.store.forget(root, dry_run=True)  # refused here, before any file goes
+    workspace = None
     if files:
         workspace = await runtime.workspaces.open(record.workspace or root)
-        if not getattr(workspace, "collectable", False):
+        if not _collectable(runtime, workspace):
             raise ValueError(f"the workspace of {root} is not collectable; forget it without files")
+    found = await runtime.store.forget(root, dry_run=dry_run)
+    if workspace is not None:
         prefix = home(root) if record.workspace else ""
         paths = await workspace.list(prefix)
         found = {**found, "files": len(paths)}
@@ -133,8 +171,6 @@ async def forget(
                 await workspace.remove(path)
             for folder in [prefix] if prefix else ["home", "shared", "run"]:
                 await workspace.prune(folder)
-    if not dry_run:
-        await runtime.store.forget(root)
     return found
 
 

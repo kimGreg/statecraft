@@ -57,7 +57,7 @@ from statecraft import (
     state,
     tool,
 )
-from statecraft.kernel.store import Ended
+from statecraft.kernel.store import Ended, Unavailable
 from statecraft.kernel.transitions import InvalidAnswer
 from statecraft.providers.stores import SqliteStore
 from statecraft.providers.workspaces import LocalWorkspace
@@ -362,6 +362,8 @@ class Driver:
         except Ended as exc:
             self.refused.append({"agent": target, "error": str(exc)})
             self.log("refused", agent=target, roll=round(roll, 3))
+        except Unavailable:  # a paused worker holds the write lock: nothing stored; later
+            self.log("unavailable", agent=target, roll=round(roll, 3))
         except (InvalidAnswer, KeyError) as exc:
             self.log("ignored", agent=target, error=str(exc)[:120])
 

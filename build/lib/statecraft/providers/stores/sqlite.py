@@ -76,8 +76,9 @@ def _migrate_1(db: sqlite3.Connection) -> None:
 
 
 def _migrate_2(db: sqlite3.Connection) -> None:
-    """2 -> 3: nothing to rewrite (full-record history entries are valid checkpoints); the format
-    number keeps an older statecraft from reading deltas it does not know."""
+    """2 -> 3: nothing to rewrite (full-record history entries are valid checkpoints). The format
+    number keeps statecraft 0.3 and later from misreading a newer store; statecraft 0.2 never
+    reads it, so do not run 0.2 on a migrated store (keep the backup to go back)."""
 
 
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1, 2: _migrate_2}
@@ -395,17 +396,26 @@ class SqliteStore(StateStore):
 
 def migrate(path: str | Path) -> tuple[int | None, int]:
     """Back the store up (`<path>.format-<n>.bak`) and upgrade it to this statecraft's format.
-    Returns (the format it had, the format it has)."""
-    import shutil
-
+    Returns (the format it had, the format it has). Stop every process using the store first:
+    one that is writing makes this refuse (`Unavailable`). The backup is SQLite's online backup,
+    so it holds what is still in the write-ahead log too."""
     path = Path(path)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=1.0, isolation_level=None)
     try:
         found = format_of(db)
+        if found is not None and found < FORMAT:
+            try:
+                db.execute("BEGIN EXCLUSIVE")  # no other writer now
+                db.execute("ROLLBACK")
+            except sqlite3.OperationalError as exc:
+                raise Unavailable(f"{path} is in use; stop its processes, then migrate") from exc
+            backup = sqlite3.connect(path.with_name(f"{path.name}.format-{found}.bak"))
+            try:
+                db.backup(backup)
+            finally:
+                backup.close()
     finally:
         db.close()
-    if found is not None and found < FORMAT:
-        shutil.copy2(path, path.with_name(f"{path.name}.format-{found}.bak"))
     SqliteStore(path, migrate=True).close()
     return found, FORMAT
 
