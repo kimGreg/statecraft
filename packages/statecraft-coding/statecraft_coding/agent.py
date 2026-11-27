@@ -35,8 +35,8 @@ What must hold
 from __future__ import annotations
 
 import hashlib
-import posixpath
 import json
+import posixpath
 from typing import Any, ClassVar
 
 from statecraft_agentic import AgenticAgent
