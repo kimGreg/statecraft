@@ -293,7 +293,9 @@ class Runtime:
             problem = self._check_spawns(definition, outcome)
             if problem is None and outcome.attach:
                 problem = await self.attach_problem(definition, outcome)
-            if problem is None and outcome.done:
+            if problem is None and outcome.done and not record.terminating:
+                # an agent being terminated ends through its on_term state, and its live
+                # children get TERM with it: the rule is for an agent finishing on its own
                 problem = await self.live_children_problem(record, outcome)
             if problem is None and outcome.spawns:
                 problem = await self.limit_problem(record, len(outcome.spawns))

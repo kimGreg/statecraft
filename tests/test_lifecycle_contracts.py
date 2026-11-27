@@ -176,3 +176,38 @@ async def test_a_message_after_a_term_in_the_same_batch_is_kept() -> None:
         record = await rt.store.load(root)
     assert record.status == "terminated"
     assert record.undelivered == [{"message": {"n": 2}, "reason": "arrived as it ended"}]
+
+
+class Holding(Agent):
+    """Spawns a child that waits, then waits itself; its cleanup finishes."""
+
+    start = "spawn"
+    on_term = "cleanup"
+
+    @state
+    async def spawn(self, ctx, data):
+        return Spawn({"w": ("waiter", {})}, then="hold")
+
+    @state
+    async def hold(self, ctx, data):
+        return Wait(answer={"name": "never", "question": "?"}, then="cleanup")
+
+    @state
+    async def cleanup(self, ctx, data):
+        return Done
+
+
+async def test_a_terminated_parent_ends_through_on_term_with_live_children() -> None:
+    """TERM to a parent with a live child: its `on_term` state finishing ends it (terminated),
+    and the child gets TERM; the live-children rule is for an agent finishing on its own."""
+    rt = runtime()
+    rt.registrar.agents.register("holding", Holding, spawns=["waiter"])
+    async with rt:
+        root = await rt.spawn("holding", root_id="h")
+        await rt.run(root, timeout=10)
+        await rt.signal(root, "TERM")
+        await rt.run(root, timeout=10)
+        record = await rt.get(root)
+        faults = [h for h in await rt.history(root) if h["kind"] == "fault"]
+        assert record["view"] == "terminated" and faults == []
+        assert (await rt.get("h/w"))["view"] == "terminated"
