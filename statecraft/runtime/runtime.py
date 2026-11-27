@@ -22,6 +22,7 @@ import json
 import re
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,8 @@ class Runtime:
         self._tasks: list[asyncio.Task[None]] = []
         self._seen_views: dict[str, Any] = {}
         self._temporary: list[Executor] = []  # executors `run()` makes while it runs
+        #: every executor made over this runtime, however it was made (KILL reaches them all)
+        self._every_executor: weakref.WeakSet[Executor] = weakref.WeakSet()
 
     # ---- construction -------------------------------------------------------------------------
     @classmethod
@@ -217,9 +220,13 @@ class Runtime:
             raise NotStarted("start the runtime first: `await runtime.start()` or `async with`")
 
     # ---- the executor's environment -----------------------------------------------------------
+    def adopt(self, executor: Executor) -> None:
+        """An executor was made over this runtime (called by the executor itself)."""
+        self._every_executor.add(executor)
+
     def killed(self, agent_id: str) -> None:
         """An agent was killed: every executor of this runtime cancels its running step."""
-        for executor in [*self.executors, *self._temporary]:
+        for executor in list(self._every_executor):
             executor.cancel(agent_id, "killed")
 
     def notify(self) -> None:

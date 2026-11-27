@@ -115,6 +115,9 @@ class Executor:
         self._cancelled: set[str] = set()
         #: failures while handling a record that were not the agent's (newest last)
         self.failures: list[dict[str, Any]] = []
+        adopt = getattr(env, "adopt", None)
+        if adopt is not None:  # so a KILL carried out anywhere reaches this executor's steps
+            adopt(self)
 
     @property
     def store(self) -> StateStore:

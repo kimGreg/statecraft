@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import ClassVar
 
 from statecraft import Agent, Done, EffectPolicy, Spawn, Wait, state
 from statecraft.kernel.process import Lease
@@ -269,3 +270,63 @@ async def until(check, seconds: float = 20.0) -> None:
     while not await check():
         assert asyncio.get_running_loop().time() < deadline, "the condition never held"
         await asyncio.sleep(0.01)
+
+
+class Ticking(Agent):
+    """Stands for a step making calls: ticks until it is cancelled."""
+
+    start = "go"
+    ticks: ClassVar[list[float]] = []
+    started: ClassVar[asyncio.Event | None] = None
+
+    @state
+    async def go(self, ctx, data):
+        Ticking.started.set()
+        for _ in range(200):
+            Ticking.ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+        return Done
+
+
+class KillsItsChild(Agent):
+    start = "spawn"
+
+    @state
+    async def spawn(self, ctx, data):
+        return Spawn({"c": ("ticking", {})}, then="kill")
+
+    @state
+    async def kill(self, ctx, data):
+        await Ticking.started.wait()
+        ctx.signal("c", "KILL")
+        return Wait(join=["c"], then="done")
+
+    @state
+    async def done(self, ctx, data):
+        return Done
+
+
+async def test_a_kill_intent_reaches_a_step_on_another_executor() -> None:
+    """A KILL carried out by one executor cancels the child's step on another executor of the
+    same runtime at once, not at that executor's next lease renewal."""
+    from statecraft.kernel.executor import Executor
+
+    Ticking.ticks, Ticking.started = [], asyncio.Event()
+    rt = memory_runtime()
+    rt.registrar.agents.register("killer", KillsItsChild, spawns=["ticking"])
+    rt.registrar.agents.register("ticking", Ticking)
+    async with rt:
+        await rt.spawn("killer", root_id="k")
+        a, b = Executor(rt, owner="A"), Executor(rt, owner="B")
+        await a._process(await rt.store.load("k"))
+        await a.drain()  # the spawn step
+        await a._process(await rt.store.load("k"))  # the child is made; `kill` starts
+        await b._process(await rt.store.load("k/c"))  # the child's step runs on B
+        await a.drain()  # the parent commits the KILL intent
+        await a._process(await rt.store.load("k"))  # A carries it out
+        await asyncio.sleep(0.05)
+        after = len(Ticking.ticks)
+        await asyncio.sleep(0.3)
+        assert len(Ticking.ticks) == after
+        assert (await rt.store.load("k/c")).status == "terminated"
+        await b.stop(0.1)
