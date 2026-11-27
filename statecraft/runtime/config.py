@@ -1,6 +1,7 @@
 """One configuration builds a runtime (architecture §13).
 
-    runtime: {concurrency: 16, executors: 1, drain: 30, lease_ttl: 120, beat: 30}
+    runtime: {concurrency: 16, executors: 1, drain: 30, lease_ttl: 120, beat: 30,
+              limits: {max_depth: 3, max_agents: 32, max_live: 8}}
     store: {provider: sqlite, path: ./statecraft.db}            # or memory
     workspace: {provider: local, root: ./workspaces}            # or memory
     plugins: [agentic, research]                                # enabled entry points
@@ -79,7 +80,7 @@ def runtime_from_config(config: str | Path | dict[str, Any], **overrides: Any) -
     options = {
         k: v
         for k, v in (data.get("runtime") or {}).items()
-        if k in ("concurrency", "executors", "lease_ttl", "beat", "scan_every", "drain")
+        if k in ("concurrency", "executors", "lease_ttl", "beat", "scan_every", "drain", "limits")
     }
     runtime = Runtime(store=store, workspace=workspace, **{**options, **overrides})
     configure(runtime.registrar, data, base)

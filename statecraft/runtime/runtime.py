@@ -39,6 +39,9 @@ from .registry import AgentDefinition, Registrar, Registry, RegistryError
 from .views import agents_state
 from .workspace import HOME_FOLDERS, WorkspaceProvider, WorkspaceService, input_path
 
+#: Limits a runtime can put on every tree (`Runtime(limits=...)`, configuration `runtime.limits`).
+LIMITS = ("max_depth", "max_agents", "max_live")
+
 
 class NotStarted(RuntimeError):
     """The runtime must be started (`await runtime.start()`) first."""
@@ -69,6 +72,7 @@ class Runtime:
         envelope: type[Artifact] = Artifact,
         state: Callable[..., Any] | None = None,
         contracts: Any = None,
+        limits: dict[str, int] | None = None,
         clock: Callable[[], float] = time.time,
         owner: str | None = None,
     ) -> None:
@@ -91,6 +95,11 @@ class Runtime:
         self.envelope = envelope
         self.state_fn = state
         self.contracts = contracts
+        unknown = set(limits or {}) - set(LIMITS)
+        if unknown:
+            raise ValueError(f"unknown limits {sorted(unknown)}; known: {list(LIMITS)}")
+        #: limits on every tree (a root and its descendants), checked on each spawn
+        self.limits = {k: int(v) for k, v in (limits or {}).items() if v is not None}
         self.owner = owner or f"runtime-{uuid.uuid4().hex[:8]}"
         self.warnings: list[str] = []
         self.started = False
@@ -238,9 +247,30 @@ class Runtime:
             return Fault(problem, crossings=list(ctx.effects.crossings))
         if isinstance(outcome, Transition):
             problem = self._check_spawns(definition, outcome)
+            if problem is None and outcome.spawns:
+                problem = await self.limit_problem(record, len(outcome.spawns))
             if problem:
                 return Fault(problem, crossings=list(outcome.crossings))
         return outcome
+
+    async def limit_problem(self, parent: Record, count: int) -> str | None:
+        """Why `count` new children of `parent` would break the tree's limits, or None.
+        `max_depth`: a root is depth 0; `max_agents`: every agent the tree ever had;
+        `max_live`: agents of the tree not ended (running, waiting or suspended)."""
+        if not self.limits or count <= 0:
+            return None
+        depth = parent.id.count("/") + 1
+        if "max_depth" in self.limits and depth > self.limits["max_depth"]:
+            return f"limit max_depth={self.limits['max_depth']}: a child would be at depth {depth}"
+        if "max_agents" in self.limits or "max_live" in self.limits:
+            tree = await self.store.tree(parent.id.split("/")[0])
+            total = len(tree) + count
+            if "max_agents" in self.limits and total > self.limits["max_agents"]:
+                return f"limit max_agents={self.limits['max_agents']}: the tree would have {total}"
+            live = sum(1 for r in tree if not r.ended) + count
+            if "max_live" in self.limits and live > self.limits["max_live"]:
+                return f"limit max_live={self.limits['max_live']}: {live} agents would be live"
+        return None
 
     def _check_spawns(self, parent: AgentDefinition, t: Transition) -> str | None:
         for name, (target, child_input) in t.spawns.items():
@@ -617,4 +647,4 @@ class Runtime:
         return False
 
 
-__all__ = ["NotStarted", "Runtime", "agent_of_question"]
+__all__ = ["LIMITS", "NotStarted", "Runtime", "agent_of_question"]

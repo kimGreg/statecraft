@@ -240,6 +240,55 @@ class StepContext:
             "inherits": head.inherits,
         }
 
+    async def children_view(self) -> list[dict[str, Any]]:
+        """Its children as they are now: name, agent, status and phase (`running`, `waiting`
+        for a join, an answer or a sleep, `faulted`, `stopped`, or ended), its state and step,
+        what it published, its error and an open question."""
+        found = []
+        for name, child_id in self.record.children.items():
+            record = await self._runtime.store.find(child_id)
+            if record is None:
+                found.append({"name": name, "id": child_id, "status": "starting"})
+                continue
+            kinds = [r["kind"] for r in record.reasons]
+            if record.ended:
+                phase = record.status
+            elif "fault" in kinds:
+                phase = "faulted"
+            elif "stopped" in kinds:
+                phase = "stopped"
+            elif kinds:
+                phase = "waiting"
+            else:
+                phase = "running"
+            question = record.reason("answer")
+            found.append(
+                {
+                    "name": name,
+                    "id": child_id,
+                    "agent": record.agent,
+                    "status": record.status,
+                    "phase": phase,
+                    "waiting_for": kinds,
+                    "state": record.state,
+                    "step": record.step,
+                    "published": sorted(record.published),
+                    "children": sorted(record.children),
+                    "error": record.error,
+                    "question": question.get("question") if question else None,
+                }
+            )
+        return found
+
+    async def spawn_problem(self, target: str, count: int = 1) -> str | None:
+        """Why spawning `count` of `target` would be refused (not permitted, not registered, or
+        over the tree's limits), or None. The runtime checks the same when the state ends."""
+        if not self._runtime.registry.may_spawn(self.definition, target):
+            return f"agent {self.definition.name} may not spawn {target}"
+        if self._runtime.registry.resolve_spawn(self.definition, target) is None:
+            return f"cannot spawn {target}: not registered"
+        return await self._runtime.limit_problem(self.record, count)
+
     def discard(self) -> None:
         """Drop what this step staged (artifacts, notes)."""
         self.effects.published.clear()

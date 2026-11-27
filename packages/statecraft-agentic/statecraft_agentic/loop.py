@@ -2,7 +2,7 @@
 
     prepare -> think -> act_one -> act_one -> ... -> think -> ... -> finish -> Done
                  |        |                                            |
-                 |        +- a boundary tool (spawn_agent, wait_for,     +- a follow-up waits:
+                 |        +- a boundary tool (spawn_agent, join_agents,  +- a follow-up waits:
                  |           ask_person, sleep) returns Spawn/Wait;        think again
                  |           wait_result adds its result
                  +- the context is over budget: compact -> think
@@ -25,6 +25,14 @@ People steer a running agent with USR signals (durable, like every signal):
                                                     goes on with it instead (the last answer is
                                                     the output)
 Any other USR message goes to `on_signal`.
+
+Children are processes the model manages (when the agent may spawn): `spawn_agent` starts one and
+returns at once (the parent goes on working: spawning is asynchronous); `list_agents` and
+`inspect_agent` show their phase and what they published; `join_agents` waits for the ones whose
+results it needs (a waiting parent holds no execution slot); `signal_agent` stops, continues,
+ends or steers one. A spawn the runtime would refuse (not permitted, over the tree's limits) is
+told to the model instead. Before the agent finishes with children still live it is told once;
+finishing anyway ends them (an ending parent terminates its children).
 
 Settings come from the definition's `extensions.agentic`:
 
@@ -55,9 +63,25 @@ GENERAL = """You are one agent in a larger procedure. Work only with your tools.
   with `read_artifact`. `ask_person` asks a person and waits for the answer.
 - When you are done, answer with your final result only{output}."""
 
-BOUNDARY = {"spawn_agent", "wait_for", "ask_person", "sleep"}
+COLLABORATE = """Working with other agents:
+- `spawn_agent` delegates an independent task and returns at once: the child runs on its own while
+  you go on with your own work. Give it a precise task and the shared file paths it needs; it does
+  not see your conversation.
+- All agents share the workspace (`shared/...`); each has its own conversation. Agree on who
+  writes which file: two agents must not write the same file.
+- `list_agents` / `inspect_agent` show how your children are doing; `read_artifact` with `by` reads
+  what one published, also before it ended.
+- `join_agents` only when you need results you do not have yet; never wait without a reason.
+- `signal_agent` steers a child (`steer`, `follow_up`) or controls it (STOP, CONT, TERM, KILL).
+- Before you finish, join the children you still need and end the ones you do not."""
+
+BOUNDARY = {"spawn_agent", "join_agents", "wait_for", "ask_person", "sleep"}
+#: Tools that manage children (offered when the agent may spawn); answered within the step.
+CHILD_TOOLS = {"list_agents", "inspect_agent", "signal_agent"}
+SIGNALS = {"STOP", "CONT", "TERM", "KILL"}
 BUILTIN = {"read_artifact", "read_file", "list_files", "load_skill"}
 RESULT_CHARS = 12_000
+ENDED = ("succeeded", "terminated")
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 SKILLS_SERVICE = "agentic.skills"
 
@@ -152,6 +176,7 @@ class AgenticAgent(Agent):
                 await self.task_instruction(ctx, data),
                 GENERAL.format(output=shape),
                 ("Skills you can load with `load_skill`: " + ", ".join(others)) if others else "",
+                COLLABORATE if self.spawnable(ctx) else "",
                 await self._project_context(ctx),
             )
             if p
@@ -251,7 +276,7 @@ class AgenticAgent(Agent):
             raise RuntimeError(f"more than {self.max_tool_calls} tool calls")
         name, arguments = call_["name"], call_["arguments"]
         if name in BOUNDARY:
-            boundary = self._boundary(ctx, data, name, arguments)
+            boundary = await self._boundary(ctx, data, name, arguments)
             if isinstance(boundary, (Spawn, Wait)):
                 data["boundary"] = {"name": name, "arguments": arguments}
                 return boundary
@@ -264,7 +289,7 @@ class AgenticAgent(Agent):
         woke = ctx.woke
         if boundary["name"] == "spawn_agent":
             result: Any = {"spawned": boundary["arguments"].get("name")}
-        elif boundary["name"] == "wait_for":
+        elif boundary["name"] in ("join_agents", "wait_for"):
             result = {
                 "children": woke.get("children", {}),
                 "faulted": [
@@ -289,6 +314,20 @@ class AgenticAgent(Agent):
             problem = f"{type(exc).__name__}: {exc}"
             payload = None
         self._take_signals(ctx, data)
+        if not problem and not data.get("children_told"):
+            live = [c for c in await ctx.children_view() if c.get("phase") not in ENDED]
+            if live:
+                data["children_told"] = True
+                names = ", ".join(f"{c['name']} ({c['phase']})" for c in live)
+                data["messages"].append(
+                    {
+                        "role": "user",
+                        "content": f"Before you finish: children still live: {names}. Join the "
+                        "ones whose results you need, or end them; answering again as you did "
+                        "ends them.",
+                    }
+                )
+                return "think"
         if not problem and data["follow_ups"]:
             text = data["follow_ups"].pop(0)
             data["messages"].append({"role": "user", "content": text})
@@ -364,6 +403,25 @@ class AgenticAgent(Agent):
                 continue
             found.append(f"Project context ({path}):\n{text.strip()}")
         return "\n\n".join(found)
+
+    async def _child_tool(self, ctx, name: str, arguments: dict[str, Any]) -> Any:
+        children = await ctx.children_view()
+        if name == "list_agents":
+            keys = ("name", "agent", "phase", "published", "error")
+            return [{k: c.get(k) for k in keys if c.get(k) is not None} for c in children]
+        child = next((c for c in children if c["name"] == arguments.get("name")), None)
+        if child is None:
+            return {"error": f"no child {arguments.get('name')!r}; yours: {sorted(ctx.children)}"}
+        if name == "inspect_agent":
+            return {k: v for k, v in child.items() if v not in (None, [], "")}
+        signal = str(arguments.get("signal") or "")
+        if signal in SIGNALS:
+            ctx.signal(child["name"], signal)
+        elif signal in ("steer", "follow_up") and arguments.get("text"):
+            ctx.signal(child["name"], ("USR", {"type": signal, "text": str(arguments["text"])}))
+        else:
+            return {"error": "signal is STOP, CONT, TERM, KILL, or steer/follow_up with text"}
+        return {"sent": signal, "to": child["name"], "after": "this step commits"}
 
     def _model(self, ctx) -> str:
         return str(ctx.extension("agentic").get("model") or self.model)
@@ -456,32 +514,63 @@ class AgenticAgent(Agent):
             )
         spawnable = self.spawnable(ctx)
         if spawnable:
-            out.append(
+            names = {"type": "array", "items": {"type": "string"}}
+            out += [
                 _function(
                     "spawn_agent",
-                    "Start an agent; wait_for it, then read its artifact.",
+                    "Start a child agent on a task. Returns at once; the child runs while you "
+                    "go on. Its input is all it knows of the task.",
                     {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string"},
+                            "name": {"type": "string", "description": "a new name: a-z 0-9 _ -"},
                             "agent": {"type": "string", "enum": spawnable},
                             "input": {"type": "object"},
                         },
                         "required": ["name", "agent"],
                     },
-                )
-            )
-            out.append(
+                ),
                 _function(
-                    "wait_for",
-                    "Wait until the named agents end.",
+                    "list_agents",
+                    "Your children: each one's phase (running, waiting, faulted, stopped, "
+                    "succeeded, terminated) and what it published.",
+                    {"type": "object", "properties": {}},
+                ),
+                _function(
+                    "inspect_agent",
+                    "One child in detail: phase, state, step, published artifacts, its error, an "
+                    "open question, its own children.",
                     {
                         "type": "object",
-                        "properties": {"names": {"type": "array", "items": {"type": "string"}}},
-                        "required": ["names"],
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
                     },
-                )
-            )
+                ),
+                _function(
+                    "join_agents",
+                    "Wait until the named children end (you pause meanwhile). Only for results "
+                    "you need now.",
+                    {"type": "object", "properties": {"names": names}, "required": ["names"]},
+                ),
+                _function(
+                    "signal_agent",
+                    "Send a child a signal: STOP, CONT, TERM, KILL; or `steer` (a new instruction "
+                    "for its next turn) or `follow_up` (more work after it would finish), with "
+                    "`text`.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "signal": {
+                                "type": "string",
+                                "enum": [*sorted(SIGNALS), "steer", "follow_up"],
+                            },
+                            "text": {"type": "string"},
+                        },
+                        "required": ["name", "signal"],
+                    },
+                ),
+            ]
         out.append(
             _function(
                 "ask_person",
@@ -498,7 +587,7 @@ class AgenticAgent(Agent):
         )
         return out
 
-    def _boundary(self, ctx, data, name: str, arguments: dict[str, Any]) -> Any:
+    async def _boundary(self, ctx, data, name: str, arguments: dict[str, Any]) -> Any:
         if name == "spawn_agent":
             child = str(arguments.get("name") or "")
             agent = str(arguments.get("agent") or "")
@@ -506,11 +595,14 @@ class AgenticAgent(Agent):
                 return {"error": f"you cannot spawn {agent!r}"}
             if not re.fullmatch(r"[a-z0-9_-]{1,40}", child) or child in ctx.children:
                 return {"error": f"choose a new child name (a-z, 0-9, _ or -), not {child!r}"}
+            if data["children"] >= self.max_children:
+                return {"error": f"you may start at most {self.max_children} children"}
+            refused = await ctx.spawn_problem(agent)
+            if refused:
+                return {"error": f"refused: {refused}"}
             data["children"] += 1
-            if data["children"] > self.max_children:
-                raise RuntimeError(f"more than {self.max_children} children")
             return Spawn({child: (agent, dict(arguments.get("input") or {}))}, then="wait_result")
-        if name == "wait_for":
+        if name in ("join_agents", "wait_for"):
             names = [n for n in arguments.get("names") or [] if n in ctx.children]
             if not names:
                 return {"error": "name children you spawned"}
@@ -544,6 +636,8 @@ class AgenticAgent(Agent):
                 return await ctx.files.list(str(arguments.get("prefix") or ""))
             if name == "load_skill":
                 return await self._skill_text(ctx, data, str(arguments.get("name")))
+            if name in CHILD_TOOLS:
+                return await self._child_tool(ctx, name, arguments)
             offered = {model_name_of(t): t for t in self.offered(ctx)}
             if name not in offered:
                 return {"error": f"unknown tool {name!r}"}

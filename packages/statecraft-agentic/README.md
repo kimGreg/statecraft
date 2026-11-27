@@ -26,6 +26,13 @@ The loop is a harness over the runtime's durable execution:
   waits until the agent would finish, then the agent goes on with it (its last answer is the
   output). Signals are durable, so a steer sent before a crash is not lost. Other USR messages go
   to `on_signal`.
+- **Children as processes.** An agent that may spawn gets `spawn_agent` (asynchronous: it returns
+  at once and the parent works on), `list_agents`, `inspect_agent`, `join_agents` (waits for the
+  named children only; the parent holds no execution slot meanwhile) and `signal_agent` (STOP,
+  CONT, TERM, KILL, or a `steer` / `follow_up` for an agentic child), and collaboration guidance
+  in its prompt: delegate independent tasks, share files through `shared/` with one writer per
+  file, join only when a result is needed. A spawn the runtime would refuse (the tree's limits)
+  is told to the model. Finishing with live children is told once; finishing anyway ends them.
 - **Project context.** `context.files` (workspace paths such as `shared/AGENTS.md`) are added to
   the system prompt when present.
 
