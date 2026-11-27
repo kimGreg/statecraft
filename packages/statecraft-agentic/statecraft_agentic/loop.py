@@ -525,9 +525,13 @@ class AgenticAgent(Agent):
                         "properties": {
                             "name": {"type": "string", "description": "a new name: a-z 0-9 _ -"},
                             "agent": {"type": "string", "enum": spawnable},
-                            "input": {"type": "object"},
+                            "input": {
+                                "type": "object",
+                                "description": "everything the child gets: its task and the "
+                                "facts and file paths it needs",
+                            },
                         },
-                        "required": ["name", "agent"],
+                        "required": ["name", "agent", "input"],
                     },
                 ),
                 _function(
@@ -595,6 +599,11 @@ class AgenticAgent(Agent):
                 return {"error": f"you cannot spawn {agent!r}"}
             if not re.fullmatch(r"[a-z0-9_-]{1,40}", child) or child in ctx.children:
                 return {"error": f"choose a new child name (a-z, 0-9, _ or -), not {child!r}"}
+            if not arguments.get("input"):
+                return {
+                    "error": "input is empty: a child knows only its input; put its task (and "
+                    "what it needs) there"
+                }
             if data["children"] >= self.max_children:
                 return {"error": f"you may start at most {self.max_children} children"}
             refused = await ctx.spawn_problem(agent)

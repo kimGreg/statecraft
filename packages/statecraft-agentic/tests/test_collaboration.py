@@ -73,8 +73,18 @@ class Scenario:
         script = [
             {
                 "calls": [
-                    ("spawn_agent", {"name": "architecture", "agent": "researcher"}),
-                    ("spawn_agent", {"name": "tests", "agent": "reviewer"}),
+                    (
+                        "spawn_agent",
+                        {
+                            "name": "architecture",
+                            "agent": "researcher",
+                            "input": {"task": "analyse shared/src"},
+                        },
+                    ),
+                    (
+                        "spawn_agent",
+                        {"name": "tests", "agent": "reviewer", "input": {"task": "review tests"}},
+                    ),
                 ]
             },
             call("math__add", a=40, b=2),  # its own work while the children run
@@ -164,7 +174,7 @@ async def test_a_spawn_over_the_limits_is_told_to_the_model() -> None:
         turn = sum(1 for m in messages if m["role"] == "assistant")
         depth_note = [m["content"] for m in messages if m["role"] == "tool"]
         if turn == 0:
-            return call("spawn_agent", name="deeper", agent="researcher")
+            return call("spawn_agent", name="deeper", agent="researcher", input={"task": "go"})
         return say(json.dumps({"summary": depth_note[0] if depth_note else ""}))
 
     model = ScriptedModel(step_fn=step)

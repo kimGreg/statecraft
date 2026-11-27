@@ -32,7 +32,14 @@ The loop is a harness over the runtime's durable execution:
   CONT, TERM, KILL, or a `steer` / `follow_up` for an agentic child), and collaboration guidance
   in its prompt: delegate independent tasks, share files through `shared/` with one writer per
   file, join only when a result is needed. A spawn the runtime would refuse (the tree's limits)
-  is told to the model. Finishing with live children is told once; finishing anyway ends them.
+  is told to the model, as is a spawn with an empty input (a child knows only its input).
+  Finishing with live children is told once; finishing anyway ends them.
+- **Failures.** A tool or model call that fails transiently or times out is retried by the
+  runtime as its policy allows; one that still fails comes back to the model as the tool's
+  result (a model call faults the agent: CONT resumes the same turn). A faulted child wakes its
+  joining parent with the fault. `tests/test_resilience_real_model.py` runs these on a real
+  model, with STOP/CONT, a runtime stopped mid-run, a process killed in a tool call and a hung
+  child killed by an operator.
 - **Project context.** `context.files` (workspace paths such as `shared/AGENTS.md`) are added to
   the system prompt when present.
 
