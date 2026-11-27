@@ -28,7 +28,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .process import ChildView, Fault, Lease, Record, Transition
-from .store import Busy, Conflict, Fenced, StateStore
+from .store import Busy, Conflict, Ended, Fenced, StateStore, Unread
 from .transitions import (
     InvalidAnswer,
     InvalidTransition,
@@ -246,9 +246,10 @@ class Executor:
                     await self.store.kill(target.id)
                     self.cancel(target.id, "killed")
                 elif target is not None:
-                    await self.store.append_inbox(
-                        target.id, intent["id"], {"kind": "signal", "signal": intent["signal"]}
-                    )
+                    with contextlib.suppress(Ended):  # a signal to an ended child is a no-op
+                        await self.store.append_inbox(
+                            target.id, intent["id"], {"kind": "signal", "signal": intent["signal"]}
+                        )
             record = await self._control(
                 record,
                 lambda r, i=intent["id"]: mark_intent_done(r, i),
@@ -306,6 +307,10 @@ class Executor:
             lease = current if current and current.epoch == lease.epoch else lease
             try:
                 await self.store.commit_step(agent_id, lease, record.step, outcome, self.now())
+            except Unread:
+                log.info("%s: messages arrived as it ended; running the state again", agent_id)
+                await self.store.release(agent_id, lease)
+                self.env.notify()
             except InvalidTransition as exc:
                 await self.store.commit_step(
                     agent_id, lease, record.step, Fault(f"invalid transition: {exc}"), self.now()

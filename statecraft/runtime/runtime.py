@@ -29,7 +29,7 @@ import jsonschema
 
 from ..kernel.executor import Executor, signal_name
 from ..kernel.process import Fault, Lease, Record, Transition
-from ..kernel.store import StateStore
+from ..kernel.store import Ended, StateStore
 from ..kernel.transitions import InvalidAnswer, apply_answer, view
 from ..sdk.agent import run_state
 from ..sdk.contracts import Artifact
@@ -40,7 +40,7 @@ from .views import agents_state
 from .workspace import HOME_FOLDERS, WorkspaceProvider, WorkspaceService, input_path
 
 #: Limits a runtime can put on every tree (`Runtime(limits=...)`, configuration `runtime.limits`).
-LIMITS = ("max_depth", "max_agents", "max_live")
+LIMITS = ("max_depth", "max_total_agents", "max_live_agents")
 
 
 class NotStarted(RuntimeError):
@@ -247,29 +247,58 @@ class Runtime:
             return Fault(problem, crossings=list(ctx.effects.crossings))
         if isinstance(outcome, Transition):
             problem = self._check_spawns(definition, outcome)
+            if problem is None and outcome.done:
+                problem = await self.live_children_problem(record, outcome)
             if problem is None and outcome.spawns:
                 problem = await self.limit_problem(record, len(outcome.spawns))
             if problem:
                 return Fault(problem, crossings=list(outcome.crossings))
         return outcome
 
+    async def live_children_problem(self, record: Record, t: Transition) -> str | None:
+        """An agent may not finish while a child is live (running, waiting, faulted or
+        stopped), unless it ends that child (TERM or KILL) in this step or ended it before:
+        children are joined or ended deliberately, never cut off by a parent finishing."""
+        ending = {
+            target for target, signal in t.signals if signal_name(signal) in ("TERM", "KILL")
+        } | {
+            i["target"]
+            for i in record.intents
+            if i["kind"] == "signal" and signal_name(i["signal"]) in ("TERM", "KILL")
+        }
+        live = []
+        for name, child_id in record.children.items():
+            if child_id in ending:
+                continue
+            child = await self.store.find(child_id)
+            if child is not None and not child.ended:
+                live.append(name)
+        if not live:
+            return None
+        return (
+            f"{record.agent} finished while children are live: {', '.join(sorted(live))} "
+            "(join them, or end them with TERM or KILL, before finishing)"
+        )
+
     async def limit_problem(self, parent: Record, count: int) -> str | None:
         """Why `count` new children of `parent` would break the tree's limits, or None.
-        `max_depth`: a root is depth 0; `max_agents`: every agent the tree ever had;
-        `max_live`: agents of the tree not ended (running, waiting or suspended)."""
+        `max_depth`: a root is depth 0; `max_total_agents`: every agent the tree ever had;
+        `max_live_agents`: agents of the tree not ended (running, waiting or suspended)."""
         if not self.limits or count <= 0:
             return None
         depth = parent.id.count("/") + 1
         if "max_depth" in self.limits and depth > self.limits["max_depth"]:
             return f"limit max_depth={self.limits['max_depth']}: a child would be at depth {depth}"
-        if "max_agents" in self.limits or "max_live" in self.limits:
+        if "max_total_agents" in self.limits or "max_live_agents" in self.limits:
             tree = await self.store.tree(parent.id.split("/")[0])
             total = len(tree) + count
-            if "max_agents" in self.limits and total > self.limits["max_agents"]:
-                return f"limit max_agents={self.limits['max_agents']}: the tree would have {total}"
+            most = self.limits.get("max_total_agents")
+            if most is not None and total > most:
+                return f"limit max_total_agents={most}: the tree would have {total}"
             live = sum(1 for r in tree if not r.ended) + count
-            if "max_live" in self.limits and live > self.limits["max_live"]:
-                return f"limit max_live={self.limits['max_live']}: {live} agents would be live"
+            most = self.limits.get("max_live_agents")
+            if most is not None and live > most:
+                return f"limit max_live_agents={most}: {live} agents would be live"
         return None
 
     def _check_spawns(self, parent: AgentDefinition, t: Transition) -> str | None:
@@ -378,6 +407,10 @@ class Runtime:
         return root_id
 
     async def signal(self, agent_id: str, signal: Any, *, message_id: str | None = None) -> None:
+        """Raises `Ended` for an agent that has ended (the message would never be read)."""
+        record = await self.store.load(agent_id)
+        if record.ended:
+            raise Ended(f"{agent_id} has ended ({record.status}); it takes no more signals")
         if signal_name(signal) == "KILL":
             await self.store.kill(agent_id)
             for executor in self.executors:

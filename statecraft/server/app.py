@@ -28,6 +28,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from ..kernel.store import Ended
 from ..kernel.transitions import InvalidAnswer
 from ..runtime.runtime import Runtime
 
@@ -115,6 +116,8 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             await runtime.signal(request.path_params["id"], sent)
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
         return Response(status_code=204)
 
     async def repin(request: Request) -> Response:
@@ -156,7 +159,7 @@ def server_app(runtime: Runtime, *, manage: bool = False) -> Starlette:
             await runtime.answer(
                 request.path_params["id"], body.get("answer"), by=str(body.get("by") or "person")
             )
-        except (InvalidAnswer, KeyError) as exc:
+        except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
         return Response(status_code=204)
 

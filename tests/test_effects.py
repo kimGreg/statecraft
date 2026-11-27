@@ -173,3 +173,43 @@ async def test_a_python_tool_result_breaking_its_schema_fails() -> None:
         root = await runtime.spawn("caller", {"tool": "calc.bad"})
         await runtime.run(root, timeout=10)
         assert (await runtime.artifact(root, "outcome"))["payload"]["failure"] == "failed"
+
+
+def test_exceptions_and_http_answers_are_classified() -> None:
+    from statecraft import classify
+    from statecraft.kernel.effects import classify_status
+
+    class ConnectError(Exception):  # named as HTTP libraries name theirs
+        pass
+
+    class ReadTimeout(Exception):
+        pass
+
+    class Response:
+        def __init__(self, status: int, text: str = "") -> None:
+            self.status_code, self.text = status, text
+
+    class HTTPStatusError(Exception):
+        def __init__(self, status: int, text: str = "") -> None:
+            super().__init__(status)
+            self.response = Response(status, text)
+
+    found = {
+        "refused": classify(ConnectionRefusedError()),
+        "connect": classify(ConnectError("down")),
+        "timeout": classify(ReadTimeout()),
+        "reset": classify(ConnectionResetError()),
+        "503": classify(HTTPStatusError(503)),
+        "401": classify(HTTPStatusError(401, "bad key")),
+        "bug": classify(ValueError("no")),
+    }
+    assert (found["refused"].cls, found["refused"].sent) == ("unavailable", False)
+    assert (found["connect"].cls, found["connect"].sent) == ("unavailable", False)
+    assert found["timeout"].cls == "timeout" and found["reset"].cls == "transient"
+    assert found["503"].cls == "transient"
+    assert (found["401"].cls, found["401"].code) == ("refused", "auth")
+    assert found["bug"].cls == "failed"  # an ordinary exception is never retried
+    overflow = classify_status(400, '{"error": "This model\'s maximum context length is 8192"}')
+    assert (overflow.cls, overflow.code) == ("invalid", "context_overflow")
+    assert classify_status(400, "bad field").code == "400"
+    assert classify_status(408).cls == "timeout" and classify_status(429).cls == "transient"

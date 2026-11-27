@@ -109,7 +109,11 @@ async def test_the_same_api_embedded_and_served() -> None:
             except StatecraftError as exc:
                 assert exc.status == 404
             assert await client.questions() == []  # the question was answered
-            await client.signal("s1", "STOP")  # an ended agent: a no-op, not an error
+            try:  # an ended agent takes no more signals: refused, not silently dropped
+                await client.signal("s1", "STOP")
+                raise AssertionError("a signal to an ended agent was accepted")
+            except StatecraftError as exc:
+                assert exc.status == 409
     finally:
         server.should_exit = True
         await task

@@ -47,7 +47,14 @@ def _term_children(record: Record) -> list[dict[str, Any]]:
 
 
 def _end(record: Record, status: str) -> Record:
-    ended = record.but(status=status, reasons=[], wake=None, terminating=False, mailbox=[])
+    ended = record.but(
+        status=status,
+        reasons=[],
+        wake=None,
+        terminating=False,
+        mailbox=[],
+        undelivered=[*record.undelivered, *record.mailbox],
+    )
     return ended.but(intents=[*ended.intents, *_term_children(ended)])
 
 
@@ -190,7 +197,12 @@ def apply_signal(record: Record, signal: Any) -> Record:
         if record.term_state is None:
             return _end(record, "terminated")
         return record.but(
-            state=record.term_state, terminating=True, reasons=[], wake={"kind": "term"}, mailbox=[]
+            state=record.term_state,
+            terminating=True,
+            reasons=[],
+            wake={"kind": "term"},
+            mailbox=[],
+            undelivered=[*record.undelivered, *record.mailbox],
         )
     if name == "KILL":
         return _end(record, "terminated")  # the store also bumps the lease epoch

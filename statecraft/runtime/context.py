@@ -12,6 +12,8 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
+import jsonschema
+
 from ..kernel.process import Lease, Record
 from ..sdk.agent import StepEffects
 from ..sdk.contracts import Artifact
@@ -280,13 +282,34 @@ class StepContext:
             )
         return found
 
-    async def spawn_problem(self, target: str, count: int = 1) -> str | None:
-        """Why spawning `count` of `target` would be refused (not permitted, not registered, or
-        over the tree's limits), or None. The runtime checks the same when the state ends."""
+    def spawn_target(self, target: str) -> dict[str, Any] | None:
+        """What a spawn target is (name, description, input schema), if this agent may spawn it."""
+        registry = self._runtime.registry
+        found = registry.resolve_spawn(self.definition, target)
+        if found is None or not registry.may_spawn(self.definition, target):
+            return None
+        return {
+            "name": found.name,
+            "description": found.description,
+            "input_schema": found.input_schema,
+        }
+
+    async def spawn_problem(
+        self, target: str, count: int = 1, input: dict[str, Any] | None = None
+    ) -> str | None:
+        """Why spawning `count` of `target` (with `input`, when given) would be refused: not
+        permitted, not registered, an input its schema rejects, or over the tree's limits; None
+        when it would not. The runtime checks the same when the state ends."""
         if not self._runtime.registry.may_spawn(self.definition, target):
             return f"agent {self.definition.name} may not spawn {target}"
-        if self._runtime.registry.resolve_spawn(self.definition, target) is None:
+        found = self._runtime.registry.resolve_spawn(self.definition, target)
+        if found is None:
             return f"cannot spawn {target}: not registered"
+        if input is not None and found.input_schema is not None:
+            try:
+                jsonschema.validate(input, found.input_schema)
+            except jsonschema.ValidationError as exc:
+                return f"input for {target} is invalid: {exc.message[:200]}"
         return await self._runtime.limit_problem(self.record, count)
 
     def discard(self) -> None:

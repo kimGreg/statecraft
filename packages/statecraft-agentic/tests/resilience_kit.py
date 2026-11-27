@@ -34,7 +34,8 @@ TASK = (
 )
 
 #: what the tools do: {"transient": n, "hang": n, "fail": bool, "hang_always": bool,
-#: "crash_at": n, "on_call": {n: callback}}
+#: "crash_at": n, "on_call": {n: callback}, "gate_at": n with "entered": asyncio.Event (the
+#: n-th call sets it, then blocks until it is cancelled)}
 PLAN: dict[str, Any] = {}
 CALLS: list[dict[str, Any]] = []
 
@@ -64,6 +65,9 @@ async def add(a: float, b: float) -> float:
     n = _log("calc.add", a, b)
     if PLAN.get("crash_at") and n == PLAN["crash_at"]:
         os._exit(17)  # the process dies inside a tool call, as a SIGKILL would
+    if PLAN.get("gate_at") == n:
+        PLAN["entered"].set()
+        await asyncio.Event().wait()  # held until the step is cancelled
     callback = (PLAN.get("on_call") or {}).get(n)
     if callback is not None:
         callback()

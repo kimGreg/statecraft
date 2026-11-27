@@ -24,6 +24,7 @@ from typing import Any, Protocol
 import httpx
 
 from statecraft import EffectDefinition, EffectError, EffectPolicy
+from statecraft.kernel.effects import classify, classify_status
 
 from .context import estimate
 
@@ -83,18 +84,10 @@ class ChatModel:
                 response = await client.post(
                     f"{self.base_url}/chat/completions", json=body, headers=headers
                 )
-        except httpx.ConnectError as exc:
-            raise EffectError(
-                "unavailable", f"cannot connect: {type(exc).__name__}", sent=False
-            ) from exc
-        except httpx.TransportError as exc:
-            raise EffectError("transient", f"transport: {type(exc).__name__}") from exc
-        if response.status_code >= 500 or response.status_code == 429:
-            raise EffectError("transient", f"endpoint answered {response.status_code}")
+        except httpx.TransportError as exc:  # connect, timeout, protocol: classified by type
+            raise classify(exc) from exc
         if response.status_code >= 400:
-            raise EffectError(
-                "failed", f"endpoint answered {response.status_code}: {response.text[:300]}"
-            )
+            raise classify_status(response.status_code, response.text)
         try:
             return reply_of(response.json())
         except (json.JSONDecodeError, ModelError) as exc:

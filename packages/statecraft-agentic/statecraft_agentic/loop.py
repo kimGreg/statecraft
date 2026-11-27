@@ -31,8 +31,8 @@ returns at once (the parent goes on working: spawning is asynchronous); `list_ag
 `inspect_agent` show their phase and what they published; `join_agents` waits for the ones whose
 results it needs (a waiting parent holds no execution slot); `signal_agent` stops, continues,
 ends or steers one. A spawn the runtime would refuse (not permitted, over the tree's limits) is
-told to the model instead. Before the agent finishes with children still live it is told once;
-finishing anyway ends them (an ending parent terminates its children).
+told to the model instead. An agent may not finish while a child is live (the runtime faults it):
+it is told once before it tries, to join the children or end them.
 
 Settings come from the definition's `extensions.agentic`:
 
@@ -53,7 +53,7 @@ import json
 import re
 from typing import Any, ClassVar
 
-from statecraft import Agent, Done, Spawn, Wait, state
+from statecraft import Agent, Done, EffectError, Spawn, Wait, state
 
 from .context import cut_for, estimate, project, summary_request
 
@@ -73,7 +73,8 @@ COLLABORATE = """Working with other agents:
   what one published, also before it ended.
 - `join_agents` only when you need results you do not have yet; never wait without a reason.
 - `signal_agent` steers a child (`steer`, `follow_up`) or controls it (STOP, CONT, TERM, KILL).
-- Before you finish, join the children you still need and end the ones you do not."""
+- You cannot finish while a child is live: join the children you still need and end the
+  others (TERM) first."""
 
 BOUNDARY = {"spawn_agent", "join_agents", "wait_for", "ask_person", "sleep"}
 #: Tools that manage children (offered when the agent may spawn); answered within the step.
@@ -82,6 +83,8 @@ SIGNALS = {"STOP", "CONT", "TERM", "KILL"}
 BUILTIN = {"read_artifact", "read_file", "list_files", "load_skill"}
 RESULT_CHARS = 12_000
 ENDED = ("succeeded", "terminated")
+#: Model calls over its context window in a row that compaction may answer before a fault.
+MAX_OVERFLOWS = 2
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 SKILLS_SERVICE = "agentic.skills"
 
@@ -210,9 +213,17 @@ class AgenticAgent(Agent):
         if over and cut_for(data["messages"], data.get("compaction"), keep) is not None:
             return "compact"
         sent = project(data["messages"], data.get("compaction"))
-        reply = await ctx.call(
-            f"model.{self._model(ctx)}", messages=sent, tools=self._tools(ctx, data)
-        )
+        try:
+            reply = await ctx.call(
+                f"model.{self._model(ctx)}", messages=sent, tools=self._tools(ctx, data)
+            )
+        except EffectError as exc:
+            if exc.code != "context_overflow" or data.get("overflows", 0) >= MAX_OVERFLOWS:
+                raise
+            data["overflows"] = data.get("overflows", 0) + 1
+            data["force_compact"] = True  # the model's window is smaller than the budget
+            return "compact"
+        data["overflows"] = 0
         data["turns"] += 1
         self._count(data, reply)
         prompt = (reply.get("usage") or {}).get("prompt_tokens")
@@ -247,9 +258,12 @@ class AgenticAgent(Agent):
     async def compact(self, ctx, data):
         """Summarize the oldest messages that can be cut; the history keeps them."""
         _budget, keep = self._budget(ctx)
+        forced = data.pop("force_compact", False)
         earlier = data.get("compaction")
-        cut = cut_for(data["messages"], earlier, keep)
+        cut = cut_for(data["messages"], earlier, 0 if forced else keep)
         if cut is None:
+            if forced:
+                raise RuntimeError("over the model's context window, and nothing to compact")
             return "think"
         reply = await ctx.call(
             f"model.{self._model(ctx)}",
@@ -323,8 +337,8 @@ class AgenticAgent(Agent):
                     {
                         "role": "user",
                         "content": f"Before you finish: children still live: {names}. Join the "
-                        "ones whose results you need, or end them; answering again as you did "
-                        "ends them.",
+                        "ones whose results you need and end the others (signal_agent TERM); "
+                        "finishing with a live child is a fault.",
                     }
                 )
                 return "think"
@@ -404,6 +418,17 @@ class AgenticAgent(Agent):
             found.append(f"Project context ({path}):\n{text.strip()}")
         return "\n\n".join(found)
 
+    def _spawn_menu(self, ctx, spawnable: list[str]) -> str:
+        """One line per agent it may spawn: its description and its input schema."""
+        lines = []
+        for target in spawnable:
+            info = ctx.spawn_target(target) or {}
+            line = f"- {target}: {(info.get('description') or '').strip()[:300]}"
+            if info.get("input_schema"):
+                line += f" Input schema: {json.dumps(info['input_schema'], ensure_ascii=False)}"
+            lines.append(line)
+        return "\n".join(lines)
+
     async def _child_tool(self, ctx, name: str, arguments: dict[str, Any]) -> Any:
         children = await ctx.children_view()
         if name == "list_agents":
@@ -414,6 +439,8 @@ class AgenticAgent(Agent):
             return {"error": f"no child {arguments.get('name')!r}; yours: {sorted(ctx.children)}"}
         if name == "inspect_agent":
             return {k: v for k, v in child.items() if v not in (None, [], "")}
+        if child.get("phase") in ENDED:
+            return {"error": f"{child['name']} has ended ({child['phase']}): it takes no signals"}
         signal = str(arguments.get("signal") or "")
         if signal in SIGNALS:
             ctx.signal(child["name"], signal)
@@ -519,7 +546,8 @@ class AgenticAgent(Agent):
                 _function(
                     "spawn_agent",
                     "Start a child agent on a task. Returns at once; the child runs while you "
-                    "go on. Its input is all it knows of the task.",
+                    "go on. Its input is all it knows of the task. Agents:\n"
+                    + self._spawn_menu(ctx, spawnable),
                     {
                         "type": "object",
                         "properties": {
@@ -599,18 +627,16 @@ class AgenticAgent(Agent):
                 return {"error": f"you cannot spawn {agent!r}"}
             if not re.fullmatch(r"[a-z0-9_-]{1,40}", child) or child in ctx.children:
                 return {"error": f"choose a new child name (a-z, 0-9, _ or -), not {child!r}"}
-            if not arguments.get("input"):
-                return {
-                    "error": "input is empty: a child knows only its input; put its task (and "
-                    "what it needs) there"
-                }
             if data["children"] >= self.max_children:
                 return {"error": f"you may start at most {self.max_children} children"}
-            refused = await ctx.spawn_problem(agent)
+            given = arguments.get("input")
+            if not isinstance(given, dict):
+                return {"error": "input must be an object: the child's task and what it needs"}
+            refused = await ctx.spawn_problem(agent, input=given)
             if refused:
                 return {"error": f"refused: {refused}"}
             data["children"] += 1
-            return Spawn({child: (agent, dict(arguments.get("input") or {}))}, then="wait_result")
+            return Spawn({child: (agent, dict(given))}, then="wait_result")
         if name in ("join_agents", "wait_for"):
             names = [n for n in arguments.get("names") or [] if n in ctx.children]
             if not names:
@@ -651,8 +677,23 @@ class AgenticAgent(Agent):
             if name not in offered:
                 return {"error": f"unknown tool {name!r}"}
             return await ctx.call(offered[name], **dict(arguments or {}))
+        except EffectError as exc:  # classified by the runtime: the model decides what next
+            return {
+                "error": {
+                    "class": exc.cls,
+                    "code": exc.code or None,
+                    "message": exc.message,
+                    "may_work_later": exc.cls in ("transient", "timeout", "unavailable"),
+                }
+            }
         except Exception as exc:
-            return {"error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "error": {
+                    "class": "failed",
+                    "message": f"{type(exc).__name__}: {exc}"[:500],
+                    "may_work_later": False,
+                }
+            }
 
 
 __all__ = ["BOUNDARY", "AgenticAgent", "model_name_of", "parse_json"]

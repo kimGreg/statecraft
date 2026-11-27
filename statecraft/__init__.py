@@ -13,7 +13,7 @@ The kernel has no notion of a model, a prompt, a skill or reasoning; extensions 
 runs) and docs/architecture.md (what surrounds it).
 """
 
-from .kernel.effects import EffectError, EffectPolicy
+from .kernel.effects import EffectError, EffectPolicy, classify
 from .runtime.registry import AgentDefinition, Registrar
 from .runtime.runtime import Runtime
 from .sdk.agent import Agent, ChildFailed, Done, ExecutableAgent, Spawn, Wait, state
@@ -34,6 +34,7 @@ __all__ = [
     "Runtime",
     "Spawn",
     "Wait",
+    "classify",
     "effect",
     "state",
     "tool",

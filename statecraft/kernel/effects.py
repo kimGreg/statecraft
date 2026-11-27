@@ -92,9 +92,77 @@ def may_retry(policy: EffectPolicy, failure: EffectError, *, keyed: bool, attemp
     return False
 
 
+#: Phrases model endpoints use when a request is over the model's context window.
+CONTEXT_OVERFLOW = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "too many tokens",
+    "prompt is too long",
+    "reduce the length",
+)
+
+
+def classify_status(status: int, body: str = "", *, effect: str = "") -> EffectError:
+    """An HTTP error answer as a failure: 429 and 5xx `transient`, 408 `timeout`, 401/403
+    `refused` (code `auth`), a 400 about the context window `invalid` (code
+    `context_overflow`), other 4xx `invalid`."""
+    text = body[:300]
+    if status == 429 or status >= 500:
+        return EffectError("transient", f"answered {status}", effect=effect, code=str(status))
+    if status == 408:
+        return EffectError("timeout", f"answered {status}", effect=effect, code="408")
+    if status in (401, 403):
+        return EffectError("refused", f"answered {status}: {text}", effect=effect, code="auth")
+    if any(p in body.lower() for p in CONTEXT_OVERFLOW):
+        return EffectError(
+            "invalid", f"over the context window: {text}", effect=effect, code="context_overflow"
+        )
+    return EffectError("invalid", f"answered {status}: {text}", effect=effect, code=str(status))
+
+
+def classify(exc: BaseException, *, effect: str = "") -> EffectError:
+    """An exception as a classified failure, for tools that call networks:
+
+        except Exception as exc:
+            raise classify(exc) from exc
+
+    `EffectError` as it is; refused connections `unavailable` (never sent); timeouts `timeout`;
+    other connection and transport errors `transient`; an HTTP error answer by its status
+    (`classify_status`); anything else `failed` (not retried). Exceptions are recognized by
+    type name too, so HTTP libraries need not be imported here."""
+    if isinstance(exc, EffectError):
+        return exc
+    names = {k.__name__ for k in type(exc).__mro__}
+    message = f"{type(exc).__name__}: {exc}"[:300]
+    if names & {"ConnectionRefusedError", "ConnectError", "ConnectTimeout"}:
+        return EffectError("unavailable", message, effect=effect, sent=False)
+    if names & {"TimeoutError", "TimeoutException", "ReadTimeout", "WriteTimeout", "PoolTimeout"}:
+        return EffectError("timeout", message, effect=effect)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        body = str(getattr(exc.response, "text", "") or "")  # type: ignore[attr-defined]
+        return classify_status(status, body, effect=effect)
+    if names & {"ConnectionError", "TransportError", "RemoteProtocolError", "BrokenPipeError"}:
+        return EffectError("transient", message, effect=effect)
+    return EffectError("failed", message, effect=effect)
+
+
 def digest_of(value: Any) -> str:
     body = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()
     return "sha256:" + hashlib.sha256(body).hexdigest()[:32]
 
 
-__all__ = ["COSTS", "FAILURES", "KINDS", "EffectError", "EffectPolicy", "digest_of", "may_retry"]
+__all__ = [
+    "CONTEXT_OVERFLOW",
+    "COSTS",
+    "FAILURES",
+    "KINDS",
+    "EffectError",
+    "EffectPolicy",
+    "classify",
+    "classify_status",
+    "digest_of",
+    "may_retry",
+]

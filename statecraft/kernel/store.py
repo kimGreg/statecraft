@@ -40,6 +40,16 @@ class Busy(StoreError):
     """Another executor holds a valid lease on the record."""
 
 
+class Ended(StoreError):
+    """The agent has ended: it takes no more signals or answers."""
+
+
+class Unread(StoreError):
+    """A step would end the agent while messages it has not read are waiting: not committed.
+    The executor releases the lease; the next pass applies the messages and runs the state
+    again, so the agent sees them before it ends."""
+
+
 class Tables(Protocol):
     """One transaction's view of the adapter's tables."""
 
@@ -205,6 +215,8 @@ class StateStore:
             if before is None or before.step != expected_step:
                 raise Conflict(f"{agent_id}: expected step {expected_step}")
             after = apply_outcome(before, outcome, now=now)
+            if after.ended and t.inbox_read(agent_id, before.inbox_applied):
+                raise Unread(f"{agent_id}: messages arrived before it could end")
             kind = "fault" if isinstance(outcome, Fault) else "step"
             saved = self._save(
                 t, before, after, kind, crossings=list(outcome.crossings), from_state=before.state
@@ -249,9 +261,22 @@ class StateStore:
     async def append_inbox(self, agent_id: str, message_id: str, message: Any) -> bool:
         """Append if that id is not there yet; signals and answers are never applied twice."""
         with self.transaction() as t:
-            if t.get(agent_id) is None:
+            record = t.get(agent_id)
+            if record is None:
                 raise KeyError(agent_id)
+            if record.ended:
+                raise Ended(f"{agent_id} has ended ({record.status}); it takes no more messages")
             return t.inbox_append(agent_id, message_id, message)
 
 
-__all__ = ["Busy", "Conflict", "Fenced", "StateStore", "StoreError", "Tables", "root_of"]
+__all__ = [
+    "Busy",
+    "Conflict",
+    "Ended",
+    "Fenced",
+    "StateStore",
+    "StoreError",
+    "Tables",
+    "Unread",
+    "root_of",
+]

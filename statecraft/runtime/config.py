@@ -1,7 +1,7 @@
 """One configuration builds a runtime (architecture §13).
 
     runtime: {concurrency: 16, executors: 1, drain: 30, lease_ttl: 120, beat: 30,
-              limits: {max_depth: 3, max_agents: 32, max_live: 8}}
+              limits: {max_depth: 3, max_total_agents: 32, max_live_agents: 8}}
     store: {provider: sqlite, path: ./statecraft.db}            # or memory
     workspace: {provider: local, root: ./workspaces}            # or memory
     plugins: [agentic, research]                                # enabled entry points

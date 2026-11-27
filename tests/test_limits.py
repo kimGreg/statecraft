@@ -3,9 +3,9 @@
 What must hold
   * `max_depth`: a spawn that would put a child below the limit faults the parent with the
     reason (a root is depth 0);
-  * `max_agents`: the tree never has more agents than the limit, counting ended ones;
-  * `max_live`: no more agents of the tree than the limit are live at once; once children end,
-    new ones may start;
+  * `max_total_agents`: the tree never has more agents than the limit, counting ended ones;
+  * `max_live_agents`: no more agents of the tree than the limit are live at once (waiting ones
+    count; execution slots are `runtime.concurrency`); once children end, new ones may start;
   * `ctx.spawn_problem` tells an agent in advance what the runtime would refuse;
   * the limits come from `Runtime(limits=...)` or the configuration's `runtime.limits`; an
     unknown limit is refused.
@@ -83,25 +83,25 @@ async def test_max_depth_faults_the_parent_that_would_go_too_deep() -> None:
 
 
 async def test_max_live_lets_rounds_through_and_refuses_a_burst() -> None:
-    async with runtime_with(max_live=3) as runtime:
+    async with runtime_with(max_live_agents=3) as runtime:
         rounds = await runtime.spawn("fan", {"n": 6, "round": 2}, root_id="rounds")
         rows = await runtime.run(rounds, timeout=10)
         assert {r["view"] for r in rows} == {"succeeded"} and len(rows) == 7
         burst = await runtime.spawn("fan", {"n": 3}, root_id="burst")
         await runtime.run(burst, timeout=10)
         record = await runtime.get(burst)
-    assert record["view"] == "suspended" and "limit max_live=3" in record["error"]
-    assert record["data"]["problem"] == "limit max_live=3: 4 agents would be live"
+    assert record["view"] == "suspended" and "limit max_live_agents=3" in record["error"]
+    assert record["data"]["problem"] == "limit max_live_agents=3: 4 agents would be live"
 
 
 async def test_max_agents_counts_ended_agents_too() -> None:
-    async with runtime_with(max_agents=4) as runtime:
+    async with runtime_with(max_total_agents=4) as runtime:
         root = await runtime.spawn("fan", {"n": 4, "round": 1}, root_id="a")
         await runtime.run(root, timeout=10)
         rows = await runtime.tree(root)
     assert len(rows) == 4  # the root and three leaves; the fourth leaf was refused
     head = next(r for r in rows if r["id"] == "a")
-    assert "limit max_agents=4: the tree would have 5" in head["error"]
+    assert "limit max_total_agents=4: the tree would have 5" in head["error"]
 
 
 def test_limits_come_from_the_configuration(tmp_path) -> None:
@@ -109,9 +109,9 @@ def test_limits_come_from_the_configuration(tmp_path) -> None:
         {
             "store": {"provider": "memory"},
             "workspace": {"provider": "memory"},
-            "runtime": {"limits": {"max_depth": 3, "max_agents": 32, "max_live": 8}},
+            "runtime": {"limits": {"max_depth": 3, "max_total_agents": 32, "max_live_agents": 8}},
         }
     )
-    assert runtime.limits == {"max_depth": 3, "max_agents": 32, "max_live": 8}
+    assert runtime.limits == {"max_depth": 3, "max_total_agents": 32, "max_live_agents": 8}
     with pytest.raises(ValueError, match="unknown limits"):
         memory_runtime(limits={"max_tokens": 10})

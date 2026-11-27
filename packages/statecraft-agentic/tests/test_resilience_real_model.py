@@ -189,16 +189,14 @@ async def test_stop_in_the_middle_then_continue() -> None:
 
 
 async def test_a_stopped_runtime_resumes_in_a_new_one(tmp_path) -> None:
-    kit.reset(hang=0, on_call={3: lambda: kit.PLAN.update(hang=1, hang_seconds=1.5)})
+    entered = asyncio.Event()
+    kit.reset(gate_at=3, entered=entered)
     first = kit.on_disk(tmp_path, executors=1)
     async with first:
         await first.spawn("calc", {"task": kit.TASK}, root_id="job")
-
-        async def busy() -> bool:
-            return len(kit.CALLS) >= 3
-
-        await until(busy)
+        await asyncio.wait_for(entered.wait(), 300)  # the third call is in flight, held
         await first.stop(drain=0)  # the step in flight is cancelled, its lease released
+        kit.PLAN.pop("gate_at")
     async with kit.on_disk(tmp_path) as second:
         await second.run("job", timeout=300)
         assert await total_of(second, "job") == kit.TOTAL

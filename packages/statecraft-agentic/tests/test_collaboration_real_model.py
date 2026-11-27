@@ -47,7 +47,7 @@ class Worker(AgenticAgent):
 
 
 async def test_a_lead_delegates_to_workers_and_combines() -> None:
-    runtime = memory_runtime(limits={"max_depth": 1, "max_agents": 6})
+    runtime = memory_runtime(limits={"max_depth": 1, "max_total_agents": 6})
     r = runtime.registrar
     agentic(r)
     add_model(r, "default", openrouter(os.environ.get("STATECRAFT_MODEL", "openai/gpt-oss-20b")))

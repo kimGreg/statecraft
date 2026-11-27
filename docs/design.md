@@ -369,7 +369,11 @@ Signals are intents (section 6) ending in the target's inbox. The engine applies
 | `fault` and `stopped` both hold | one `CONT` clears both |
 | `TERM` while `stopped` | waits cleared, moves to `on_term` (or ends) |
 | a step commit after `KILL` | refused (epoch) |
-| a parent ends (succeeded or terminated) | its live children get `TERM` |
+| a parent finishes (`Done`) with a live child it did not end (TERM or KILL, in that step or before) | refused: the step faults, naming the children (the runtime checks before the commit) |
+| a parent is terminated (TERM, KILL) | its live children get `TERM` |
+| a signal or answer to an agent that has ended | refused (`Ended`; HTTP 409): it would never be read |
+| a message arrives while the step that ends the agent runs | that step is not committed (`Unread`): the state runs again with the message applied |
+| an agent ends with USR messages it never read (TERM, KILL) | they are kept in its record's `undelivered` |
 | a joined child is terminated | the join clears with `"terminated"` for that child (not success) |
 | the child ended before the `Wait` was committed | the wait is evaluated at commit time and clears at once |
 | an answer while `stopped` | stored and the answer wait cleared; `stopped` remains |

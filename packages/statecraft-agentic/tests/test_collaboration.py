@@ -14,6 +14,7 @@ What must hold (a lead delegates two tasks and works on while they run)
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Any
 
@@ -175,6 +176,8 @@ async def test_a_spawn_over_the_limits_is_told_to_the_model() -> None:
         depth_note = [m["content"] for m in messages if m["role"] == "tool"]
         if turn == 0:
             return call("spawn_agent", name="deeper", agent="researcher", input={"task": "go"})
+        if turn == 1 and '"spawned"' in depth_note[0]:  # the root joins its child first
+            return call("join_agents", names=["deeper"])
         return say(json.dumps({"summary": depth_note[0] if depth_note else ""}))
 
     model = ScriptedModel(step_fn=step)
@@ -184,3 +187,41 @@ async def test_a_spawn_over_the_limits_is_told_to_the_model() -> None:
         assert {r["view"] for r in rows} == {"succeeded"}
         child = (await runtime.artifact(root, "analysis", "r/deeper"))["payload"]
     assert "refused: limit max_depth=1" in child["summary"]  # its own spawn was refused
+
+
+async def test_spawn_inputs_are_checked_against_the_childs_schema() -> None:
+    offered: list[list[dict[str, Any]]] = []
+
+    def step(messages, tools):
+        offered.append(tools)
+        turn = sum(1 for m in messages if m["role"] == "assistant")
+        if role(messages) != "LEAD":
+            return say('{"summary": "ok"}' if role(messages) == "RESEARCHER" else '{"r": 1}')
+        if turn == 0:  # the reviewer's schema wants a task: refused, told to the model
+            return call("spawn_agent", name="r1", agent="reviewer", input={})
+        if turn == 1:  # the researcher has no schema: an empty input is accepted
+            return call("spawn_agent", name="a1", agent="researcher", input={})
+        if turn == 2:
+            return call("join_agents", names=["a1"])
+        return say("{}")
+
+    model = ScriptedModel(step_fn=step)
+    runtime = runtime_for(model)
+    reviewer = runtime.registry.agents["reviewer"]
+    runtime.registry.agents["reviewer"] = dataclasses.replace(
+        reviewer,
+        description="Reviews tests.",
+        input_schema={"type": "object", "required": ["task"]},
+    )
+    async with runtime:
+        root = await runtime.spawn("lead", {}, root_id="s")
+        rows = await runtime.run(root, timeout=10)
+        messages = (await runtime.get(root))["data"]["messages"]
+    assert {r["view"] for r in rows} == {"succeeded"}
+    results = tool_results(messages)
+    assert "input for reviewer is invalid" in results[0]["error"]
+    assert results[1] == {"spawned": "a1"}
+    menu = next(
+        t["function"]["description"] for t in offered[0] if t["function"]["name"] == "spawn_agent"
+    )
+    assert "- reviewer: Reviews tests. Input schema:" in menu and "- researcher:" in menu
