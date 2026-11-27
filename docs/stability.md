@@ -47,5 +47,6 @@ Until 1.0 every package is released in lockstep and requires the same minor vers
 | statecraft-postgres | statecraft 0.3, PostgreSQL (tested with 16), psycopg 3.1+ |
 | statecraft-coding | statecraft 0.3, statecraft-agentic 0.3 |
 
-`scripts/check_wheels.sh` builds every wheel and installs each extension alone with the core in
+The packages are not on PyPI: install them from the repository (`pip install -e .` and
+`packages/*`) or from wheels. `scripts/check_wheels.sh` builds every wheel and installs each extension alone with the core in
 a fresh environment.

@@ -55,7 +55,9 @@ added); chaos at HEAD: the 11 original seeds on SQLite with the shell effect (se
 stopped the harness itself: its driver waited on a lock held by a worker it had paused; the
 driver now moves on, and 31, 34, 35 pass), 3 seeds on PostgreSQL with 4 to 6 workers; the §17
 acceptance samples, item 23 included, pass from a clean environment with only the built wheels
-installed. Left to the owner: merging to `main` and publishing the packages. Not in 1.0: D2
+installed. Released by pushing `main` to GitHub (kimGreg/statecraft); by the owner's decision the
+packages are not published to PyPI (the name `statecraft` there belongs to another project):
+install from the repository or from wheels built with `scripts/check_wheels.sh`. Not in 1.0: D2
 (isolated workers), C4, A6, E2, F2 (command-agentic stays pinned at `2e56619`).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
