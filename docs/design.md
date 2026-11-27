@@ -374,6 +374,8 @@ Signals are intents (section 6) ending in the target's inbox. The engine applies
 | a signal or answer to an agent that has ended | refused (`Ended`; HTTP 409): it would never be read |
 | a message arrives while the step that ends the agent runs | that step is not committed (`Unread`): the state runs again with the message applied |
 | an agent ends with USR messages it never read (TERM, KILL) | they are kept in its record's `undelivered` |
+| a value that is not a signal (`"FOO"`, a list, a number) | refused before it is accepted (`ValueError`; HTTP 400); nothing is stored |
+| a message in an inbox that cannot be applied (an unknown kind, a malformed signal, a message to an agent that ended in the meantime) | accepted, so accounted for: kept in `undelivered` with its reason and recorded in the history; the agent and the executor go on |
 | a joined child is terminated | the join clears with `"terminated"` for that child (not success) |
 | the child ended before the `Wait` was committed | the wait is evaluated at commit time and clears at once |
 | an answer while `stopped` | stored and the answer wait cleared; `stopped` remains |
@@ -464,6 +466,11 @@ async for event in runtime.events(root, since=seq):
     ...
 ```
 
+A root is created in steps that a crash can stop anywhere: the id is reserved (create-only, so
+two spawns of one id cannot both win), the record is created with an `init` intent, the
+workspace is prepared and the input written (both idempotent), and the intent is marked done,
+which makes the root runnable. An executor that finds the intent pending finishes it.
+
 A root may be **attached** to another root's workspace (`runtime.spawn(ref, input,
 workspace=<root>)`): its tools and files work in that session, so a conversation about a finished
 run reads the run's files and views; its own objects stay under its home, its input is written
@@ -528,6 +535,12 @@ class StateStore(Protocol):
 Leases are kept apart from the record's step CAS, so a long state whose executor keeps renewing its
 lease still commits normally.
 
+Every operation is one transaction. Values are normalized to JSON before they are written, so
+both stores keep the same data and a value that is not JSON fails the step that made it
+(`NotJSON`), not the store. A store that cannot take its lock in time raises `Unavailable`, a
+transient error: the executor retries, a heartbeat keeps trying until its lease would expire, and
+fencing still holds because a commit checks the lease in the same transaction.
+
 ### The kernel: pure transition rules
 
 The rules are pure functions without I/O; the store adapters and the executor only persist and
@@ -555,6 +568,12 @@ renew the leases of running steps
 
 - **Correctness never depends on notifications**: the periodic scan finds every active agent,
   passed deadlines and intents left by a dead executor. `changes()` and SSE only make it faster.
+- **Failures stay with their agent.** Each record is handled on its own: a lost race (`Busy`,
+  `Conflict`) is skipped, a store error is logged and tried at the next scan, and anything else
+  is that agent's fault. Preparing or running a step (building the agent, the state, a
+  `CancelledError` it raises itself, storing its result) can only end in a committed transition
+  or a committed fault; the lease of a step that did not commit is released. A spawn intent that
+  cannot be carried out faults the parent with the reason; `CONT` carries it out again.
 - One executor runs many agents concurrently on one asyncio loop; several executors may share a
   store (invariant 1).
 
@@ -689,6 +708,20 @@ Further:
 35. An effect key in `on_term` differs from the interrupted state's key at the same step.
 36. No event is lost between reading the log and following the live channel.
 37. A stale worker cannot modify the current attempt's staging files.
+
+Isolation and accounting:
+38. A malformed signal or inbox message is undelivered with its reason; the agent and the
+    executor go on.
+39. An agent whose constructor raises, whose state raises `CancelledError`, or whose result is not
+    JSON faults once; its lease is released.
+40. A spawn of an agent that is not registered faults the parent; after a fix, `CONT` spawns it.
+41. Messages unread when an agent is killed or terminated are undelivered, none lost, none twice
+    (property tests over random lifecycles).
+42. A crash between creating a root's record and writing its input is finished on restart.
+43. Several processes share one SQLite file: no lost or doubled commit; a held lock is
+    `Unavailable`, not a crash.
+44. A cancelled or timed-out thread call keeps its slot until the thread ends; the retry waits.
+45. A symbolic link swapped in while a path is opened is refused.
 
 Three levels of tests: **pure kernel** (record in, record out), **store contract** (the same
 suite for the memory and SQLite stores: atomicity, leases, fencing), **crash integration** (a

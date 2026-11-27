@@ -120,6 +120,15 @@ statecraft ps | inspect ID | signal ID STOP | answer QUESTION VALUE (--config F 
 python -m statecraft_console --config statecraft.yaml  # the visualizer
 ```
 
+Configuration is strict: an unknown key or provider is an error, durations take a unit
+(`30s`, `5m`), and an unset `${NAME}` is an error (`${NAME:-default}` for an optional one).
+
+The server and the console answer loopback only, refuse cross-site browser requests and accept
+changes only as JSON. To serve beyond the machine, give a token (`--token` or
+`STATECRAFT_TOKEN`); clients send it as `Authorization: Bearer <token>` (the CLI and
+`StatecraftClient` read `STATECRAFT_TOKEN`). It is one shared operator secret, not user
+authentication.
+
 A plugin is a package that declares `register(registrar)` under the `statecraft.plugins` entry
 point; see [examples/notes_plugin](examples/notes_plugin).
 

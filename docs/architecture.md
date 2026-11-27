@@ -216,8 +216,10 @@ that must do blocking work does it through such an effect, not inline.
 |---|---|
 | a provider's capacity is full | the call waits asynchronously for capacity |
 | an effect's deadline passes | `timeout`: retried or faulted by policy |
-| `KILL` | the store bumps the lease epoch (no commit possible), and the executor holding the step cancels its task and its in-flight calls |
-| the lease is lost (renewal fails) | the step stops making new calls, in-flight calls are cancelled, the result is not committed; another executor runs the state again |
+| `KILL` | the store bumps the lease epoch (no commit possible), and every executor of the runtime (including the temporary ones `run()` starts) cancels its task and its in-flight calls at once; an executor in another process notices at its next renewal |
+| the lease is lost (renewal fails) | the step stops making new calls, in-flight calls are cancelled, the result is not committed; another executor runs the state again. A renewal that fails on a transient store error (`Unavailable`) is retried until the lease would expire; only then is the step cancelled |
+| a call on a thread or in a process is cancelled or times out | the thread or process cannot be stopped: the call returns at once, but its provider slot stays taken until the work really ends, and a retry of that call waits for it, so attempts never overlap and capacity is never exceeded |
+| a step raises, cannot be built, or cannot be stored | the exception (or a `CancelledError` the state raised itself) is that state's fault, committed once; the lease of a step that did not commit is released, even after `stop`; other agents go on |
 | a provider connection drops | only the calls on that connection fail; the provider reopens on demand |
 | the runtime stops | section 11.2 |
 
@@ -343,7 +345,13 @@ class EffectProvider(Protocol):
 
 `EffectContext` carries the root (the session), the agent, the step, the effect key, the deadline
 and a cancellation signal. Providers must be safe for concurrent `invoke` calls up to their
-declared `concurrency`, and must honour cancellation.
+declared `concurrency`, and must honour cancellation. Work a provider starts but cannot stop (a
+thread, a process, a request it cannot withdraw) goes into `context.work`: the effect manager
+then keeps the call's capacity slot, and makes a retry wait, until that work really ends. The
+Python provider does this for `thread` and `process` tools. A provider that hides such work (for
+example a plain `asyncio.to_thread` in `invoke`) gives the slot back when the call is cancelled
+or times out, so its declared `concurrency` can be exceeded and a retry can overlap the first
+attempt.
 
 | Provider | Package | Discovery |
 |---|---|---|
@@ -382,6 +390,15 @@ Three ways a root gets a workspace:
 
 Attach with write access is an explicit, separately granted mode, not the default, because
 several roots attached to one workspace break the assumption that one tree owns `shared/`.
+Attaching is itself a grant: an agent definition says `attach: none | ro | rw` (default `none`),
+a spawn asks for at most that mode, and the target must be an existing root.
+
+`local` keeps every operation inside its folder even while links change under it: each path is
+opened component by component from the workspace folder (`dir_fd`, `O_NOFOLLOW`), a symbolic link
+anywhere on the way is refused (`Escape`) and skipped by listings, and a listing prefix is a
+folder inside the workspace (`..` is refused). The memory and local providers mean the same by a
+prefix. The workspace is a shared file system, not a transactional one: nothing more is
+promised than atomic single-file writes and create-only objects.
 Snapshots, retention and workspace garbage collection need reference tracking and policies of
 their own, and come later.
 
@@ -584,15 +601,32 @@ hooks. It never patches the kernel.
   - Content is read on demand (progressive disclosure), not put into the model's context upfront.
   - A skill grants no permission: tools it mentions run only if the definition permits them;
     scripts in a skill run only as registered tools or through an isolated provider.
+  - A pinned copy is written create-only under `home/<agent>/skills/<digest>/` and verified
+    against its digest when read; an agent cannot write another agent's skills folder.
 - **Decider** and **SkillAgent**: ordinary registered agents (`agentic:decider`,
   `agentic:skill`). A SkillAgent runs one skill as its own process, with its own checkpoints,
   faults and outputs.
 - **Patterns**: reusable agents for sequence, fan-out and ask-a-person-on-fault.
+- **No escalation through generic agents**: the built-in SkillAgent and patterns get no tools and
+  spawn nothing unless the operator grants it (`extensions.agentic.skill_agent.tools`,
+  `extensions.agentic.patterns.spawns`); a SkillAgent offers the model the skill's
+  `allowed-tools` within that grant. Delegation to a specialized agent keeps that agent's own
+  definition (children are not limited to their parent's tools), so what an agent can reach is
+  what its definition and the grants say, never what a parent or a skill asks for. The loop runs
+  only tools offered to the model in that turn.
 
 ### 12.3 statecraft-mcp
 
 The MCP effect provider (HTTP, stdio, in-memory transports; discovery from `tools/list`; the
 session named by the root; annotations proposed as policies) and an MCP-backed workspace provider.
+
+`deduplicated` needs both sides: the provider sends the call's idempotency key on every attempt
+in `_meta["io.statecraft/idempotencyKey"]`, and the server promises to apply a key once, either
+by declaring it on the tool (`_meta["io.statecraft/deduplicates"]: true`) or by the operator
+listing the tool (`deduplicating: [...]`). A `deduplicated` policy for a tool without that
+promise is refused at start. A repeated call is then applied once by the server; statecraft does
+not claim more than that (an exactly-once commit of the step does not make the outside effect
+exactly once).
 
 ### 12.4 statecraft-console
 
@@ -637,6 +671,13 @@ agents:
 `extensions.agentic.models.default` is read by the agentic extension, which registers
 `model.default`; the kernel never reads model settings.
 
+Configuration is strict. An unknown section, key, store or workspace provider, provider option or
+policy field is refused at load with where it was found; nothing falls back to memory or is
+dropped. Durations are seconds or `<n>ms|s|m|h`. A policy under `policies` sets only the fields it
+names and keeps the rest of what the provider declared. A `python` entry serves its module's tools
+under its own name with its `concurrency`, `processes` and `execution`. An unset `${NAME}` is an
+error; `${NAME:-default}` names a default. An operator policy applies to every tool of that name, registered or discovered; a policy for a tool no provider offers refuses the start. Lease timing must be `0 < beat < lease_ttl`.
+
 ## 14. Observability
 
 Every effect call made in a step produces a **crossing**: effect, provider, binding, sizes,
@@ -662,6 +703,15 @@ The first product runs trusted, operator-installed packages only. Accepting thir
 code makes isolated workers a requirement, not an option; this boundary comes before namespaces
 or tenants. Credentials are referenced in configuration and resolved at start; they never enter
 records, artifacts, events or logs.
+
+The HTTP API and the console are operator interfaces. A guard in front of both refuses requests
+a browser makes for another site (a foreign or opaque `Origin`, `Sec-Fetch-Site: cross-site`),
+changes that are not JSON (`text/plain` and form posts), and, without a token, any `Host` other
+than loopback or the names the operator allows (DNS rebinding). With a token (`--token` or
+`STATECRAFT_TOKEN`), every request carries `Authorization: Bearer <token>`; serving on a
+non-loopback address without one is refused. This is one shared secret, not user accounts or
+per-root permissions: proper authentication, and a versioned store format with migrations, are
+release gates before any deployment beyond one operator's machine.
 
 ## 16. Package layout
 
@@ -812,4 +862,8 @@ Where the implementation settles details this design left open:
 | failures | `classify(exc)` and `classify_status(status, body)` (`kernel/effects.py`): refused connections `unavailable` (not sent), timeouts `timeout`, transport errors and 429/5xx `transient`, 401/403 `refused` (code `auth`), a 400 about the context window `invalid` (code `context_overflow`), other exceptions `failed` (never retried). Python tools keep their explicit classification; they call `classify` for network errors. The agentic loop compacts and tries again on `context_overflow` (twice at most) and gives tools' failures to the model as `{class, code, message, may_work_later}` |
 | spawn inputs | checked against the child's `input` schema (`ctx.spawn_problem(target, input=...)`); the agentic `spawn_agent` tool lists each spawnable agent's description and schema; an empty input is valid when the schema allows it |
 | tree limits | `Runtime(limits={max_depth, max_total_agents, max_live_agents})` (configuration `runtime.limits`) is checked on every spawn; a violation faults the parent with the reason; `ctx.spawn_problem(target)` tells an agent in advance. Spawns committed at the same moment by two agents of one tree are each checked against the tree as it was, so `max_total_agents`/`max_live_agents` can be exceeded by those. A token budget per tree is not implemented |
+| fault isolation | the executor handles each record on its own: a lost race, a store error or an exception in one agent never stops the scan or other agents. A signal that is not one of `STOP`, `CONT`, `TERM`, `KILL`, `(USR, message)` is refused by `runtime.signal` (`ValueError`, HTTP 400) and never stored; a message already in an inbox that cannot be applied is kept in `undelivered` with its reason and recorded in history. A spawn that cannot be carried out (an unknown agent, a limit) faults the parent, and `CONT` tries again |
+| message accounting | every message accepted into an inbox ends in exactly one place: applied (a USR message in the mailbox until a step commits past it), or `undelivered` with a reason (arrived as it ended, was killed, could not be applied). "Refused" means not accepted: the caller is told and nothing is stored |
+| root creation | `spawn` reserves the id (create-only), creates the record with an `init` intent, prepares the workspace and writes the input (both idempotent), then marks the intent done; a crash in between is finished by the next executor, and a spawn whose root an executor activated first still succeeds. A workspace that cannot be prepared faults the root; CONT tries again. Root ids are one path segment and may not be the workspace's top-level folder names (`home`, `shared`, `run`, ...) |
+| store | every operation is one transaction (`transaction(write=)`); values are normalized to JSON before they are stored, so the memory and SQLite stores keep the same data (`NotJSON` otherwise). SQLite: one thread owns each connection (never the event loop), `BEGIN IMMEDIATE` for writes, WAL, `busy_timeout`; a lock held past it is `Unavailable` (transient), and several processes may share one file. PostgreSQL is a separate provider, later |
 | children as processes | `ctx.children_view()` gives each child's phase (running, waiting, faulted, stopped, ended), state, step, publications, error and open question; the agentic loop offers it to models as `list_agents`/`inspect_agent`, with `join_agents` and `signal_agent` |
