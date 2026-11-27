@@ -136,3 +136,76 @@ async def test_writing_is_a_separately_granted_mode(engine) -> None:
     [row] = await e.run("pen2", scan_every=0.01)
     assert row["view"] == "succeeded"
     assert (folder / "run1" / "shared" / "scribble.txt").read_text() == "mine"
+
+
+class Attacher(Agent):
+    """Spawns `writer` attached to `run` with `mode`; publishes how its child ended."""
+
+    start = "spawn"
+
+    @state
+    async def spawn(self, ctx, data):
+        target = {"root": ctx.input["run"], "mode": ctx.input.get("mode", "ro")}
+        return Spawn({"w": ("t:scribbler", {})}, then="wait", attach={"w": target})
+
+    @state
+    async def wait(self, ctx, data):
+        return Wait(join=["w"], then="done", on_fault="done")
+
+    @state
+    async def done(self, ctx, data):
+        ctx.signal("w", "TERM")
+        await ctx.write("ended", {"child": ctx.woke.get("children", {}).get("w")})
+        return Done
+
+
+def attach_runtime(tmp_path, grant: str):
+    rt = permissive_runtime({"t:run": Run, "t:scribbler": Scribbler}, files_root=tmp_path)
+    rt.registrar.agents.register(
+        "t:attacher", Attacher, spawns=["*"], writes=["ended"], attach=grant
+    )
+    return rt
+
+
+async def test_an_attached_child_is_read_only_unless_granted_rw(tmp_path) -> None:
+    async with attach_runtime(tmp_path, "rw") as rt:
+        await rt.spawn("t:run", {}, root_id="run1")
+        await rt.run("run1", scan_every=0.01)
+        await rt.spawn("t:attacher", {"run": "run1"}, root_id="a1")  # ro by default
+        await rt.run("a1", scan_every=0.01)
+        assert (await rt.artifact("a1", "ended"))["payload"] == {"child": "active"}  # faulted
+        assert not (tmp_path / "run1" / "shared" / "scribble.txt").exists()
+        await rt.spawn("t:attacher", {"run": "run1", "mode": "rw"}, root_id="a2")
+        await rt.run("a2", scan_every=0.01)
+        assert (await rt.get("a2/w"))["view"] == "succeeded"
+    assert (tmp_path / "run1" / "shared" / "scribble.txt").read_text() == "mine"
+
+
+@pytest.mark.parametrize(
+    ("grant", "mode", "run", "error"),
+    [
+        ("ro", "rw", "run1", "may not attach w rw"),
+        ("none", "ro", "run1", "may not attach w ro"),
+        ("rw", "ro", "future", "no root 'future'"),
+    ],
+)
+async def test_attachments_need_a_grant_and_an_existing_root(tmp_path, grant, mode, run, error):
+    async with attach_runtime(tmp_path, grant) as rt:
+        await rt.spawn("t:run", {}, root_id="run1")
+        await rt.run("run1", scan_every=0.01)
+        await rt.spawn("t:attacher", {"run": run, "mode": mode}, root_id="a")
+        await rt.run("a", scan_every=0.01)
+        record = await rt.get("a")
+        assert record["view"] == "suspended" and error in record["error"]
+        assert record["children"] == {}  # nothing was spawned
+    assert not (tmp_path / "future").exists()
+
+
+async def test_attaching_to_an_attached_root_works_in_its_run(tmp_path) -> None:
+    rt = permissive_runtime({"t:run": Run, "t:reader": Reader}, files_root=tmp_path)
+    async with rt:
+        await rt.spawn("t:run", {"topic": {"name": "x"}}, root_id="run1")
+        await rt.run("run1", scan_every=0.01)
+        await rt.spawn("t:reader", {}, root_id="chat1", attach="run1")
+        await rt.spawn("t:reader", {}, root_id="chat2", attach="chat1")
+        assert rt.workspaces.session_of("chat2") == ("run1", "ro")

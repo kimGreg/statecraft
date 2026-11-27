@@ -12,69 +12,182 @@ them in memory (tests).
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
-import tempfile
+import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
 from ..kernel.files import Files, clean
 
 
+class Escape(PermissionError):
+    """A path that would leave the workspace (a symbolic link in it): refused."""
+
+
+_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 class LocalFiles:
-    """A folder on disk. Writes go through a temporary file and a rename, so a reader never sees
-    half a file; `create` uses an exclusive link, so two writers of the same object make one."""
+    """A folder on disk, contained: every path is opened one component at a time, relative to
+    an open directory and without following symbolic links (`O_NOFOLLOW`), so no path, and no
+    link created or swapped in while it is opened, leads outside the folder. Links inside the
+    workspace are refused, not followed; listings skip them.
+
+    Writes go through a temporary file and a rename, so a reader never sees half a file; the
+    directory is synced after, so a published file survives a power loss with its commit.
+    `create` uses an exclusive link, so two writers of the same object make one.
+    """
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        if not (_NOFOLLOW and os.open in os.supports_dir_fd):
+            raise OSError("LocalFiles needs a platform with O_NOFOLLOW and dir_fd (POSIX)")
 
-    def _path(self, path: str) -> Path:
-        return self.root / clean(path)
+    # ---- contained opening -------------------------------------------------------------------
+    def _dir(self, parts: list[str], *, create: bool) -> int:
+        """An open descriptor of the folder `parts` (relative to the root); the caller closes
+        it. Raises FileNotFoundError, or Escape for a component that is a link."""
+        fd = os.open(self.root, _DIR)
+        try:
+            for part in parts:
+                try:
+                    nxt = os.open(part, _DIR | _NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    with contextlib.suppress(FileExistsError):
+                        os.mkdir(part, dir_fd=fd)
+                    nxt = os.open(part, _DIR | _NOFOLLOW, dir_fd=fd)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                        raise Escape(f"{part!r} is a link or not a folder: not followed") from None
+                    raise
+                os.close(fd)
+                fd = nxt
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
 
-    def _temp(self, target: Path, data: bytes) -> str:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-")
+    def _split(self, path: str) -> tuple[list[str], str]:
+        parts = clean(path).split("/")
+        return parts[:-1], parts[-1]
+
+    async def get(self, path: str) -> bytes:
+        folders, name = self._split(path)
+        try:
+            dfd = self._dir(folders, create=False)
+        except (FileNotFoundError, NotADirectoryError):
+            raise FileNotFoundError(path) from None
+        try:
+            fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=dfd)
+        except FileNotFoundError:
+            raise FileNotFoundError(path) from None
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise Escape(f"{path!r} is a link: not followed") from None
+            if exc.errno == errno.EISDIR:
+                raise FileNotFoundError(path) from None
+            raise
+        finally:
+            os.close(dfd)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise FileNotFoundError(path)
+            return handle.read()
+
+    def _temp(self, dfd: int, data: bytes) -> str:
+        name = f".tmp-{secrets.token_hex(8)}"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o644, dir_fd=dfd)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        return temp
-
-    async def get(self, path: str) -> bytes:
-        try:
-            return self._path(path).read_bytes()
-        except (FileNotFoundError, IsADirectoryError):
-            raise FileNotFoundError(path) from None
+        return name
 
     async def put(self, path: str, data: bytes) -> None:
-        target = self._path(path)
-        os.replace(self._temp(target, data), target)
+        folders, name = self._split(path)
+        dfd = self._dir(folders, create=True)
+        try:
+            temp = self._temp(dfd, data)
+            os.replace(temp, name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces a link, never follows
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     async def create(self, path: str, data: bytes) -> bool:
-        target = self._path(path)
-        if target.exists():
-            return False
-        temp = self._temp(target, data)
+        folders, name = self._split(path)
+        dfd = self._dir(folders, create=True)
         try:
-            os.link(temp, target)
-            return True
-        except FileExistsError:
-            return False
+            try:
+                os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                return False
+            except FileNotFoundError:
+                pass
+            temp = self._temp(dfd, data)
+            try:
+                os.link(temp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+                os.fsync(dfd)
+                return True
+            except FileExistsError:
+                return False
+            finally:
+                os.unlink(temp, dir_fd=dfd)
         finally:
-            os.unlink(temp)
+            os.close(dfd)
 
     async def exists(self, path: str) -> bool:
-        return self._path(path).exists()
+        folders, name = self._split(path)
+        try:
+            dfd = self._dir(folders, create=False)
+        except (FileNotFoundError, NotADirectoryError, Escape):
+            return False  # through a link: not a file of the workspace
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            return stat.S_ISREG(st.st_mode)  # a link is not a file of the workspace
+        except FileNotFoundError:
+            return False
+        finally:
+            os.close(dfd)
 
     async def list(self, prefix: str) -> list[str]:
-        base = self.root / clean(prefix) if prefix.strip("/") else self.root
-        if not base.is_dir():
+        """Files under the folder `prefix` (all files for an empty prefix); links skipped."""
+        start = prefix.strip("/")
+        parts = clean(start).split("/") if start else []
+        try:
+            top = self._dir(parts, create=False)
+        except (FileNotFoundError, NotADirectoryError, Escape):
             return []
-        return sorted(
-            str(p.relative_to(self.root))
-            for p in base.rglob("*")
-            if p.is_file() and not p.name.startswith(".tmp-")
-        )
+        found: list[str] = []
+
+        def walk(fd: int, base: str) -> None:
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    if entry.name.startswith(".tmp-") or entry.is_symlink():
+                        continue
+                    rel = f"{base}/{entry.name}" if base else entry.name
+                    if entry.is_file(follow_symlinks=False):
+                        found.append(rel)
+                    elif entry.is_dir(follow_symlinks=False):
+                        try:
+                            sub = os.open(entry.name, _DIR | _NOFOLLOW, dir_fd=fd)
+                        except OSError:
+                            continue  # swapped for a link meanwhile: skipped
+                        try:
+                            walk(sub, rel)
+                        finally:
+                            os.close(sub)
+
+        try:
+            walk(top, "/".join(parts))
+        finally:
+            os.close(top)
+        return sorted(found)
 
 
 class MemoryFiles:
@@ -103,8 +216,12 @@ class MemoryFiles:
         return clean(path) in self.files
 
     async def list(self, prefix: str) -> list[str]:
-        start = prefix.lstrip("/")
-        return sorted(p for p in self.files if p.startswith(start))
+        """Files under the folder `prefix` (as LocalFiles)."""
+        start = prefix.strip("/")
+        if not start:
+            return sorted(self.files)
+        folder = clean(start) + "/"
+        return sorted(p for p in self.files if p.startswith(folder))
 
 
 class ScopedFiles:
@@ -130,8 +247,10 @@ class ScopedFiles:
         return await self.files.exists(self._p(path))
 
     async def list(self, prefix: str) -> list[str]:
-        found = await self.files.list(self.prefix + prefix.lstrip("/"))
-        return [f.removeprefix(self.prefix) for f in found]
+        start = prefix.strip("/")
+        inner = self.prefix + clean(start) if start else self.prefix  # never outside the scope
+        found = await self.files.list(inner)
+        return [f.removeprefix(self.prefix) for f in found if f.startswith(self.prefix)]
 
 
 class LocalWorkspace:
@@ -158,4 +277,11 @@ class MemoryWorkspace:
         return None
 
 
-__all__ = ["LocalFiles", "LocalWorkspace", "MemoryFiles", "MemoryWorkspace", "ScopedFiles"]
+__all__ = [
+    "Escape",
+    "LocalFiles",
+    "LocalWorkspace",
+    "MemoryFiles",
+    "MemoryWorkspace",
+    "ScopedFiles",
+]

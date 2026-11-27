@@ -55,7 +55,8 @@ def permissive_runtime(
     views=None,
     **options,
 ):
-    """A runtime with test agents registered permissively (any tool, any spawn) and test tools
+    """A runtime with test agents registered permissively (any tool, any spawn, read-only
+    attachments) and test tools
     as plain functions: `tools={"math.square": (fn, "read_only")}`. Not started."""
     from ..kernel.effects import EffectPolicy
     from ..providers.workspaces import LocalWorkspace
@@ -69,7 +70,7 @@ def permissive_runtime(
     )
     r = runtime.registrar
     for name, cls in agents.items():
-        r.agents.register(name, cls, tools=["*"], spawns=["*"])
+        r.agents.register(name, cls, tools=["*"], spawns=["*"], attach="ro")
     if tools:
         functions = {}
         for full, (fn, policy) in tools.items():

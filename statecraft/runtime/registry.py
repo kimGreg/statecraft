@@ -46,6 +46,7 @@ AGENT_KEYS = frozenset(
         "optional_reads",
         "writes",
         "workspace",
+        "attach",
         "extensions",
     }
 )
@@ -86,6 +87,9 @@ class AgentDefinition:
     optional_reads: tuple[str, ...] = ()
     writes: tuple[str, ...] | None = None
     workspace: str = "shared"
+    #: What its children may be attached to: "none" (default), "ro" (another run's workspace,
+    #: read-only) or "rw" (read-write: a separate, explicit grant).
+    attach: str = "none"
     extensions: dict[str, Any] = field(default_factory=dict, hash=False, compare=False)
     meta: dict[str, Any] = field(default_factory=dict, hash=False, compare=False)
     folder: Path | None = None
@@ -190,6 +194,10 @@ class Registry:
 
     def add_agent(self, definition: AgentDefinition) -> AgentDefinition:
         self._check_open()
+        if definition.attach not in ("none", "ro", "rw"):
+            self.problems.append(
+                f"agent {definition.name}: attach is none, ro or rw, not {definition.attach!r}"
+            )
         if definition.name in self.agents:
             self.problems.append(f"agent {definition.name} is registered twice")
         self.agents[definition.name] = definition
@@ -427,6 +435,7 @@ class _Agents:
         optional_reads: Iterable[str] = (),
         writes: Iterable[str] | None = None,
         workspace: str = "shared",
+        attach: str = "none",
         extensions: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         folder: Path | None = None,
@@ -446,6 +455,7 @@ class _Agents:
                 optional_reads=_strings(optional_reads),
                 writes=_optional(writes),
                 workspace=workspace,
+                attach=attach,
                 extensions=dict(extensions or {}),
                 meta=dict(meta or {}),
                 folder=folder,
@@ -468,6 +478,7 @@ class _Agents:
             optional_reads=_strings(declared.get("optional_reads")),
             writes=_optional(declared.get("writes")),
             workspace=str(declared.get("workspace") or "shared"),
+            attach=str(declared.get("attach") or "none"),
             extensions=dict(declared.get("extensions") or {}),
             meta={k: v for k, v in declared.items() if k not in AGENT_KEYS},
             folder=folder,

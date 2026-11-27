@@ -279,6 +279,8 @@ class Runtime:
             return Fault(problem, crossings=list(ctx.effects.crossings))
         if isinstance(outcome, Transition):
             problem = self._check_spawns(definition, outcome)
+            if problem is None and outcome.attach:
+                problem = await self.attach_problem(definition, outcome)
             if problem is None and outcome.done:
                 problem = await self.live_children_problem(record, outcome)
             if problem is None and outcome.spawns:
@@ -286,6 +288,30 @@ class Runtime:
             if problem:
                 return Fault(problem, crossings=list(outcome.crossings))
         return outcome
+
+    async def attach_problem(self, parent: AgentDefinition, t: Transition) -> str | None:
+        """Children attached to another run: the parent's definition grants the mode (`attach:
+        ro` or `rw`), and the target is an existing root."""
+        for name, target in t.attach.items():
+            root = target["root"] if isinstance(target, dict) else target
+            mode = target.get("mode", "ro") if isinstance(target, dict) else "ro"
+            if mode not in ("ro", "rw"):
+                return f"{name}: attach mode is ro or rw, not {mode!r}"
+            granted = {"none": (), "ro": ("ro",), "rw": ("ro", "rw")}[parent.attach]
+            if mode not in granted:
+                return (
+                    f"agent {parent.name} may not attach {name} {mode} to {root!r} "
+                    f"(its definition grants attach: {parent.attach})"
+                )
+            if not isinstance(root, str) or "/" in root or await self.store.find(root) is None:
+                return f"{name}: no root {root!r} to attach to"
+        return None
+
+    async def attach_target(self, target: str) -> str:
+        """The workspace an attachment to `target` works in: that root's own, or the run it is
+        attached to itself."""
+        await self.workspaces.prepare(target)
+        return self.workspaces.session_of(target)[0]
 
     async def live_children_problem(self, record: Record, t: Transition) -> str | None:
         """An agent may not finish while a child is live (running, waiting, faulted or
@@ -382,13 +408,16 @@ class Runtime:
         definition = self.registry.resolve_spawn(parent_definition, intent["agent"])
         if definition is None:
             raise KeyError(f"cannot spawn {intent['agent']}: not registered")
+        workspace = intent.get("workspace")
+        if workspace:
+            workspace = await self.attach_target(workspace)
         return self.new_record(
             definition,
             intent["id"],
             parent=parent.id,
             name=intent["name"],
             data_input=intent["input"],
-            workspace=intent.get("workspace"),
+            workspace=workspace,
             workspace_mode=intent.get("workspace_mode") or "ro",
         )
 
@@ -421,8 +450,10 @@ class Runtime:
         problem = root_id_problem(root_id)
         if problem:
             raise ValueError(problem)
-        if attach is not None and await self.store.find(attach) is None:
-            raise ValueError(f"no root {attach} to attach to")
+        if attach is not None:
+            if "/" in attach or await self.store.find(attach) is None:
+                raise ValueError(f"no root {attach} to attach to")
+            attach = await self.attach_target(attach)
         if attach_mode not in ("ro", "rw"):
             raise ValueError("attach_mode is 'ro' or 'rw'")
         if inherit is not None and await self.store.find(str(inherit.get("root"))) is None:
