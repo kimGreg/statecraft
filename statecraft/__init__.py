@@ -13,7 +13,8 @@ The kernel has no notion of a model, a prompt, a skill or reasoning; extensions 
 runs) and docs/architecture.md (what surrounds it).
 """
 
-from .kernel.effects import EffectError, EffectPolicy, classify
+from .kernel.effects import EffectError, EffectPolicy
+from .ports.effects import classify
 from .runtime.registry import AgentDefinition, Registrar
 from .runtime.runtime import Runtime
 from .sdk.agent import Agent, ChildFailed, Done, ExecutableAgent, Spawn, Wait, state

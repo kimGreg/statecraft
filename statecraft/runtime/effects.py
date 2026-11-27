@@ -14,37 +14,16 @@ import asyncio
 import contextlib
 import json
 import time
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import jsonschema
 
 from ..kernel.effects import EffectError, may_retry
+from ..ports.effects import EffectContext
 
 if TYPE_CHECKING:
     from .context import StepContext
     from .registry import Registry
-
-
-@dataclass
-class EffectContext:
-    """What a provider gets with each call."""
-
-    root: str
-    agent: str
-    step: int
-    state: str
-    workspace: str
-    key: str | None
-    deadline: float | None
-    attempt: int = 1
-    extra: dict[str, Any] = field(default_factory=dict)
-    #: Work the provider started that cancelling the call cannot stop (a thread, a process):
-    #: the call's capacity stays taken, and no other attempt starts, until it ends.
-    work: list[asyncio.Future[Any]] = field(default_factory=list)
-
-    def running(self) -> list[asyncio.Future[Any]]:
-        return [w for w in self.work if not w.done()]
 
 
 def _size(value: Any) -> int:

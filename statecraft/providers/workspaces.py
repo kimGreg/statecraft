@@ -20,7 +20,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from ..kernel.files import Files, clean
+from ..ports.workspace import Files, clean
 
 
 class Escape(PermissionError):

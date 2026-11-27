@@ -24,9 +24,32 @@ from typing import Any, Protocol
 import httpx
 
 from statecraft import EffectDefinition, EffectError, EffectPolicy
-from statecraft.kernel.effects import classify, classify_status
+from statecraft.ports.effects import classify, classify_status
 
 from .context import estimate
+
+#: Phrases model endpoints use when a request is over the model's context window.
+CONTEXT_OVERFLOW = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "too many tokens",
+    "prompt is too long",
+    "reduce the length",
+)
+
+
+def model_failure(status: int, body: str = "") -> EffectError:
+    """A model endpoint's error answer: by its HTTP status, except a 400 about the context
+    window, which is `invalid` with code `context_overflow` (the loop compacts and tries
+    again)."""
+    if status == 400 and any(p in body.lower() for p in CONTEXT_OVERFLOW):
+        return EffectError(
+            "invalid", f"over the context window: {body[:300]}", code="context_overflow"
+        )
+    return classify_status(status, body)
+
 
 PROVIDER = "model"
 MODEL_POLICY = EffectPolicy(
@@ -87,7 +110,7 @@ class ChatModel:
         except httpx.TransportError as exc:  # connect, timeout, protocol: classified by type
             raise classify(exc) from exc
         if response.status_code >= 400:
-            raise classify_status(response.status_code, response.text)
+            raise model_failure(response.status_code, response.text)
         try:
             return reply_of(response.json())
         except (json.JSONDecodeError, ModelError) as exc:

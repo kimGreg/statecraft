@@ -177,7 +177,7 @@ async def test_a_python_tool_result_breaking_its_schema_fails() -> None:
 
 def test_exceptions_and_http_answers_are_classified() -> None:
     from statecraft import classify
-    from statecraft.kernel.effects import classify_status
+    from statecraft.ports.effects import classify_status
 
     class ConnectError(Exception):  # named as HTTP libraries name theirs
         pass
@@ -209,7 +209,5 @@ def test_exceptions_and_http_answers_are_classified() -> None:
     assert found["503"].cls == "transient"
     assert (found["401"].cls, found["401"].code) == ("refused", "auth")
     assert found["bug"].cls == "failed"  # an ordinary exception is never retried
-    overflow = classify_status(400, '{"error": "This model\'s maximum context length is 8192"}')
-    assert (overflow.cls, overflow.code) == ("invalid", "context_overflow")
     assert classify_status(400, "bad field").code == "400"
     assert classify_status(408).cls == "timeout" and classify_status(429).cls == "transient"

@@ -20,9 +20,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..kernel.files import HOME_FOLDERS, Files, WorkspaceProvider, clean, home
 from ..kernel.process import Record
 from ..kernel.store import StateStore
+from ..ports.workspace import HOME_FOLDERS, Files, WorkspaceProvider, clean, home
 
 if TYPE_CHECKING:
     from .context import StepContext

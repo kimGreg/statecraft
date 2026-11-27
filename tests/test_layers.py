@@ -21,15 +21,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "statecraft"
 ALLOWED = {
     "kernel": {"kernel"},
+    "ports": {"kernel", "ports"},
     "sdk": {"kernel", "sdk"},
-    "providers": {"kernel", "sdk", "providers"},
-    "runtime": {"kernel", "sdk", "providers", "runtime"},
-    "server": {"kernel", "sdk", "providers", "runtime", "server"},
+    "providers": {"kernel", "ports", "sdk", "providers"},
+    "runtime": {"kernel", "ports", "sdk", "providers", "runtime"},
+    "server": {"kernel", "ports", "sdk", "providers", "runtime", "server"},
     "client": {"client"},
-    "cli": {"kernel", "sdk", "providers", "runtime", "server", "client", "cli"},
-    "testing": {"kernel", "sdk", "providers", "runtime", "testing"},
+    "cli": {"kernel", "ports", "sdk", "providers", "runtime", "server", "client", "cli"},
+    "testing": {"kernel", "ports", "sdk", "providers", "runtime", "testing"},
 }
-LEAN: dict[str, set[str]] = {"kernel": set(), "sdk": {"pydantic"}}
+LEAN: dict[str, set[str]] = {"kernel": set(), "ports": set(), "sdk": {"pydantic"}}
 EXTENSIONS = {"statecraft_agentic", "statecraft_mcp", "statecraft_console"}
 IMPORT_NAMES = {"pyyaml": "yaml"}
 
@@ -125,3 +126,46 @@ def test_third_party_imports_are_declared() -> None:
         if top and top not in stdlib and top != "statecraft"
     }
     assert sorted(found - declared()) == []
+
+
+#: The kernel knows execution only: none of these words appear in its code (comments included).
+KERNEL_UNKNOWN = re.compile(
+    r"\b(model|prompt|token|mcp|sandbox|volume|mount|docker|kubernetes|container|shell|"
+    r"context window|http)\w*",
+    re.IGNORECASE,
+)
+
+
+def test_the_kernel_knows_nothing_of_models_tools_or_infrastructure() -> None:
+    found = []
+    for path in sorted((PACKAGE / "kernel").rglob("*.py")):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if KERNEL_UNKNOWN.search(line):
+                found.append(f"{path.relative_to(ROOT)}:{n}: {line.strip()}")
+    assert found == []
+
+
+#: Where the runtime may construct a concrete provider: configuration (bootstrap), the
+#: `Runtime.local` convenience, and the built-in Python provider behind `@tool` registration.
+BUILDS_PROVIDERS = {
+    ("config.py", "runtime_from_config"),
+    ("config.py", "_python_module"),
+    ("runtime.py", "local"),
+    ("registry.py", "register"),
+}
+
+
+def test_only_bootstrap_code_builds_concrete_providers() -> None:
+    found = set()
+    for path in sorted((PACKAGE / "runtime").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(func):
+                if isinstance(node, ast.ImportFrom) and "providers" in (node.module or ""):
+                    found.add((path.name, func.name))
+        for node in tree.body:  # module level
+            if isinstance(node, ast.ImportFrom) and "providers" in (node.module or ""):
+                found.add((path.name, "<module>"))
+    assert found <= BUILDS_PROVIDERS, found - BUILDS_PROVIDERS
