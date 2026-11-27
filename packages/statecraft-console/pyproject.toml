@@ -1,6 +1,6 @@
 [project]
 name = "statecraft-console"
-version = "0.3.0"
+version = "0.3.1"
 description = "The statecraft console: registry, graphs, providers and live runs"
 readme = "README.md"
 requires-python = ">=3.11"

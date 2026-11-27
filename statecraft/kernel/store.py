@@ -258,15 +258,18 @@ class StateStore:
         seq = t.event_append(root_of(after.id), event["id"], jsonable(event))
         if after.parent and _child_news(before, after):
             # CHLD: the parent learns that a child faulted or ended (its wait is still decided
-            # from the child's record; the notification is for whoever follows the parent)
+            # from the child's record; the notification is for whoever follows the parent).
+            # Like every event, `agent` and `status` are an agent's and its status now (the
+            # parent's): a reader filtering on them never takes a child's news for the parent's.
+            parent = t.get(after.parent)
             news = {
                 "id": f"{after.id}@{after.revision}/CHLD",
                 "kind": "CHLD",
                 "agent": after.parent,
+                "status": parent.status if parent is not None else None,
                 "child": after.id,
-                "status": after.status,
+                "child_status": after.status,
                 "fault": after.reason("fault") is not None,
-                "revision": after.revision,
             }
             t.event_append(root_of(after.id), news["id"], jsonable(news))
         if any("seq" not in ref for ref in after.published.values()):
@@ -492,18 +495,39 @@ class StateStore:
         """Keep what an attempt that did not commit did (why, and its effect calls) as an
         `attempt` event in the run's durable log: recovery tooling reads it. Once per attempt."""
         event_id = f"{agent_id}/attempt/{step}/{epoch}"
-        event = jsonable(
-            {"id": event_id, "kind": "attempt", "agent": agent_id, "step": step, "epoch": epoch}
-            | entry
-        )
-        return await self._txn(lambda t: t.event_append(root_of(agent_id), event_id, event))
+
+        def body(t: Tables) -> int:
+            record = t.get(agent_id)  # every event carries its agent's status now
+            event = jsonable(
+                {
+                    "id": event_id,
+                    "kind": "attempt",
+                    "agent": agent_id,
+                    "status": record.status if record is not None else None,
+                    "step": step,
+                    "epoch": epoch,
+                }
+                | entry
+            )
+            return t.event_append(root_of(agent_id), event_id, event)
+
+        return await self._txn(body)
 
     async def audit(self, root: str, entry: dict[str, Any]) -> int:
         """Record who did what to a run (a control operation, an operator's decision)
         in the run's durable event log, as an `audit` event."""
         event_id = f"audit/{uuid.uuid4().hex}"
-        event = jsonable({"id": event_id, "kind": "audit", **entry})
-        return await self._txn(lambda t: t.event_append(root, event_id, event))
+
+        def body(t: Tables) -> int:
+            agent = str(entry.get("agent") or root)
+            record = t.get(agent)  # every event carries its agent's status now
+            status = record.status if record is not None else None
+            event = jsonable(
+                {"id": event_id, "kind": "audit", "agent": agent, "status": status} | entry
+            )
+            return t.event_append(root, event_id, event)
+
+        return await self._txn(body)
 
     async def append_inbox(
         self,

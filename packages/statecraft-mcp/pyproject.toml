@@ -1,6 +1,6 @@
 [project]
 name = "statecraft-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP servers as statecraft tool providers"
 readme = "README.md"
 requires-python = ">=3.11"

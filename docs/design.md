@@ -362,7 +362,7 @@ Signals are intents (section 6) ending in the target's inbox. The engine applies
 | `TERM` | cooperative end: waits cleared, it moves to `on_term`; **when `on_term` commits, the agent is `terminated`** (an agent without `on_term` is terminated at once) | yes, `on_term` (cleanup only) |
 | `KILL` | logically ends it now: `terminated`, lease epoch bumped (a running step's commit is refused); cancelling the local task is best effort, and a tool call already sent to a server is not undone | no |
 | `USR {message}` | a message for the agent's own protocol; in `ctx.signals` until a step commits past it | yes |
-| `CHLD` | a notification to a parent that a child faulted or ended: a `CHLD` event in the run's log, written in the child's commit (agent: the parent; child, status, fault); the parent's wait is decided from the child's record, not from the notification | n/a |
+| `CHLD` | a notification to a parent that a child faulted or ended: a `CHLD` event in the run's log, written in the child's commit (agent and status: the parent's, as in every event; child, child_status, fault); the parent's wait is decided from the child's record, not from the notification | n/a |
 
 | Situation | Behaviour |
 |---|---|

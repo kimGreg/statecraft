@@ -1,6 +1,6 @@
 [project]
 name = "statecraft-agentic"
-version = "0.3.0"
+version = "0.3.1"
 description = "Model-driven agents for statecraft: the agentic loop as states, models as tools, skills"
 readme = "README.md"
 requires-python = ">=3.11"

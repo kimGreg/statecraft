@@ -118,7 +118,21 @@ async def test_children_send_chld_to_their_parent() -> None:
         await rt.spawn("parent", root_id="p")
         await rt.run("p", timeout=5)
         news = [e for e in await rt.store.read_events("p") if e["kind"] == "CHLD"]
-        found = {(e["agent"], e["child"], e["status"], e["fault"]) for e in news}
+        found = {(e["agent"], e["child"], e["child_status"], e["fault"]) for e in news}
         assert ("p", "p/ok", "succeeded", False) in found
         assert ("p", "p/bad", "active", True) in found  # faulted: suspended until decided
         assert all(e["agent"] == "p" for e in news)
+
+
+async def test_every_event_tells_its_agent_and_that_agents_status() -> None:
+    """A reader waiting for `agent == root and status == succeeded` is never misled by a child's
+    news, a diagnostic or an audit: every event's `status` is its own agent's status then."""
+    async with runtime() as rt:
+        await rt.spawn("parent", root_id="q")
+        await rt.store.audit("q", {"op": "look", "agent": "q", "by": "ops"})
+        await rt.run("q", timeout=5)
+        events = await rt.store.read_events("q")
+    assert all("agent" in e and "status" in e for e in events)
+    ok = next(e for e in events if e["kind"] == "CHLD" and e["child"] == "q/ok")
+    assert (ok["agent"], ok["status"], ok["child_status"]) == ("q", "active", "succeeded")
+    assert not [e for e in events if e["agent"] == "q" and e["status"] == "succeeded"]

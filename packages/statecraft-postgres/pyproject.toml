@@ -1,6 +1,6 @@
 [project]
 name = "statecraft-postgres"
-version = "0.3.0"
+version = "0.3.1"
 description = "The statecraft state store on PostgreSQL: executors on several hosts, one database"
 readme = "README.md"
 requires-python = ">=3.11"
