@@ -8,8 +8,11 @@ operation runs there, one at a time, so the event loop never waits on a database
 keep moving while another process writes). Writes take `BEGIN IMMEDIATE`; reads take a deferred
 `BEGIN` and see a snapshot (WAL). A lock held longer than `busy_timeout` raises `Unavailable`:
 nothing was done, and the executor tries again next pass. Fencing does not depend on any of this:
-a commit after the lease expired is refused, however long it waited. A process that forks gets a
-connection of its own.
+the lease (owner, epoch) is checked in the commit's own write transaction, and acquiring a lease
+bumps the epoch in a write transaction too, so a commit can never land after another executor
+took the lease. (Expiry is judged by the time taken before the lock wait, so a commit may land a
+little after its lease expired in wall-clock time, while no one else holds it.) A process that
+forks gets a connection of its own.
 """
 
 from __future__ import annotations

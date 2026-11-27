@@ -14,3 +14,8 @@ Policies come from the operator (`policies`); a `trusted` server's annotations a
 (read-only hint → `read_only`, idempotent hint → `idempotent`); anything else is
 `non_repeatable` and refused until a policy is set. With `session_header`, each root gets its own
 session. A server that cannot be reached is a startup warning, and its calls are `unavailable`.
+
+`deduplicated` is allowed only for a tool whose server applies an idempotency key once: the tool
+declares `_meta: {"io.statecraft/deduplicates": true}` in `tools/list`, or the operator lists it
+(`deduplicating: [charge]`). The provider then sends the call's key on every attempt as
+`_meta: {"io.statecraft/idempotencyKey": <key>}` in `tools/call`; the server must use it.

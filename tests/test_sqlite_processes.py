@@ -6,7 +6,9 @@ What must hold
   * a store call never blocks the event loop, even while another process holds the write lock:
     the event loop keeps running (heartbeats keep moving);
   * a lock held longer than `busy_timeout` is `Unavailable` (a store error the executor tries
-    again), never a raw sqlite3 error, and nothing was done.
+    again), never a raw sqlite3 error, and nothing was done;
+  * a process forked from one that already used a store opens its own connection: its writes
+    land in the file and the parent's connection keeps working.
 """
 
 from __future__ import annotations
@@ -82,4 +84,29 @@ async def test_a_locked_database_neither_blocks_the_loop_nor_leaks_sqlite_errors
     holder.join(10)
     assert await store.lease("r") is None  # nothing was done
     assert await store.try_acquire("r", "me", 10, now=0) is not None  # and it works again
+    store.close()
+
+
+def _forked_write(store: SqliteStore, results) -> None:
+    async def write() -> None:
+        await store.create(Record(id="from-child", agent="x", state="go"))
+        results.put((await store.load("parent")).id)
+
+    try:
+        asyncio.run(write())
+    except Exception as exc:  # pragma: no cover - the failure being tested
+        results.put(f"{type(exc).__name__}: {exc}")
+
+
+async def test_a_forked_process_gets_its_own_connection(tmp_path) -> None:
+    store = SqliteStore(tmp_path / "db")
+    await store.create(Record(id="parent", agent="x", state="go"))
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    child = context.Process(target=_forked_write, args=(store, results))
+    child.start()
+    child.join(30)
+    assert results.get(timeout=5) == "parent"
+    assert (await store.load("from-child")).id == "from-child"
+    await store.create(Record(id="after", agent="x", state="go"))
     store.close()

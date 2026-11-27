@@ -294,12 +294,23 @@ class Executor:
     # ---- 3. intents -------------------------------------------------------------------------
     async def _carry_out(self, record: Record) -> Record:
         for intent in record.pending_intents:
+            fault = record.reason("fault")
+            if fault is not None and fault.get("intent") == intent["id"]:
+                continue  # this intent failed; it is tried again after CONT
             if intent["kind"] == "init":  # a root's workspace (a crash after its creation)
-                await self.env.initialize(record, intent)
+                try:
+                    await self.env.initialize(record, intent)
+                except StoreError:
+                    raise  # transient: the next pass tries again
+                except Exception as exc:  # a workspace that cannot be prepared: the root's fault
+                    error = f"cannot prepare the workspace: {type(exc).__name__}: {exc}"
+                    return await self._control(
+                        record,
+                        lambda r, e=error, i=intent["id"]: _spawn_fault(r, e, i),
+                        "fault",
+                        intent=intent["id"],
+                    )
             elif intent["kind"] == "spawn":
-                fault = record.reason("fault")
-                if fault is not None and fault.get("intent") == intent["id"]:
-                    continue  # this spawn failed; it is tried again after CONT
                 try:
                     child = await self.env.create_child(record, intent)
                 except Exception as exc:  # the parent's problem, not the executor's
@@ -456,6 +467,10 @@ def message_problem(message: Any, record: Record) -> str | None:
             )
         except (InvalidAnswer, KeyError) as exc:
             return f"answer not applied: {exc}"
+    if message["kind"] == "repin" and not (
+        isinstance(message.get("definition"), dict) and isinstance(message.get("bindings"), dict)
+    ):
+        return "repin without a definition and bindings"
     return None
 
 

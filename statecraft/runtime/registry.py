@@ -245,6 +245,7 @@ class Registry:
         return warnings
 
     def freeze(self) -> None:
+        self._apply_policy_overrides()
         for name, definition in list(self.agents.items()):
             try:
                 cls = definition.load()
@@ -253,6 +254,20 @@ class Registry:
                 continue
             self.agents[name] = replace(definition, cls=cls, code=code_digest(definition, cls))
         self.frozen = True
+
+    def _apply_policy_overrides(self) -> None:
+        """The operator's policies count for every tool, registered or discovered; a policy for
+        a tool that does not exist is a problem (a typo would otherwise be silent), unless its
+        provider did not start (then its tools are unknown, and that is already a warning)."""
+        for name, override in self.policy_overrides.items():
+            definition = self.effects.get(name)
+            if definition is None:
+                if name.split(".", 1)[0] not in self.unreachable:
+                    self.problems.append(f"a policy is set for {name}, which no provider offers")
+                continue
+            merged = EffectPolicy.of({**definition.policy.as_dict(), **override})
+            if merged != definition.policy:
+                self.effects[name] = definition.but(policy=merged)
 
     # ---- validation -------------------------------------------------------------------------
     def validate(self) -> tuple[list[str], list[str]]:

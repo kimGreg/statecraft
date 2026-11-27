@@ -21,6 +21,7 @@ The kernel runs anything that implements `ExecutableAgent` (one async `step`); `
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import traceback
 from dataclasses import dataclass, field
@@ -196,6 +197,15 @@ async def run_state(agent: type, record: Record, ctx: Any) -> Transition | Fault
             call = agent().step(record.state, ctx, data)
         result = await call
         return to_transition(agent, result, data, ctx.effects)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise  # the executor cancels the step (KILL, lease loss, stop)
+        # raised by the state itself: its fault, after its calls are settled like any other
+        return Fault(
+            "the state was cancelled from inside (CancelledError)",
+            crossings=list(ctx.effects.crossings),
+        )
     except Exception as exc:
         lines = traceback.format_exception_only(type(exc), exc)
         return Fault("".join(lines).strip(), crossings=list(ctx.effects.crossings))

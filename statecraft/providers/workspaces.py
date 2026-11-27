@@ -29,6 +29,8 @@ class Escape(PermissionError):
 
 _DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+#: a FIFO or device opened for reading must not block: only regular files are read
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class LocalFiles:
@@ -85,7 +87,7 @@ class LocalFiles:
         except (FileNotFoundError, NotADirectoryError):
             raise FileNotFoundError(path) from None
         try:
-            fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=dfd)
+            fd = os.open(name, os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=dfd)
         except FileNotFoundError:
             raise FileNotFoundError(path) from None
         except OSError as exc:

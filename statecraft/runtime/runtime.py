@@ -31,7 +31,7 @@ import jsonschema
 
 from ..kernel.executor import Executor, signal_name
 from ..kernel.process import Fault, Lease, Record, Transition
-from ..kernel.store import Ended, StateStore
+from ..kernel.store import Busy, Conflict, Ended, StateStore
 from ..kernel.transitions import (
     InvalidAnswer,
     apply_answer,
@@ -106,6 +106,11 @@ class Runtime:
         self.registrar = Registrar(self.registry)
         self.effects = EffectManager(self.registry)
         self.workspaces = WorkspaceService(workspace, store)
+        if lease_ttl <= 0 or beat <= 0 or beat >= lease_ttl:
+            raise ValueError(
+                f"leases need 0 < beat < lease_ttl (beat {beat}, lease_ttl {lease_ttl}): a lease "
+                "that expires as it is taken, or is renewed too late, lets nothing commit"
+            )
         self.clock = clock
         self.concurrency = concurrency
         self.executor_count = executors
@@ -476,18 +481,34 @@ class Runtime:
         if not await self.store.create(record):
             raise ValueError(f"{root_id} exists")
         await self.initialize(record, init)
-        created = await self.store.load(root_id)
-        await self.store.commit_control(
-            root_id,
-            created.revision,
-            lambda r: mark_intent_done(r, init["id"]),
-            self.clock(),
-            kind="intent",
-            intent=init["id"],
-        )
+        await self._activate(root_id, init["id"])
         await self.refresh_views(root_id)
         self.notify()
         return root_id
+
+    async def _activate(self, root_id: str, intent_id: str) -> None:
+        """Mark a new root's `init` intent done, unless an executor already did (it may have
+        prepared the workspace meanwhile and be running the first step): either way the root is
+        created and active, so the spawn succeeds."""
+        for _ in range(5):
+            created = await self.store.load(root_id)
+            if all(i["done"] for i in created.intents if i["id"] == intent_id):
+                return
+            try:
+                await self.store.commit_control(
+                    root_id,
+                    created.revision,
+                    lambda r: mark_intent_done(r, intent_id),
+                    self.clock(),
+                    kind="intent",
+                    intent=intent_id,
+                )
+                return
+            except Conflict:
+                continue  # changed meanwhile: look again
+            except Busy:
+                return  # an executor holds it, so it carried the intent out
+        # still changing: the executor that keeps changing it carries the intent out
 
     async def initialize(self, record: Record, intent: dict[str, Any]) -> None:
         """A new root's workspace: its session known, its input written. Safe to repeat."""

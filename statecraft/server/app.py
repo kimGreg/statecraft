@@ -57,12 +57,16 @@ class BadRequest(ValueError):
 
 async def read_body(request: Request) -> dict[str, Any]:
     try:
-        body = await request.json()
+        body = json.loads(await request.body(), parse_constant=_no_constant)
     except ValueError:
-        raise BadRequest("the body is not JSON") from None
+        raise BadRequest("the body is not JSON (NaN and Infinity are not JSON)") from None
     if not isinstance(body, dict):
         raise BadRequest("the body must be a JSON object")
     return body
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
 
 
 def optional_field(body: dict[str, Any], key: str, kind: type, default: Any = None) -> Any:
@@ -241,6 +245,8 @@ def server_app(
             )
         except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
+        except ValueError as exc:  # an answer that cannot be stored (not JSON)
+            return _json({"error": str(exc)}, 400)
         return Response(status_code=204)
 
     async def agents(request: Request) -> Response:

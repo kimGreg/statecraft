@@ -188,6 +188,8 @@ def console_app(
             await runtime.answer(question, body.get("answer"))
         except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
+        except ValueError as exc:  # an answer that cannot be stored (not JSON)
+            return _json({"error": str(exc)}, 400)
         return Response(status_code=204)
 
     async def signal(request: Request) -> Response:

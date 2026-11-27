@@ -44,6 +44,11 @@ The loop is a harness over the runtime's durable execution:
   joining parent with the fault. `tests/test_resilience_real_model.py` runs these on a real
   model, with STOP/CONT, a runtime stopped mid-run, a process killed in a tool call and a hung
   child killed by an operator.
+- **No escalation.** A model runs only tools offered to it in that turn. The built-in skill agent
+  and patterns (sequence, fan-out) get nothing by default: grant them with
+  `extensions.agentic.skill_agent.tools` and `extensions.agentic.patterns.spawns`. A skill agent
+  offers the skill's `allowed-tools` within that grant. Pinned skills are kept create-only under
+  `home/<agent>/skills/<digest>/` and checked against their digest when read.
 - **Project context.** `context.files` (workspace paths such as `shared/AGENTS.md`) are added to
   the system prompt when present.
 
