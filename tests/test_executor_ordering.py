@@ -295,3 +295,75 @@ async def test_start_after_stop_runs_agents_again() -> None:
     assert (await rt.get(root))["view"] == "succeeded"
     assert rt.executors and all(not t.done() for t in rt._tasks)
     await rt.close()
+
+
+class Slow(Agent):
+    start = "go"
+
+    @state
+    async def go(self, ctx, data):
+        return Wait(sleep=0.4, then="done")
+
+    @state
+    async def done(self, ctx, data):
+        return Done
+
+
+class Interruptible(Agent):
+    """Joins a slow child with a deadline and messages; records each wake, then rejoins."""
+
+    start = "spawn"
+
+    @state
+    async def spawn(self, ctx, data):
+        return Spawn({"a": ("slow", {}), "b": ("slow", {})}, then="wait")
+
+    @state
+    async def wait(self, ctx, data):
+        return Wait(join=["a", "b"], then="woke", timeout=ctx.input.get("timeout"), messages=True)
+
+    @state
+    async def woke(self, ctx, data):
+        woke = ctx.woke
+        data.setdefault("wakes", []).append(
+            {"by": woke["by"], "live": woke.get("live", []), "signals": list(ctx.signals)}
+        )
+        if woke["by"] == "children":
+            return Done
+        return Wait(join=woke["live"], then="woke")  # rejoin what is still running
+
+    @state
+    async def done(self, ctx, data):
+        return Done
+
+
+async def test_a_join_wakes_at_its_deadline_and_the_children_go_on() -> None:
+    rt = memory_runtime(scan_every=0.01)
+    rt.registrar.agents.register("interruptible", Interruptible, spawns=["slow"])
+    rt.registrar.agents.register("slow", Slow)
+    async with rt:
+        root = await rt.spawn("interruptible", {"timeout": 0.1}, root_id="i")
+        await rt.run(root, timeout=10)
+        record = await rt.store.load(root)
+    wakes = record.data["wakes"]
+    assert wakes[0]["by"] == "timeout" and sorted(wakes[0]["live"]) == ["a", "b"]
+    assert wakes[-1]["by"] == "children" and record.status == "succeeded"
+
+
+async def test_a_join_wakes_on_a_message() -> None:
+    rt = memory_runtime(scan_every=0.01)
+    rt.registrar.agents.register("interruptible", Interruptible, spawns=["slow"])
+    rt.registrar.agents.register("slow", Slow)
+    async with rt:
+        root = await rt.spawn("interruptible", {}, root_id="m")
+        for _ in range(100):
+            record = await rt.store.load(root)
+            if record.reason("join"):
+                break
+            await asyncio.sleep(0.01)
+        await rt.signal(root, ("USR", "look"))
+        await rt.run(root, timeout=10)
+        record = await rt.store.load(root)
+    wakes = record.data["wakes"]
+    assert wakes[0]["by"] == "message" and wakes[0]["signals"] == ["look"]
+    assert wakes[-1]["by"] == "children" and record.status == "succeeded"

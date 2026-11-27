@@ -68,6 +68,10 @@ class Wait:
     answer: dict[str, Any] | None = None  # {name, question, schema, default, timeout?}
     sleep: float | None = None
     on_fault: str | None = None
+    #: A join may also clear at a deadline (seconds) or when a message waits in the mailbox; its
+    #: wake says which (`by`: children, timeout, message) and which children are still `live`.
+    timeout: float | None = None
+    messages: bool = False
 
 
 class _DoneType:
@@ -170,8 +174,19 @@ def to_transition(
             raise AgentDefinitionError(f"{agent.__name__}: a Wait has one of join/answer/sleep")
         known(result.then, "Wait.then")
         known(result.on_fault, "Wait.on_fault")
+        if chosen[0] != "join" and (result.timeout is not None or result.messages):
+            raise AgentDefinitionError(
+                f"{agent.__name__}: Wait timeout and messages are for joins (an answer has its "
+                "own timeout; a sleep is a timeout)"
+            )
         if chosen[0] == "join":
-            wait = {"kind": "join", "children": list(result.join), "on_fault": result.on_fault}
+            wait = {
+                "kind": "join",
+                "children": list(result.join),
+                "on_fault": result.on_fault,
+                "timeout": result.timeout,
+                "messages": result.messages,
+            }
         elif chosen[0] == "answer":
             if "name" not in result.answer:
                 raise AgentDefinitionError(f"{agent.__name__}: a question has a name")

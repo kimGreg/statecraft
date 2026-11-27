@@ -393,6 +393,13 @@ question_id, answer}`, `{kind: "sleep"}`. The woken state sees it as `ctx.woke`;
 record through faults, crashes and retries of that state, and is consumed when the state commits.
 `ctx.signals` (USR) follow the same rule (`inbox_applied` advances only at a commit).
 
+A join may be **interruptible**: `Wait(join=[...], then=..., timeout=seconds, messages=True)` also
+clears at its deadline, or when a USR message waits in the mailbox. Its wake says what cleared
+it, `by`: `children` (all ended), `fault` (with `on_fault`), `timeout` or `message`, and for the
+last two which joined children are still `live`. Those children are not touched: the parent works
+on and may join them again later. `timeout` and `messages` are only for joins (an answer has its
+own timeout; a sleep is a timeout).
+
 ### Questions and answers
 
 - A state asks with a business **name**; the engine makes the **id**:

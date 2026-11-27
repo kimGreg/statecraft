@@ -805,7 +805,9 @@ class Runtime:
             if any(x["kind"] in ("stopped", "fault") for x in rec.reasons):
                 continue
             if any(
-                r["kind"] == "sleep" or (r["kind"] == "answer" and r.get("deadline"))
+                r["kind"] == "sleep"
+                or (r["kind"] == "answer" and r.get("deadline"))
+                or (r["kind"] == "join" and r.get("until") is not None)
                 for r in rec.reasons
             ):
                 return True

@@ -87,12 +87,23 @@ class Lifecycle(RuleBasedStateMachine):
         self.commit(Transition(state="a", spawns={n: ("x", {}) for n in fresh}))
 
     @precondition(lambda self: self.runnable() and self.record.children)
-    @rule(data=st.data(), on_fault=st.booleans())
-    def wait_join(self, data, on_fault):
+    @rule(
+        data=st.data(),
+        on_fault=st.booleans(),
+        timeout=st.one_of(st.none(), st.floats(0, 5)),
+        messages=st.booleans(),
+    )
+    def wait_join(self, data, on_fault, timeout, messages):
         names = data.draw(
             st.lists(st.sampled_from(sorted(self.record.children)), min_size=1, unique=True)
         )
-        wait = {"kind": "join", "children": names, "on_fault": "b" if on_fault else None}
+        wait = {
+            "kind": "join",
+            "children": names,
+            "on_fault": "b" if on_fault else None,
+            "timeout": timeout,
+            "messages": messages,
+        }
         self.commit(Transition(wait=wait, then="c"))
 
     @precondition(lambda self: self.runnable())
@@ -172,7 +183,8 @@ class Lifecycle(RuleBasedStateMachine):
                 ChildView("active", "child broke") if status == "faulted" else ChildView(status)
             )
         before = self.record
-        after = resolve_wait(before, views, NOW + data.draw(st.floats(0, 10)))
+        now = NOW + data.draw(st.floats(0, 10))
+        after = resolve_wait(before, views, now)
         join = before.reason("join")
         if join is not None and after.reason("join") is None:
             named = {n: views.get(n) for n in join["children"]}
@@ -180,8 +192,14 @@ class Lifecycle(RuleBasedStateMachine):
             faulted = any(
                 v is not None and v.status == "active" and v.fault for v in named.values()
             )
-            assert all_ended or (faulted and join.get("on_fault")), (join, named)
+            timed_out = join.get("until") is not None and now >= join["until"]
+            message = bool(join.get("messages") and before.mailbox)
+            cleared_by = all_ended or (faulted and join.get("on_fault"))
+            assert cleared_by or timed_out or message, (join, named)
             assert after.wake is not None and after.wake["kind"] == "join"
+            if after.wake["by"] in ("timeout", "message"):  # the children go on
+                live = [n for n, v in named.items() if v is None or v.status not in ENDED]
+                assert live and sorted(after.wake["live"]) == sorted(live)
         self.record = after
 
     @precondition(lambda self: any(not i["done"] for i in self.record.intents))

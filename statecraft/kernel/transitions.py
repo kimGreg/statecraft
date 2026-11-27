@@ -164,11 +164,17 @@ def _wait_reason(record: Record, t: Transition, now: float) -> dict[str, Any]:
         missing = [c for c in wait["children"] if c not in record.children and c not in t.spawns]
         if missing:
             raise InvalidTransition(f"join names children that were never spawned: {missing}")
-        return {
+        timeout = wait.get("timeout")
+        reason: dict[str, Any] = {
             "kind": "join",
             "children": list(wait["children"]),
             "on_fault": wait.get("on_fault"),
         }
+        if timeout is not None:
+            reason["until"] = now + float(timeout)
+        if wait.get("messages"):
+            reason["messages"] = True
+        return reason
     if kind == "answer":
         timeout = wait.get("timeout")
         return {
@@ -283,6 +289,8 @@ def resolve_wait(record: Record, children: dict[str, ChildView], now: float) -> 
         kind = reason["kind"]
         if kind == "join":
             views = {n: children.get(n) for n in reason["children"]}
+            statuses = {n: (v.status if v else "active") for n, v in views.items()}
+            live = [n for n, v in views.items() if v is None or v.status not in ENDED]
             faulted = [
                 {"child": n, "id": record.children.get(n), "error": v.fault}
                 for n, v in views.items()
@@ -295,20 +303,30 @@ def resolve_wait(record: Record, children: dict[str, ChildView], now: float) -> 
                     state=reason["on_fault"],
                     wake={
                         "kind": "join",
+                        "by": "fault",
                         "faulted": faulted,
-                        "children": {n: (v.status if v else "active") for n, v in views.items()},
+                        "children": statuses,
+                        "live": live,
                     },
                 )
-            if all(v is not None and v.status in ENDED for v in views.values()):
+            if not live:
                 return _clear(
                     record,
                     reason,
-                    wake={
-                        "kind": "join",
-                        "faulted": [],
-                        "children": {n: v.status for n, v in views.items()},
-                    },
+                    wake={"kind": "join", "by": "children", "faulted": [], "children": statuses},
                 )
+            # an interruptible join: a message waiting, or its deadline; the children go on
+            if reason.get("messages") and record.mailbox:
+                by = "message"
+            elif reason.get("until") is not None and now >= reason["until"]:
+                by = "timeout"
+            else:
+                continue
+            return _clear(
+                record,
+                reason,
+                wake={"kind": "join", "by": by, "faulted": [], "children": statuses, "live": live},
+            )
         elif kind == "sleep" and now >= reason["until"]:
             return _clear(record, reason, wake={"kind": "sleep"})
         elif kind == "answer" and reason["deadline"] is not None and now >= reason["deadline"]:
