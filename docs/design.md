@@ -367,7 +367,11 @@ Signals are intents (section 6) ending in the target's inbox. The engine applies
 | Situation | Behaviour |
 |---|---|
 | `fault` and `stopped` both hold | one `CONT` clears both |
-| `TERM` while `stopped` | waits cleared, moves to `on_term` (or ends) |
+| `TERM` while `stopped` | TERM supersedes STOP: waits and `stopped` cleared, it moves to `on_term` (or ends); to end without cleanup, `KILL` |
+| `STOP`, `TERM` or an answer while the agent waits for an execution slot | applied before its next step (an agent with unapplied inbox messages gives its slot back first) |
+| a parent `CONT`s a faulted child and waits again | the child counts as not faulted while that `CONT` (or a `TERM`/`KILL`) waits in its inbox |
+| a signal to an agent that does not exist | the intent is marked done with that outcome in the history |
+| an agent's cleanup (`on_term`) faults after its parent ended | it is ended (terminated); the fault stays in its history |
 | a step commit after `KILL` | refused (epoch) |
 | a parent finishes (`Done`) with a live child it did not end (TERM or KILL, in that step or before) | refused: the step faults, naming the children (the runtime checks before the commit) |
 | a parent is terminated (TERM, KILL) | its live children get `TERM` |

@@ -205,6 +205,7 @@ class Executor:
             return False  # another executor runs its step
         before = record.revision
         record = await self._apply_inbox(record)
+        record = await self._end_stranded(record)
         record = await self._resolve(record)
         record = await self._carry_out(record)
         moved = record.revision != before
@@ -279,7 +280,7 @@ class Executor:
                 child_id = record.children.get(name)
                 child = await self.store.find(child_id) if child_id else None
                 if child is not None:
-                    children[name] = ChildView.of(child)
+                    children[name] = await self._child_view(child)
         now = self.now()
         resolved = resolve_wait(record, children, now)
         if resolved == record:
@@ -290,6 +291,34 @@ class Executor:
             "woke",
             wake=(resolved.wake or {}).get("kind"),
         )
+
+    async def _end_stranded(self, record: Record) -> Record:
+        """An agent whose cleanup (`on_term`) faulted after its parent ended has no one left to
+        CONT or end it: it ends as terminated, its error kept, instead of waiting forever."""
+        if not (record.terminating and record.parent and record.reason("fault")):
+            return record
+        parent = await self.store.find(record.parent)
+        if parent is not None and not parent.ended:
+            return record  # its parent decides
+        log.warning("%s: cleanup faulted after its parent ended; ending it", record.id)
+        return await self.store.kill(record.id)
+
+    async def _child_view(self, child: Record) -> ChildView:
+        """A faulted child whose inbox already holds a CONT, TERM or KILL is not faulted for a
+        join: that fault is being dealt with (a parent that CONTs a child and waits again must
+        not be woken by the same fault)."""
+        view = ChildView.of(child)
+        if view.fault is None:
+            return view
+        for item in await self.store.read_inbox(child.id, child.inbox_applied):
+            message = item["message"]
+            if (
+                isinstance(message, dict)
+                and message.get("kind") == "signal"
+                and signal_name(message.get("signal")) in ("CONT", "TERM", "KILL")
+            ):
+                return ChildView(child.status)
+        return view
 
     # ---- 3. intents -------------------------------------------------------------------------
     async def _carry_out(self, record: Record) -> Record:
@@ -337,11 +366,12 @@ class Executor:
                         await self.store.append_inbox(
                             target.id, intent["id"], {"kind": "signal", "signal": intent["signal"]}
                         )
+            detail: dict[str, Any] = {"intent": intent["id"]}
+            if intent["kind"] == "signal" and target is None:
+                detail["outcome"] = f"no agent {intent['target']}: the signal was not delivered"
+                log.warning("%s: %s", record.id, detail["outcome"])
             record = await self._control(
-                record,
-                lambda r, i=intent["id"]: mark_intent_done(r, i),
-                "intent",
-                intent=intent["id"],
+                record, lambda r, i=intent["id"]: mark_intent_done(r, i), "intent", **detail
             )
         return record
 
@@ -365,8 +395,13 @@ class Executor:
             self.peak = max(self.peak, self.concurrency - self.slots._value)
             try:
                 record = await self.store.load(agent_id)
-                if not is_runnable(record, None, self.now()):
+                unread = await self.store.read_inbox(agent_id, record.inbox_applied)
+                if unread or not is_runnable(record, None, self.now()):
+                    # a STOP, TERM or answer that arrived while it waited for a slot is applied
+                    # before any step runs: the next pass applies the inbox first
                     await self.store.release(agent_id, lease)
+                    if unread:
+                        self.env.notify()
                     return
                 await self._run_and_commit(record, lease)
             finally:

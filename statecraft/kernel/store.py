@@ -324,8 +324,16 @@ class StateStore:
 
         return await self._txn(body)
 
-    async def append_inbox(self, agent_id: str, message_id: str, message: Any) -> bool:
-        """Append if that id is not there yet; signals and answers are never applied twice."""
+    async def append_inbox(
+        self,
+        agent_id: str,
+        message_id: str,
+        message: Any,
+        check: Callable[[Record], Any] | None = None,
+    ) -> bool:
+        """Append if that id is not there yet; signals and answers are never applied twice.
+        `check(record)` runs in the same transaction and refuses by raising (an answer is
+        checked against the question as it is when it is stored, not before)."""
         message = jsonable(message)
 
         def body(t: Tables) -> bool:
@@ -334,6 +342,8 @@ class StateStore:
                 raise KeyError(agent_id)
             if record.ended:
                 raise Ended(f"{agent_id} has ended ({record.status}); it takes no more messages")
+            if check is not None:
+                check(record)
             return t.inbox_append(agent_id, message_id, message)
 
         return await self._txn(body)

@@ -165,14 +165,18 @@ class Runtime:
 
     # ---- lifecycle ----------------------------------------------------------------------------
     async def start(self) -> Runtime:
-        if self.started:
+        """Start providers, freeze and validate the registry, start executors. After `stop()`,
+        `start()` starts the executors again (the registry stays as it was)."""
+        if not self.started:
+            self.warnings += await self.registry.start_providers()
+            self.registry.freeze()
+            errors, warnings = self.registry.validate()
+            self.warnings += warnings
+            if errors:
+                await self._close_providers()  # a failed start leaves nothing running
+                raise RegistryError(errors)
+        if self._tasks:
             return self
-        self.warnings += await self.registry.start_providers()
-        self.registry.freeze()
-        errors, warnings = self.registry.validate()
-        self.warnings += warnings
-        if errors:
-            raise RegistryError(errors)
         self._stop.clear()
         for n in range(self.executor_count):
             executor = Executor(self, owner=f"{self.owner}-{n}", **self.executor_options)
@@ -200,11 +204,7 @@ class Runtime:
 
     async def close(self) -> None:
         await self.stop()
-        for provider in list(self.registry.providers.values()):
-            close = getattr(provider, "close", None)
-            if close is not None:
-                with contextlib.suppress(Exception):
-                    await close()
+        await self._close_providers()
         await self.workspaces.close()
         closer = getattr(self.store, "close", None)
         if closer is not None:
@@ -213,6 +213,13 @@ class Runtime:
                 if asyncio.iscoroutine(result):
                     await result
         self.started = False
+
+    async def _close_providers(self) -> None:
+        for provider in list(self.registry.providers.values()):
+            close = getattr(provider, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
 
     async def __aenter__(self) -> Runtime:
         return await self.start()
@@ -541,11 +548,11 @@ class Runtime:
     async def answer(self, question_id: str, answer: Any, *, by: str = "person") -> None:
         """Checked now (open, valid) and stored once; a second answer is refused."""
         agent_id = agent_of_question(question_id)
-        apply_answer(await self.store.load(agent_id), question_id, answer, by=by)
         stored = await self.store.append_inbox(
             agent_id,
             question_id,
             {"kind": "answer", "question_id": question_id, "answer": answer, "by": by},
+            check=lambda record: apply_answer(record, question_id, answer, by=by),
         )
         if not stored:
             raise InvalidAnswer(f"{question_id} is already answered")
