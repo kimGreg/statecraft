@@ -40,8 +40,17 @@ class EffectPolicy:
             raise ValueError(f"effect policy kind must be one of {KINDS}, not {self.kind!r}")
         if self.cost not in COSTS:
             raise ValueError(f"effect cost must be one of {COSTS}, not {self.cost!r}")
+        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int):
+            raise ValueError(f"max_attempts must be a whole number, not {self.max_attempts!r}")
         if self.max_attempts < 1:
             raise ValueError("max_attempts is at least 1")
+        timeout = self.timeout
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
+        ):
+            raise ValueError(f"timeout must be positive seconds or None, not {timeout!r}")
+        if not isinstance(self.deterministic, bool):
+            raise ValueError(f"deterministic must be true or false, not {self.deterministic!r}")
 
     @classmethod
     def of(cls, value: EffectPolicy | str | dict[str, Any] | None) -> EffectPolicy:
@@ -51,7 +60,12 @@ class EffectPolicy:
             return value
         if isinstance(value, str):
             return cls(kind=value)
-        return cls(**{k: v for k, v in value.items() if k in cls.__dataclass_fields__})
+        unknown = sorted(set(value) - set(cls.__dataclass_fields__))
+        if unknown:
+            raise ValueError(
+                f"unknown policy fields {unknown}; known: {sorted(cls.__dataclass_fields__)}"
+            )
+        return cls(**value)
 
     def repeatable(self, keyed: bool) -> bool:
         """May a call be sent again (a rerun of its state, or a retry)?"""
