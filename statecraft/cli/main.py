@@ -123,6 +123,28 @@ async def _call(args: argparse.Namespace) -> int:
     return 0
 
 
+def _store(args: argparse.Namespace) -> int:
+    """`store check`: the data format and whether this statecraft reads it (exit 1 when not);
+    `store migrate`: back the store up and upgrade it."""
+    from ..providers.stores import sqlite
+    from ..runtime.config import read
+
+    data, base = read(args.config)
+    cfg = data.get("store") or {}
+    if cfg.get("provider") != "sqlite":
+        print("only a sqlite store has a data format to check or migrate", file=sys.stderr)
+        return 1
+    path = Path(cfg.get("path", "statecraft.db"))
+    path = path if path.is_absolute() else base / path
+    if args.action == "check":
+        found = sqlite.check(path)
+        show(found)
+        return 0 if found["ok"] else 1
+    before, after = sqlite.migrate(path)
+    show({"path": str(path), "from": before, "to": after})
+    return 0
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -148,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--token", help="bearer token for --url (default: $STATECRAFT_TOKEN)")
         return p
 
+    store = sub.add_parser("store", help="check or migrate the store's data format")
+    store.add_argument("action", choices=["check", "migrate"])
+    store.add_argument("--config", required=True)
     serve = sub.add_parser("serve")
     serve.add_argument("--config", required=True)
     serve.add_argument("--host", default="127.0.0.1")
@@ -186,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "serve":
         return _serve(args)
+    if args.command == "store":
+        return _store(args)
     return asyncio.run(_call(args))
 
 

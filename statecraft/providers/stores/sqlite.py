@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from ...kernel.process import Lease, Record
-from ...kernel.store import StateStore, Unavailable
+from ...kernel.store import FormatError, StateStore, Unavailable
 from ...kernel.transitions import has_work
 
 T = TypeVar("T")
@@ -54,7 +54,41 @@ CREATE TABLE IF NOT EXISTS history (agent TEXT NOT NULL, revision INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS calls   (key TEXT PRIMARY KEY, agent TEXT NOT NULL, n INTEGER NOT NULL,
                                     body TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS calls_agent ON calls(agent, n);
+CREATE TABLE IF NOT EXISTS meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+
+#: The data format this statecraft reads and writes. 1: statecraft 0.2 (no `meta` table); 2: the
+#: call journal (`calls`). A store records its format; an older one is migrated explicitly
+#: (`statecraft store migrate`, after a backup), a newer one is refused.
+FORMAT = 2
+
+
+def _migrate_1(db: sqlite3.Connection) -> None:
+    """1 -> 2: the call journal."""
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS calls (key TEXT PRIMARY KEY, agent TEXT NOT NULL, "
+        "n INTEGER NOT NULL, body TEXT NOT NULL)"
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS calls_agent ON calls(agent, n)")
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1}
+
+
+def _statements(script: str) -> list[str]:
+    return [part.strip() for part in script.split(";") if part.strip()]
+
+
+def format_of(db: sqlite3.Connection) -> int | None:
+    """The format of an open database: None when it is empty (a new store)."""
+    tables = {name for (name,) in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "agents" not in tables:
+        return None
+    if "meta" not in tables:
+        return 1
+    row = db.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+    return int(row[0]) if row else 1
 
 
 def _dump(value: Any) -> str:
@@ -181,10 +215,14 @@ class _Tables:
 
 
 class SqliteStore(StateStore):
-    def __init__(self, path: str | Path, *, busy_timeout: float = BUSY_TIMEOUT) -> None:
+    def __init__(
+        self, path: str | Path, *, busy_timeout: float = BUSY_TIMEOUT, migrate: bool = False
+    ) -> None:
+        """`migrate`: upgrade an older data format on open (otherwise refused: FormatError)."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.busy_timeout = busy_timeout
+        self.migrate = migrate
         self._db: sqlite3.Connection | None = None
         self._pid = 0
         self._thread: ThreadPoolExecutor | None = None
@@ -204,14 +242,53 @@ class SqliteStore(StateStore):
             try:
                 db.execute("PRAGMA journal_mode=WAL")  # needs an exclusive lock: may be busy
                 db.execute("PRAGMA synchronous=FULL")
-                db.executescript(SCHEMA)
+                self._prepare(db)
                 break
+            except FormatError:
+                db.close()
+                raise
             except sqlite3.OperationalError as exc:
                 db.close()
                 if not _locked(exc) or time.monotonic() > deadline:
                     raise Unavailable(f"cannot open {self.path}: {exc}") from exc
                 time.sleep(0.05)  # another process is creating the file: wait for it
         self._db, self._pid = db, os.getpid()
+
+    def _prepare(self, db: sqlite3.Connection) -> None:
+        """Create a new store, or check (and with `migrate`, upgrade) an existing one's format,
+        in one write transaction: a concurrent opener never sees half of it."""
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            found = format_of(db)
+            if found is None:
+                for statement in _statements(SCHEMA):
+                    db.execute(statement)
+                db.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('format', ?)", (str(FORMAT),)
+                )
+            elif found > FORMAT:
+                raise FormatError(
+                    f"{self.path} has data format {found}; this statecraft reads {FORMAT}: "
+                    "upgrade statecraft"
+                )
+            elif found < FORMAT:
+                if not self.migrate:
+                    raise FormatError(
+                        f"{self.path} has data format {found}; this statecraft reads {FORMAT}: "
+                        "back it up and run `statecraft store migrate --config ...`"
+                    )
+                for version in range(found, FORMAT):
+                    MIGRATIONS[version](db)
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('format', ?)", (str(FORMAT),)
+                )
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
 
     def _executor(self) -> ThreadPoolExecutor:
         if self._thread is None or self._pid != os.getpid():
@@ -263,3 +340,40 @@ class SqliteStore(StateStore):
         if self._thread is not None:
             self._thread.shutdown(wait=False)
             self._thread = None
+
+
+def migrate(path: str | Path) -> tuple[int | None, int]:
+    """Back the store up (`<path>.format-<n>.bak`) and upgrade it to this statecraft's format.
+    Returns (the format it had, the format it has)."""
+    import shutil
+
+    path = Path(path)
+    db = sqlite3.connect(path)
+    try:
+        found = format_of(db)
+    finally:
+        db.close()
+    if found is not None and found < FORMAT:
+        shutil.copy2(path, path.with_name(f"{path.name}.format-{found}.bak"))
+    SqliteStore(path, migrate=True).close()
+    return found, FORMAT
+
+
+def check(path: str | Path) -> dict[str, Any]:
+    """The store's data format and whether this statecraft reads it."""
+    db = sqlite3.connect(Path(path))
+    try:
+        found = format_of(db)
+    finally:
+        db.close()
+    return {
+        "path": str(path),
+        "format": found,
+        "reads": FORMAT,
+        "ok": found in (None, FORMAT),
+        "action": "none"
+        if found in (None, FORMAT)
+        else "migrate"
+        if found < FORMAT
+        else "upgrade statecraft",
+    }

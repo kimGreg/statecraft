@@ -70,6 +70,11 @@ class Unread(StoreError):
     again, so the agent sees them before it ends."""
 
 
+class FormatError(StoreError):
+    """A store whose data format this statecraft does not read: newer (upgrade statecraft), or
+    older (migrate it first: `statecraft store migrate`)."""
+
+
 class CallRefused(Exception):
     """A keyed call refused before anything was sent: its identity names another request or
     another agent, or the agent has an unresolved call to that effect."""
@@ -448,6 +453,7 @@ __all__ = [
     "Conflict",
     "Ended",
     "Fenced",
+    "FormatError",
     "NotJSON",
     "StateStore",
     "StoreError",
