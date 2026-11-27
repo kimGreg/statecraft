@@ -34,4 +34,20 @@ def load(name: str) -> Any:
     return getattr(importlib.import_module(module), attr)
 
 
-__all__ = ["GROUP", "installed", "load"]
+#: Store kinds offered by packages: `store: {provider: <name>, ...}` builds the store with the
+#: entry point's `factory(settings, base_folder)`.
+STORES = "statecraft.stores"
+
+
+def store_factory(kind: str) -> Any:
+    """The factory of an installed store kind (`statecraft.stores`), or `module:function`."""
+    found = {ep.name: ep for ep in entry_points(group=STORES)}
+    if kind in found:
+        return found[kind].load()
+    module, sep, attr = kind.partition(":")
+    if not sep:
+        raise LookupError(f"no store kind {kind!r}; installed: {sorted(found)}")
+    return getattr(importlib.import_module(module), attr)
+
+
+__all__ = ["GROUP", "STORES", "installed", "load", "store_factory"]

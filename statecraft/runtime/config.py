@@ -2,7 +2,8 @@
 
     runtime: {concurrency: 16, executors: 1, drain: 30, lease_ttl: 120, beat: 30,
               limits: {max_depth: 3, max_total_agents: 32, max_live_agents: 8}}
-    store: {provider: sqlite, path: ./statecraft.db}            # or memory
+    store: {provider: sqlite, path: ./statecraft.db}            # or memory, or a package's kind
+                                                                # (postgres: {dsn, schema})
     workspace: {provider: local, root: ./workspaces}            # or memory
     plugins: [agentic, research]                                # enabled entry points
     effect_providers:
@@ -193,13 +194,29 @@ def runtime_from_config(config: str | Path | dict[str, Any], **overrides: Any) -
     from .runtime import Runtime
 
     data, base = read(config)
-    kind, store_cfg = _provider(data.get("store"), STORES, "store")
-    if kind == "sqlite":
+    given = data.get("store")
+    if isinstance(given, dict) and given.get("provider") not in (None, *STORES):
+        # a store kind offered by a package (`statecraft.stores`), e.g. postgres
+        settings = {k: v for k, v in given.items() if k != "provider"}
+        try:
+            factory = plugins.store_factory(str(given["provider"]))
+        except (LookupError, ImportError, AttributeError) as exc:
+            raise ConfigError(f"store.provider: {exc}") from exc
+        try:
+            store: Any = factory(settings, base)
+        except TypeError as exc:
+            raise ConfigError(f"store ({given['provider']}): {exc}") from exc
+        kind = "plugin"
+    else:
+        kind, store_cfg = _provider(given, STORES, "store")
+    if kind == "plugin":
+        pass
+    elif kind == "sqlite":
         extra = {}
         if "busy_timeout" in store_cfg:
             extra["busy_timeout"] = duration(store_cfg["busy_timeout"], "store.busy_timeout")
         path = _path(base, store_cfg.get("path", "statecraft.db"), "store.path")
-        store: Any = SqliteStore(path, **extra)
+        store = SqliteStore(path, **extra)
     else:
         store = MemoryStore()
     kind, ws_cfg = _provider(data.get("workspace"), WORKSPACES, "workspace")

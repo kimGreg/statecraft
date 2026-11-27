@@ -34,7 +34,15 @@ CHLD as an event to the parent; a fault that replaces an unstorable outcome keep
 E3 done (tree limits counted again in the commit's transaction with pending spawns; per-tree
 budgets: reserve before a metered send, settle with reported use, refuse unsent over budget,
 dead attempts' holds spent; statecraft-agentic holds `tokens` and `usd`; checked with
-gpt-oss-20b through OpenRouter: cost reported and counted).
+gpt-oss-20b through OpenRouter: cost reported and counted). C3 done
+(`packages/statecraft-postgres`: SERIALIZABLE writes retried on conflicts, snapshot reads; the
+store contract suite unchanged, 21/21; four processes racing for one lease; chaos with 4 and 6
+worker processes over TCP against one database, 6 seeds incl. message-heavy, all invariants;
+store kinds come from packages through `statecraft.stores`; separate hosts not tested, and no
+LISTEN/NOTIFY: executors poll). F1 done (`packages/statecraft-coding`: project discovery with
+AGENTS.md, list/read/write/edit tools safe to repeat, the shell through the granted effect,
+output shaping, sessions and a terminal session; a real-model run fixed a bug and checked it;
+an empty text answer is now asked for again in the agentic loop).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.

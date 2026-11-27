@@ -2,7 +2,7 @@
 store, with random SIGKILLs, restarts, pauses past the lease (stale executors), STOP/CONT, USR
 messages, answers and TERM; then the faults stop and every invariant is checked.
 
-    python chaos.py run  --seed N [--workers 4] [--roots 6] [--seconds 60] [--out DIR]
+    python chaos.py run  --seed N [--workers 4] [--roots 6] [--seconds 60] [--out DIR] [--pg DSN]
     python chaos.py worker DIR            (started by `run`)
 
 Everything is reproducible from the seed: the workload (tree shapes, inputs) and the schedule of
@@ -187,16 +187,26 @@ def register(runtime: Runtime, folder: Path) -> Runtime:
             policy=EffectPolicy(kind="deduplicated", timeout=10, max_attempts=2),
         )
     )
-    r.agents.register(
-        "node", Node, tools=["chaos.*", "sh.*"], spawns=["node"], writes=["value"]
-    )
+    r.agents.register("node", Node, tools=["chaos.*", "sh.*"], spawns=["node"], writes=["value"])
     return runtime
+
+
+def make_store(folder: Path) -> Any:
+    """SQLite in the run's folder, or PostgreSQL (`--pg DSN`): a schema per run, shared by the
+    driver and every worker process."""
+    dsn = os.environ.get("STATECRAFT_CHAOS_PG")
+    if not dsn:
+        return SqliteStore(folder / "state.db")
+    from statecraft_postgres import PostgresStore
+
+    schema = "chaos_" + "".join(c if c.isalnum() else "_" for c in folder.resolve().name)
+    return PostgresStore(dsn, schema=schema.lower())
 
 
 def make_runtime(folder: Path, executors: int) -> Runtime:
     return register(
         Runtime(
-            store=SqliteStore(folder / "state.db"),
+            store=make_store(folder),
             workspace=LocalWorkspace(folder / "ws"),
             executors=executors,
             concurrency=8,
@@ -634,6 +644,7 @@ def main() -> None:
     r.add_argument("--settle", type=float, default=90)
     r.add_argument("--out", required=True)
     r.add_argument("--messages", action="store_true", help="message-heavy chaos")
+    r.add_argument("--pg", help="a PostgreSQL DSN: the store for the driver and every worker")
     w = sub.add_parser("worker")
     w.add_argument("folder")
     args = p.parse_args()
@@ -642,6 +653,10 @@ def main() -> None:
         return
     global LONG
     LONG = args.messages
+    if args.pg:
+        os.environ["STATECRAFT_CHAOS_PG"] = args.pg  # the workers inherit it
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        make_store(Path(args.out)).drop()  # a fresh schema for this run
     report = asyncio.run(Driver(args).run())
     (Path(args.out) / "report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps(report, indent=1))

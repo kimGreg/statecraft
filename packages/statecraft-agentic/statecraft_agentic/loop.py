@@ -391,6 +391,8 @@ class AgenticAgent(Agent):
             payload = parse_json(text) if self.json_output else {"text": text}
             if not isinstance(payload, dict):
                 raise ValueError("the answer is not a JSON object")
+            if not self.json_output and not text.strip():
+                raise ValueError("the answer is empty: say what you did and found")
             problem = self.check_output(ctx, data, payload)
         except (ValueError, json.JSONDecodeError) as exc:
             problem = f"{type(exc).__name__}: {exc}"
@@ -443,6 +445,11 @@ class AgenticAgent(Agent):
                     "usage": data["usage"],
                 },
             )
+        return await self.answered(ctx, data, payload)
+
+    async def answered(self, ctx, data: dict[str, Any], payload: dict[str, Any]) -> Any:
+        """What follows a usable final answer (published): the agent ends (`Done`). A subclass
+        may wait for more instead (a session)."""
         return Done
 
     # ---- helpers ----------------------------------------------------------------------------

@@ -84,7 +84,7 @@ def test_a_bad_policy_is_refused_when_loaded(policy) -> None:
 @pytest.mark.parametrize(
     ("config", "where"),
     [
-        ({"store": {"provider": "postgres", "url": "x"}}, "store.provider"),
+        ({"store": {"provider": "cassandra", "url": "x"}}, "store.provider"),
         ({"workspace": {"provider": "s3", "bucket": "b"}}, "workspace.provider"),
         ({"store": {"provider": "sqlite", "pth": "x.db"}}, "store"),
         ({"runtime": {"concurency": 4}}, "runtime"),

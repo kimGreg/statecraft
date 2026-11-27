@@ -307,3 +307,20 @@ async def test_a_call_to_a_provider_unreachable_at_start_says_so() -> None:
         await runtime.run("c", timeout=5)
         cls, message = (await runtime.store.load("c")).data["error"]
     assert cls == "unavailable" and "could not be reached" in message and "repin" in message
+
+
+async def test_an_empty_text_answer_is_asked_again() -> None:
+    class Texts(AgenticAgent):
+        instruction = "Say something."
+        json_output = False
+
+    model = ScriptedModel([say(""), say("something")])
+    runtime = memory_runtime()
+    agentic(runtime.registrar)
+    add_model(runtime.registrar, "default", model)
+    runtime.registrar.agents.register("texts", Texts, tools=["model.default"], writes=["answer"])
+    async with runtime:
+        await runtime.spawn("texts", root_id="e")
+        await runtime.run("e", timeout=10)
+        assert (await runtime.artifact("e", "answer"))["payload"] == {"text": "something"}
+    assert any("the answer is empty" in str(m.get("content")) for m in model.seen[-1])

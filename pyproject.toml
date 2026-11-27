@@ -38,6 +38,7 @@ include = ["statecraft*"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/statecraft-agentic/tests", "packages/statecraft-mcp/tests",
              "packages/statecraft-console/tests", "packages/statecraft-opensandbox/tests",
+             "packages/statecraft-postgres/tests", "packages/statecraft-coding/tests",
              "examples"]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"

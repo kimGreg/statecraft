@@ -704,7 +704,23 @@ stopped (`destroy_on_cancel` destroys the sandbox and declares `tree_termination
 and runtime know nothing of it: it is a plugin and an effect provider. A `fake` backend runs the
 same provider logic on this machine for tests.
 
-### 12.4 statecraft-console
+### 12.5 statecraft-postgres
+
+The state store on PostgreSQL, for executors on several hosts against one database
+(`store: {provider: postgres, dsn, schema}`; store kinds come from packages through the
+`statecraft.stores` entry points). Writes run `SERIALIZABLE` and are run again from the start on
+a serialization conflict; reads are snapshots. It passes the core's store contract suite
+unchanged and the chaos harness with several worker processes against one database.
+
+### 12.6 statecraft-coding
+
+A coding agent on the agentic harness: project discovery (files, tooling markers, `AGENTS.md`),
+project-relative file tools that are safe to repeat (`list_dir`, `read_file`, `write_file`,
+`edit_file`), commands through the granted shell effect (`sh`), output shaping, and sessions
+(the agent waits for the next instruction after each answer); `python -m statecraft_coding` is
+a durable terminal session over it. It manages no shell process of its own.
+
+### 12.7 statecraft-console
 
 The visualizer, over the runtime API only: registry (agents with their states, tools with schemas
 and policies, providers with health), runs (the live tree, each agent's walked path, data,
