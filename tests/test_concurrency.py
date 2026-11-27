@@ -205,9 +205,7 @@ class Waiter(Agent):
         return Done
 
 
-async def test_kill_and_a_lost_lease_cancel_in_flight_calls() -> None:
-    cancelled: list[str] = []
-
+def hanging_runtime(cancelled: list[str], **options):
     async def hang(arguments):
         try:
             await asyncio.sleep(60)
@@ -215,7 +213,7 @@ async def test_kill_and_a_lost_lease_cancel_in_flight_calls() -> None:
             cancelled.append("x")
             raise
 
-    runtime = memory_runtime(executors=1, scan_every=0.01, lease_ttl=60, beat=0.05)
+    runtime = memory_runtime(executors=1, scan_every=0.01, lease_ttl=60, **options)
     runtime.registrar.providers.register("svc", FunctionProvider({"svc.hang": hang}))
     runtime.registrar.tools.register(
         EffectDefinition(
@@ -226,20 +224,32 @@ async def test_kill_and_a_lost_lease_cancel_in_flight_calls() -> None:
         )
     )
     runtime.registrar.agents.register("waiter", Waiter, tools=["svc.hang"])
-    async with runtime:
+    return runtime
+
+
+async def test_kill_cancels_in_flight_calls_at_once() -> None:
+    cancelled: list[str] = []
+    async with hanging_runtime(cancelled, beat=30) as runtime:  # no heartbeat to rely on
         killed = await runtime.spawn("waiter")
         await until(lambda: leased(runtime, killed))
+        started = time.monotonic()
         await runtime.signal(killed, "KILL")
         await until(lambda: asyncio.sleep(0, len(cancelled) == 1))
+        assert time.monotonic() - started < 1.0
         assert (await runtime.get(killed))["status"] == "terminated"
-        assert [e["kind"] for e in await runtime.history(killed)] == ["created", "signal"]
+        kinds = [e["kind"] for e in await runtime.history(killed)]
+        assert kinds == ["created", "intent", "signal"]  # created, initialized, killed
 
+
+async def test_a_lost_lease_cancels_in_flight_calls() -> None:
+    cancelled: list[str] = []
+    async with hanging_runtime(cancelled, beat=0.05) as runtime:
         lost = await runtime.spawn("waiter")
         await until(lambda: leased(runtime, lost))
         with runtime.store.transaction() as t:  # another executor takes the lease over
             _lease, epoch = t.get_lease(lost)
             t.put_lease(lost, Lease("someone-else", epoch + 1, time.time() + 0.2), epoch + 1)
-        await until(lambda: asyncio.sleep(0, len(cancelled) == 2))
+        await until(lambda: asyncio.sleep(0, len(cancelled) == 1))
         assert (await runtime.get(lost))["step"] == 0  # nothing committed by the lost step
 
 

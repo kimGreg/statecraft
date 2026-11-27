@@ -137,7 +137,10 @@ class AgentFiles:
             return
         if path.startswith("home/"):
             rest = path.removeprefix("home/").split("/")
-            folder = next((i for i, part in enumerate(rest) if part in HOME_FOLDERS), None)
+            # rest[0] is the root's id, never a home folder (a root may not be named like one)
+            folder = next(
+                (i for i, part in enumerate(rest) if i > 0 and part in HOME_FOLDERS), None
+            )
             if folder is not None and rest[folder] == "skills":
                 return
             if folder is not None and rest[folder] == "objects":

@@ -150,4 +150,29 @@ async def test_unread_messages_of_an_ended_agent_are_kept() -> None:
         await rt.signal(root, "KILL")
         record = await rt.store.load(root)
     assert record.status == "terminated"
-    assert record.undelivered == [{"message": {"type": "steer", "text": "never read"}}]
+    assert record.undelivered == [
+        {"message": {"type": "steer", "text": "never read"}, "reason": "unread when it ended"}
+    ]
+
+
+async def test_messages_not_applied_when_an_agent_is_killed_are_kept() -> None:
+    async with runtime() as rt:
+        root = await rt.spawn("waiter", {}, root_id="k")
+        await rt.run(root, timeout=10)
+        await rt.signal(root, ("USR", {"n": 1}))  # accepted, not applied yet
+        await rt.signal(root, "KILL")
+        record = await rt.store.load(root)
+    assert record.undelivered == [{"message": {"n": 1}, "reason": "arrived as it was killed"}]
+    assert await rt.store.read_inbox(root, record.inbox_applied) == []
+
+
+async def test_a_message_after_a_term_in_the_same_batch_is_kept() -> None:
+    async with runtime() as rt:
+        root = await rt.spawn("waiter", {}, root_id="t")
+        await rt.run(root, timeout=10)
+        await rt.signal(root, "TERM")  # no on_term: ends at once when applied
+        await rt.signal(root, ("USR", {"n": 2}))
+        await rt.run(root, timeout=10)
+        record = await rt.store.load(root)
+    assert record.status == "terminated"
+    assert record.undelivered == [{"message": {"n": 2}, "reason": "arrived as it ended"}]

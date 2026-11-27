@@ -4,8 +4,8 @@ What must hold
   * a value that is not a signal is refused by the API (ValueError; HTTP 400 is tested with the
     server) and never stored;
   * a message already in an inbox that cannot be applied (a poisoned store, an old client, an
-    answer to a question that closed) is rejected: recorded in the agent's history, skipped,
-    and the executor and every other agent go on;
+    answer to a question that closed) is undelivered: kept with its reason, recorded in the
+    agent's history, skipped; the executor and every other agent go on;
   * a spawn whose agent cannot be created faults the parent with the reason; after the registry
     is fixed, CONT carries the spawn out;
   * any exception from preparing or running a step is the state's fault, committed once, with
@@ -156,10 +156,12 @@ async def test_a_poisoned_inbox_message_is_rejected_and_the_rest_go_on() -> None
         await rt.run(poisoned, timeout=10)
         assert (await rt.get(other))["view"] == "succeeded"
         assert (await rt.get(poisoned))["view"] == "succeeded"
-        rejected = [h for h in await rt.history(poisoned) if h["kind"] == "rejected"]
+        rejected = [h for h in await rt.history(poisoned) if h["kind"] == "undelivered"]
         assert [h["detail"]["message_id"] for h in rejected] == ["old-client", "junk"]
         assert "unknown signal 'FOO'" in rejected[0]["detail"]["reason"]
         assert all(not t.done() for t in rt._tasks)  # the executor is still running
+        kept = (await rt.store.load(poisoned)).undelivered
+        assert [u["reason"][:14] for u in kept] == ["unknown signal", "not a message:"]
 
 
 async def test_a_spawn_that_cannot_be_created_faults_the_parent_until_fixed(tmp_path) -> None:

@@ -22,7 +22,7 @@ from contextlib import AbstractContextManager
 from typing import Any, Protocol, TypeVar
 
 from .process import Fault, Lease, Record, Transition
-from .transitions import apply_outcome, apply_signal
+from .transitions import apply_outcome, apply_signal, undeliver
 
 T = TypeVar("T")
 
@@ -86,6 +86,15 @@ class Tables(Protocol):
     def work_ids(self) -> list[str]: ...
     def tree_ids(self, root: str) -> list[str]: ...
     def root_ids(self) -> list[str]: ...
+
+
+def _payload(message: Any) -> Any:
+    """What a message carries: a USR signal's message, else the message itself."""
+    if isinstance(message, dict) and message.get("kind") == "signal":
+        signal = message.get("signal")
+        if isinstance(signal, list) and len(signal) == 2 and signal[0] == "USR":
+            return signal[1]
+    return message
 
 
 def root_of(agent_id: str) -> str:
@@ -306,7 +315,12 @@ class StateStore:
             t.put_lease(agent_id, None, epoch + 1)
             if before.ended:
                 return before
-            return self._save(t, before, apply_signal(before, "KILL"), "signal", signal="KILL")
+            after = apply_signal(before, "KILL")
+            # messages accepted but not applied yet will never be: account for them
+            for item in t.inbox_read(agent_id, before.inbox_applied):
+                after = undeliver(after, _payload(item["message"]), "arrived as it was killed")
+                after = after.but(inbox_applied=item["n"])
+            return self._save(t, before, after, "signal", signal="KILL")
 
         return await self._txn(body)
 

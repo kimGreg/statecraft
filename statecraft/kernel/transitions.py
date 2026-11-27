@@ -46,6 +46,16 @@ def _term_children(record: Record) -> list[dict[str, Any]]:
     return out
 
 
+def _unread(mailbox: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{**m, "reason": "unread when it ended"} for m in mailbox]
+
+
+def undeliver(record: Record, message: Any, reason: str, n: int | None = None) -> Record:
+    """Account for an accepted message the agent will never receive."""
+    kept = record.but(undelivered=[*record.undelivered, {"message": message, "reason": reason}])
+    return kept.but(inbox_applied=n) if n is not None else kept
+
+
 def _end(record: Record, status: str) -> Record:
     ended = record.but(
         status=status,
@@ -53,7 +63,7 @@ def _end(record: Record, status: str) -> Record:
         wake=None,
         terminating=False,
         mailbox=[],
-        undelivered=[*record.undelivered, *record.mailbox],
+        undelivered=[*record.undelivered, *_unread(record.mailbox)],
     )
     return ended.but(intents=[*ended.intents, *_term_children(ended)])
 
@@ -195,8 +205,10 @@ def signal_problem(signal: Any) -> str | None:
 def apply_signal(record: Record, signal: Any) -> Record:
     """STOP, CONT, TERM, KILL change the lifecycle; ("USR", message) goes to the mailbox."""
     name = _signal_name(signal)
-    if record.ended:
-        return record  # signals to an ended agent are no-ops
+    if record.ended:  # lifecycle signals to an ended agent change nothing; a message is kept
+        if name == "USR" and isinstance(signal, (list, tuple)) and len(signal) == 2:
+            return undeliver(record, signal[1], "arrived as it ended")
+        return record
     if name == "STOP":
         if record.reason("stopped"):
             return record
@@ -216,7 +228,7 @@ def apply_signal(record: Record, signal: Any) -> Record:
             reasons=[],
             wake={"kind": "term"},
             mailbox=[],
-            undelivered=[*record.undelivered, *record.mailbox],
+            undelivered=[*record.undelivered, *_unread(record.mailbox)],
         )
     if name == "KILL":
         return _end(record, "terminated")  # the store also bumps the lease epoch

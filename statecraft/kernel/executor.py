@@ -39,7 +39,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .process import ChildView, Fault, Lease, Record, Transition
-from .store import Busy, Conflict, Ended, Fenced, StateStore, StoreError, Unread
+from .store import Busy, Conflict, Ended, Fenced, StateStore, StoreError, Unread, _payload
 from .transitions import (
     InvalidAnswer,
     InvalidTransition,
@@ -50,6 +50,7 @@ from .transitions import (
     mark_intent_done,
     resolve_wait,
     signal_problem,
+    undeliver,
 )
 
 #: How many failures an executor keeps for inspection (`Executor.failures`).
@@ -67,6 +68,10 @@ class Environment(Protocol):
     def notify(self) -> None: ...
 
     async def prepare(self, agent_id: str) -> None: ...
+
+    async def initialize(self, record: Record, intent: dict[str, Any]) -> None:
+        """A new root's workspace (session, input); safe to repeat."""
+        ...
 
     async def run_step(
         self, record: Record, lease: Lease, root_input: dict[str, Any]
@@ -221,12 +226,14 @@ class Executor:
             message = item["message"]
             n = item["n"]
             problem = message_problem(message, record)
-            if problem is not None:  # rejected: recorded in the history, never applied
-                log.warning("%s: message %s rejected: %s", record.id, item.get("id"), problem)
+            if problem is None and record.ended:
+                problem = "arrived as it ended"
+            if problem is not None:  # accepted, never received: accounted as undelivered
+                log.warning("%s: message %s undelivered: %s", record.id, item.get("id"), problem)
                 record = await self._control(
                     record,
-                    lambda r, n=n: r.but(inbox_applied=n),
-                    "rejected",
+                    lambda r, n=n, m=message, p=problem: undeliver(r, _payload(m), p, n),
+                    "undelivered",
                     message_id=item.get("id"),
                     reason=problem,
                 )
@@ -284,7 +291,9 @@ class Executor:
     # ---- 3. intents -------------------------------------------------------------------------
     async def _carry_out(self, record: Record) -> Record:
         for intent in record.pending_intents:
-            if intent["kind"] == "spawn":
+            if intent["kind"] == "init":  # a root's workspace (a crash after its creation)
+                await self.env.initialize(record, intent)
+            elif intent["kind"] == "spawn":
                 fault = record.reason("fault")
                 if fault is not None and fault.get("intent") == intent["id"]:
                     continue  # this spawn failed; it is tried again after CONT

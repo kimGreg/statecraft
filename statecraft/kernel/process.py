@@ -75,7 +75,9 @@ class Record:
     #: "agents": [<names or agent ids kept>]} (all of that run's agents when no list).
     inherits: dict[str, Any] | None = None
     error: str | None = None
-    #: USR messages it received and never read before it ended (kept, not dropped).
+    #: Messages it accepted but never received, each with why: unread when it ended, arrived
+    #: as it ended, or not applicable (an invalid message, a closed question). Every accepted
+    #: message is either delivered (applied, or read by a committed step) or here.
     undelivered: list[dict[str, Any]] = field(default_factory=list)
 
     @property

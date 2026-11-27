@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -30,7 +31,13 @@ import jsonschema
 from ..kernel.executor import Executor, signal_name
 from ..kernel.process import Fault, Lease, Record, Transition
 from ..kernel.store import Ended, StateStore
-from ..kernel.transitions import InvalidAnswer, apply_answer, signal_problem, view
+from ..kernel.transitions import (
+    InvalidAnswer,
+    apply_answer,
+    mark_intent_done,
+    signal_problem,
+    view,
+)
 from ..sdk.agent import run_state
 from ..sdk.contracts import Artifact
 from .context import StepContext, dumps
@@ -41,6 +48,23 @@ from .workspace import HOME_FOLDERS, WorkspaceProvider, WorkspaceService, input_
 
 #: Limits a runtime can put on every tree (`Runtime(limits=...)`, configuration `runtime.limits`).
 LIMITS = ("max_depth", "max_total_agents", "max_live_agents")
+
+
+ROOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#: Names a root may not have: its id is a folder of the workspace provider and a segment of
+#: `home/<root>/...` paths, so it may not read as a home folder or the top of a workspace.
+RESERVED_ROOT_IDS = frozenset({*HOME_FOLDERS, "home", "shared", "run"})
+
+
+def root_id_problem(root_id: str) -> str | None:
+    if not ROOT_ID.fullmatch(root_id):
+        return (
+            f"a root id is a letter or digit, then letters, digits, '.', '_' or '-' "
+            f"(at most 128), not {root_id!r}"
+        )
+    if root_id in RESERVED_ROOT_IDS:
+        return f"{root_id!r} is reserved; choose another root id"
+    return None
 
 
 class NotStarted(RuntimeError):
@@ -394,8 +418,9 @@ class Runtime:
             except jsonschema.ValidationError as exc:
                 raise ValueError(f"input for {name} is invalid: {exc.message}") from exc
         root_id = root_id or f"{name.rpartition(':')[2]}-{uuid.uuid4().hex[:8]}"
-        if "/" in root_id:
-            raise ValueError("a root id has no '/'")
+        problem = root_id_problem(root_id)
+        if problem:
+            raise ValueError(problem)
         if attach is not None and await self.store.find(attach) is None:
             raise ValueError(f"no root {attach} to attach to")
         if attach_mode not in ("ro", "rw"):
@@ -405,14 +430,32 @@ class Runtime:
         record = self.new_record(
             definition, root_id, data_input=given, workspace=attach, workspace_mode=attach_mode
         ).but(inherits=dict(inherit) if inherit else None)
-        self.workspaces.remember(record)
-        files = await self.workspaces.files_of(root_id)
-        await files.put(input_path(record), dumps(record.input))
+        init = {"id": f"{root_id}/init", "kind": "init", "done": False}
+        record = record.but(intents=[init])
+        # the record first: an id that exists is refused before anything is written, so a
+        # duplicate never touches the live run; then the workspace, through the `init` intent,
+        # so a crash in between is finished by the executor like any other intent
         if not await self.store.create(record):
             raise ValueError(f"{root_id} exists")
+        await self.initialize(record, init)
+        created = await self.store.load(root_id)
+        await self.store.commit_control(
+            root_id,
+            created.revision,
+            lambda r: mark_intent_done(r, init["id"]),
+            self.clock(),
+            kind="intent",
+            intent=init["id"],
+        )
         await self.refresh_views(root_id)
         self.notify()
         return root_id
+
+    async def initialize(self, record: Record, intent: dict[str, Any]) -> None:
+        """A new root's workspace: its session known, its input written. Safe to repeat."""
+        self.workspaces.remember(record)
+        files = await self.workspaces.files_of(record.id)
+        await files.put(input_path(record), dumps(record.input))
 
     async def signal(self, agent_id: str, signal: Any, *, message_id: str | None = None) -> None:
         """Raises `ValueError` for a value that is not a signal, and `Ended` for an agent that
