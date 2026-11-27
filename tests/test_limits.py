@@ -115,3 +115,43 @@ def test_limits_come_from_the_configuration(tmp_path) -> None:
     assert runtime.limits == {"max_depth": 3, "max_total_agents": 32, "max_live_agents": 8}
     with pytest.raises(ValueError, match="unknown limits"):
         memory_runtime(limits={"max_tokens": 10})
+
+
+class Pair(Agent):
+    """Spawns two fans, each of which spawns its own leaves."""
+
+    start = "go"
+
+    @state
+    async def go(self, ctx, data):
+        return Spawn({"a": ("fan", {"n": 2}), "b": ("fan", {"n": 2})}, then="wait")
+
+    @state
+    async def wait(self, ctx, data):
+        return Wait(join=["a", "b"], then="end")
+
+    @state
+    async def end(self, ctx, data):
+        return Done
+
+
+async def test_concurrent_spawns_cannot_pass_a_limit_together() -> None:
+    """Two agents of one tree commit spawns at once: each was checked against the tree as it
+    was (the early check is skipped here, as in that race); the commit counts again in its own
+    transaction, children not created yet included, and refuses the one that would pass it."""
+    runtime = memory_runtime(limits={"max_total_agents": 5})
+    runtime.registrar.agents.register("fan", Fan, spawns=["leaf"])
+    runtime.registrar.agents.register("leaf", Leaf, spawns=["leaf"])
+    runtime.registrar.agents.register("pair", Pair, spawns=["fan"])
+
+    async def no_early_check(parent, count):
+        return None
+
+    runtime.limit_problem = no_early_check
+    async with runtime:
+        await runtime.spawn("pair", root_id="race")
+        await runtime.run("race", timeout=10)
+        tree = await runtime.store.tree("race")
+        assert len(tree) <= 5
+        refused = [r.id for r in tree if r.error and "limit max_total_agents=5" in r.error]
+        assert len(refused) == 1 and refused[0] in ("race/a", "race/b")

@@ -495,7 +495,11 @@ async function drawAgent(side) {
           h("div", {}, h("b", {}, i.kind), " ", h("code", {}, i.id))))) : null,
         a.undelivered.length ? h("tr", {}, h("th", {}, "undelivered"), h("td", { colspan: 3 }, a.undelivered.map((u) =>
           h("div", { class: "v-terminated" }, u.reason || "", " ", h("code", {}, JSON.stringify(u.message ?? u).slice(0, 120)))))) : null,
-        a.calls.length ? h("tr", {}, h("th", {}, "calls"), h("td", { colspan: 3 }, callsTable(a.calls))) : null),
+        a.calls.length ? h("tr", {}, h("th", {}, "calls"), h("td", { colspan: 3 }, callsTable(a.calls))) : null,
+        a.attempts.length ? h("tr", {}, h("th", {}, "not committed"), h("td", { colspan: 3 }, a.attempts.map((t) =>
+          h("div", {}, `step ${t.step} · epoch ${t.epoch} · `, h("code", {}, t.state), " ", h("span", { class: "dim" }, t.why),
+            (t.crossings || []).map((c) => h("div", { class: c.ok ? "" : "v-terminated" }, h("code", {}, c.effect),
+              ` ×${c.attempts} ${c.duration}s${c.failure ? " " + c.failure : ""}`)))))) : null),
         h("div", { class: "toolbar", style: "margin-top:8px" },
           ["STOP", "CONT", "TERM", "KILL"].map((s) => h("button", { class: s === "TERM" || s === "KILL" ? "danger" : "", onclick: () => signal(r.id, s) }, s))),
         agentDefinition(a.definition, walked));

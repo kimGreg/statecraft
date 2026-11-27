@@ -10,9 +10,10 @@
     statecraft answer QUESTION_ID VALUE (--config FILE | --url URL)
     statecraft events ROOT [--since N] [--follow] (--config FILE | --url URL)
     statecraft faults | metrics (--config FILE | --url URL)   faulted agents; counts
-    statecraft repin ID | calls ID (--config FILE | --url URL)
+    statecraft repin ID | calls ID | attempts ID (--config FILE | --url URL)
     statecraft resolve KEY completed|failed|replay [--result JSON] (--config | --url)
     statecraft maintenance on|off|status (--config FILE | --url URL)
+    statecraft budget ROOT [--set JSON] (--config FILE | --url URL)
     statecraft plugins                      installed plugins (not enabled ones)
     statecraft store check|migrate --config FILE           the store's data format
     statecraft store collect [--grace S] [--apply] --config FILE   staging and unnamed objects
@@ -134,6 +135,13 @@ async def _call(args: argparse.Namespace) -> int:
             show(await api.repin(args.id))
         elif command == "calls":
             show(await api.calls(args.id))
+        elif command == "attempts":
+            show(await api.attempts(args.id))
+        elif command == "budget":
+            if args.set is not None:
+                show(await api.set_budget(args.id, _value(args.set)))
+            else:
+                show(await api.budget(args.id))
         elif command == "resolve":
             result = _value(args.result) if args.result is not None else None
             show(await api.resolve_call(args.key, args.outcome, result=result))
@@ -281,12 +289,15 @@ def main(argv: list[str] | None = None) -> int:
     resume.add_argument("--timeout", type=float)
     for name in ("agents", "tools", "providers", "ps", "questions", "faults", "metrics"):
         target(sub.add_parser(name))
-    for name in ("inspect", "tree", "history", "repin", "calls"):
+    for name in ("inspect", "tree", "history", "repin", "calls", "attempts"):
         target(sub.add_parser(name)).add_argument("id")
     resolve = target(sub.add_parser("resolve", help="settle a call whose outcome is unknown"))
     resolve.add_argument("key")
     resolve.add_argument("outcome", choices=["completed", "failed", "replay"])
     resolve.add_argument("--result", help="completed: what the state receives (JSON)")
+    budget = target(sub.add_parser("budget", help="a tree's budget: limit, spent, held"))
+    budget.add_argument("id")
+    budget.add_argument("--set", help="new limits, e.g. '{\"usd\": 2}' (null: none)")
     hold = target(sub.add_parser("maintenance", help="no new steps start while on"))
     hold.add_argument("state", choices=["on", "off", "status"])
     signal = target(sub.add_parser("signal"))

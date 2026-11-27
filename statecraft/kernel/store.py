@@ -77,6 +77,15 @@ class FormatError(StoreError):
     older (migrate it first: `statecraft store migrate`)."""
 
 
+class LimitReached(Exception):
+    """A step's spawns would take its tree past a limit (`max_total_agents`, `max_live_agents`),
+    counted in the commit's own transaction: the step faults instead of committing them."""
+
+
+class OverBudget(Exception):
+    """A metered call would take its tree past its budget: refused before it is sent."""
+
+
 class CallRefused(Exception):
     """A keyed call refused before anything was sent: its identity names another request or
     another agent, or the agent has an unresolved call to that effect."""
@@ -247,6 +256,19 @@ class StateStore:
             **detail,
         }
         seq = t.event_append(root_of(after.id), event["id"], jsonable(event))
+        if after.parent and _child_news(before, after):
+            # CHLD: the parent learns that a child faulted or ended (its wait is still decided
+            # from the child's record; the notification is for whoever follows the parent)
+            news = {
+                "id": f"{after.id}@{after.revision}/CHLD",
+                "kind": "CHLD",
+                "agent": after.parent,
+                "child": after.id,
+                "status": after.status,
+                "fault": after.reason("fault") is not None,
+                "revision": after.revision,
+            }
+            t.event_append(root_of(after.id), news["id"], jsonable(news))
         if any("seq" not in ref for ref in after.published.values()):
             stamped = {
                 k: ref if "seq" in ref else {**ref, "seq": seq}
@@ -315,7 +337,11 @@ class StateStore:
         expected_step: int,
         outcome: Transition | Fault,
         now: float,
+        limits: dict[str, int] | None = None,
     ) -> Record:
+        """`limits`: tree limits checked against the tree as it is in this transaction, its
+        children not created yet included (a spawn reserves its place when it is committed)."""
+
         def body(t: Tables) -> Record:
             current, epoch = t.get_lease(agent_id)
             if (
@@ -328,6 +354,8 @@ class StateStore:
             if before is None or before.step != expected_step:
                 raise Conflict(f"{agent_id}: expected step {expected_step}")
             after = apply_outcome(before, outcome, now=now)
+            if limits and isinstance(outcome, Transition) and outcome.spawns:
+                _check_tree_limits(t, after, limits)
             if after.ended and t.inbox_read(agent_id, before.inbox_applied):
                 raise Unread(f"{agent_id}: messages arrived before it could end")
             kind = "fault" if isinstance(outcome, Fault) else "step"
@@ -458,6 +486,18 @@ class StateStore:
         """The journaled calls of an agent, oldest first."""
         return await self._txn(lambda t: t.calls_of(agent_id), write=False)
 
+    async def record_attempt(
+        self, agent_id: str, step: int, epoch: int, entry: dict[str, Any]
+    ) -> int:
+        """Keep what an attempt that did not commit did (why, and its effect calls) as an
+        `attempt` event in the run's durable log: recovery tooling reads it. Once per attempt."""
+        event_id = f"{agent_id}/attempt/{step}/{epoch}"
+        event = jsonable(
+            {"id": event_id, "kind": "attempt", "agent": agent_id, "step": step, "epoch": epoch}
+            | entry
+        )
+        return await self._txn(lambda t: t.event_append(root_of(agent_id), event_id, event))
+
     async def audit(self, root: str, entry: dict[str, Any]) -> int:
         """Record who did what to a run (a control operation, an operator's decision)
         in the run's durable event log, as an `audit` event."""
@@ -497,6 +537,75 @@ class StateStore:
     async def set_setting(self, name: str, value: Any) -> None:
         value = jsonable(value)
         await self._txn(lambda t: t.setting_put(name, value))
+
+    # ---- tree budgets (E3): reservations before metered calls, settled with what they used ----
+    # A budget is limits per unit ({"usd": 2.0, "units": 100000}); `spent` and `held` count
+    # every unit that calls report. The units are the extensions': the kernel only adds.
+    async def budget(self, root: str) -> dict[str, Any] | None:
+        return await self._txn(lambda t: t.setting_get(_budget_name(root)), write=False)
+
+    async def set_budget(self, root: str, limit: dict[str, float] | None) -> dict[str, Any]:
+        """Set (or, with None, remove) a tree's limits; what was spent and held is kept."""
+        limit = jsonable(limit)
+
+        def body(t: Tables) -> dict[str, Any]:
+            found = t.setting_get(_budget_name(root)) or {"spent": {}, "held": {}}
+            found["limit"] = dict(limit or {})
+            t.setting_put(_budget_name(root), found)
+            return found
+
+        return await self._txn(body)
+
+    async def reserve(
+        self, root: str, key: str, amounts: dict[str, float], *, agent: str, epoch: int
+    ) -> bool:
+        """Hold `amounts` for one send of a metered call, or refuse (`OverBudget`) when what was
+        spent, what is held and this would pass a limit. False when the tree has no budget.
+        Holds of the agent's earlier attempts (lower epochs: those attempts are gone, and their
+        calls may have been charged) are counted as spent first. Holding a key twice holds once."""
+        amounts = jsonable(amounts)
+
+        def body(t: Tables) -> bool:
+            found = t.setting_get(_budget_name(root))
+            if found is None:
+                return False
+            spent, held = found["spent"], found["held"]
+            for other, hold in list(held.items()):
+                if hold["agent"] == agent and hold["epoch"] < epoch:
+                    _add(spent, hold["amounts"])
+                    del held[other]
+            if key not in held:
+                for unit, most in (found.get("limit") or {}).items():
+                    total = (
+                        spent.get(unit, 0)
+                        + sum(h["amounts"].get(unit, 0) for h in held.values())
+                        + amounts.get(unit, 0)
+                    )
+                    if total > most:
+                        raise OverBudget(
+                            f"budget {unit}={most}: this call would bring {root} to {total:g}"
+                        )
+                held[key] = {"agent": agent, "epoch": epoch, "amounts": amounts}
+            t.setting_put(_budget_name(root), found)
+            return True
+
+        return await self._txn(body)
+
+    async def settle(self, root: str, key: str, used: dict[str, float] | None) -> None:
+        """End a hold: `used` is what the call reported (or its hold, when it may have been sent
+        and reported nothing); None releases it unspent (the call was not sent)."""
+        used = jsonable(used)
+
+        def body(t: Tables) -> None:
+            found = t.setting_get(_budget_name(root))
+            if found is None or key not in found["held"]:
+                return
+            hold = found["held"].pop(key)
+            if used is not None:
+                _add(found["spent"], used or hold["amounts"])
+            t.setting_put(_budget_name(root), found)
+
+        await self._txn(body)
 
     # ---- storage upkeep (C2): compacting and forgetting ended runs -----------------------------
     async def compact(self, root: str, *, dry_run: bool = False) -> dict[str, int]:
@@ -560,9 +669,49 @@ class StateStore:
                     raise Busy(f"{other_id} reads {root}; forget {other_id} first")
             if not dry_run:
                 t.forget(ids, root)
+                if t.setting_get(_budget_name(root)) is not None:
+                    t.setting_put(_budget_name(root), None)
             return {"agents": len(ids)}
 
         return await self._txn(body, write=not dry_run)
+
+
+def _budget_name(root: str) -> str:
+    return f"budget/{root}"
+
+
+def _add(into: dict[str, float], amounts: dict[str, float]) -> None:
+    for unit, n in amounts.items():
+        if isinstance(n, int | float) and not isinstance(n, bool):
+            into[unit] = into.get(unit, 0) + n
+
+
+def _check_tree_limits(t: Tables, after: Record, limits: dict[str, int]) -> None:
+    records = {r.id: r for r in (t.get(i) for i in t.tree_ids(root_of(after.id))) if r}
+    records[after.id] = after
+    pending = {
+        i["id"]
+        for r in records.values()
+        for i in r.intents
+        if i["kind"] == "spawn" and not i["done"] and i["id"] not in records
+    }
+    total = len(records) + len(pending)
+    most = limits.get("max_total_agents")
+    if most is not None and total > most:
+        raise LimitReached(f"limit max_total_agents={most}: the tree would have {total}")
+    live = sum(1 for r in records.values() if not r.ended) + len(pending)
+    most = limits.get("max_live_agents")
+    if most is not None and live > most:
+        raise LimitReached(f"limit max_live_agents={most}: {live} agents would be live")
+
+
+def _child_news(before: Record | None, after: Record) -> bool:
+    """A child ended, or faulted, in this change."""
+    if before is None:
+        return False
+    ended = after.ended and not before.ended
+    faulted = after.reason("fault") is not None and before.reason("fault") is None
+    return ended or faulted
 
 
 def _without_revision(entry: dict[str, Any]) -> dict[str, Any]:
@@ -579,7 +728,9 @@ __all__ = [
     "Ended",
     "Fenced",
     "FormatError",
+    "LimitReached",
     "NotJSON",
+    "OverBudget",
     "StateStore",
     "StoreError",
     "Tables",

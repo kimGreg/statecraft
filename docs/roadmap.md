@@ -29,6 +29,12 @@ messages, pending intents with `init`, joins, maintenance and capacity held; per
 diagnostics and budgets come with E1 and E3). D4 done (faults with the failing attempt's calls;
 CLI `faults`, `repin`, `calls`, `resolve`, `metrics`, `maintenance`; store-wide maintenance mode
 in which running steps finish and nothing new starts; resolving from the console, admin only).
+E1 done (an `attempt` event with why and the calls of every attempt that did not commit, R11;
+CHLD as an event to the parent; a fault that replaces an unstorable outcome keeps its calls).
+E3 done (tree limits counted again in the commit's transaction with pending spawns; per-tree
+budgets: reserve before a metered send, settle with reported use, refuse unsent over budget,
+dead attempts' holds spent; statecraft-agentic holds `tokens` and `usd`; checked with
+gpt-oss-20b through OpenRouter: cost reported and counted).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.

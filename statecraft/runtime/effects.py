@@ -14,12 +14,13 @@ import asyncio
 import contextlib
 import json
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import jsonschema
 
 from ..kernel.effects import EffectError, digest_of, may_retry
-from ..kernel.store import CallRefused, StateStore
+from ..kernel.store import CallRefused, OverBudget, StateStore
 from ..ports.effects import EffectContext, Reconciled
 from . import telemetry
 
@@ -200,9 +201,16 @@ class EffectManager:
                     await slots.acquire()
                 crossing["waited"] = round(crossing.get("waited", 0) + time.monotonic() - waited, 4)
                 try:
-                    return await asyncio.wait_for(
-                        provider.invoke(definition.operation or name, arguments, context),
-                        policy.timeout,
+                    return await self._metered(
+                        ctx,
+                        provider,
+                        definition,
+                        name,
+                        arguments,
+                        lambda context=context: asyncio.wait_for(
+                            provider.invoke(definition.operation or name, arguments, context),
+                            policy.timeout,
+                        ),
                     )
                 finally:
                     self._release_after(context, slots)
@@ -224,6 +232,50 @@ class EffectManager:
                 raise failure
             self.counters["retries"] += 1
             await asyncio.sleep(min(self.backoff * 2 ** (attempt - 1), 2.0))
+
+    async def _metered(
+        self,
+        ctx: StepContext,
+        provider: Any,
+        definition: Any,
+        name: str,
+        arguments: dict[str, Any],
+        send: Any,
+    ) -> Any:
+        """Send, holding the tree's budget first when the call is metered and its provider says
+        what a send may cost (`estimate_of(operation, arguments)`); settle with what it used
+        (`charge_of(operation, result)`), with its hold when it may have been sent and said
+        nothing, or release the hold when it provably was not sent. Over budget: refused, not
+        sent. A tree without a budget holds nothing."""
+        estimate = getattr(provider, "estimate_of", None)
+        if definition.policy.cost != "metered" or estimate is None or self.store is None:
+            return await send()
+        operation = definition.operation or name
+        root, hold = ctx.record.id.split("/")[0], f"{ctx.id}@{ctx.lease.epoch}/{uuid.uuid4().hex}"
+        try:
+            held = await self.store.reserve(
+                root,
+                hold,
+                dict(estimate(operation, arguments) or {}),
+                agent=ctx.id,
+                epoch=ctx.lease.epoch,
+            )
+        except OverBudget as exc:
+            raise EffectError("refused", str(exc), effect=name, sent=False) from None
+        if not held:
+            return await send()
+        try:
+            result = await send()
+        except EffectError as exc:
+            await self.store.settle(root, hold, None if not exc.sent else {})
+            raise
+        except BaseException:
+            await asyncio.shield(self.store.settle(root, hold, {}))  # it may have been sent
+            raise
+        charge = getattr(provider, "charge_of", None)
+        used = dict(charge(operation, result) or {}) if charge is not None else {}
+        await self.store.settle(root, hold, used)
+        return result
 
     async def _settle_earlier(
         self,

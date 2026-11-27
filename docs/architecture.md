@@ -198,6 +198,19 @@ These extend design §2 and bind agents, providers and the runtime:
 - Per provider `concurrency`: calls beyond it wait asynchronously for capacity, inside the step's
   deadline.
 - Per agent nothing extra: invariant 1 already serializes an agent's steps.
+- Per tree: `max_depth`, `max_total_agents`, `max_live_agents` (`Runtime(limits=...)`). The
+  total and live counts are checked again in the transaction that commits a step's spawns,
+  counting children not created yet: two agents of a tree committing spawns at once cannot pass
+  a limit together; the one that would faults with the limit.
+- Per tree budgets (`spawn(..., budget={"usd": 2})`, `runtime.set_budget`): a metered call whose
+  provider estimates it (`estimate_of`) holds the estimate in the store before it is sent and is
+  refused, unsent, when spent plus held plus the estimate would pass a limit; it settles with
+  what the provider says it used (`charge_of`). A call provably not sent releases its hold; one
+  that may have been sent and said nothing spends it; holds of an agent's dead attempts count as
+  spent. The units are the extensions' (statecraft-agentic: `tokens`, and `usd` from reported
+  cost or the client's `prices`); a unit is held only when the provider can estimate it, so a
+  `usd` limit without prices is checked against what was spent, and one request can pass it.
+  A state that runs again after a fault calls again, and pays again.
 
 ### 5.4 Blocking and CPU-heavy work
 
@@ -746,7 +759,10 @@ error; `${NAME:-default}` names a default. An operator policy applies to every t
 Every effect call made in a step produces a **crossing**: effect, provider, binding, sizes,
 duration, wait for capacity, attempts, failure class, effect key, and usage when the provider
 reports it. Crossings are committed with the step in its history entry; a step that does not
-commit leaves its crossings in a per-attempt diagnostic area for recovery tooling. Payloads are
+commit leaves its reason and crossings as an `attempt` event in the run's log
+(`runtime.attempts(agent)`, `GET /agents/{id}/attempts`, the console): a commit refused by
+fencing, a step cancelled by KILL or lease loss (its calls come from the running attempt), a
+step that ran again because messages arrived as it ended. Payloads are
 referenced, not copied. Extensions add observation hooks without the kernel understanding them.
 
 Tracing uses the OpenTelemetry API only (`statecraft[otel]`): a `statecraft.step` span per step

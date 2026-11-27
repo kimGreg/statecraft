@@ -140,6 +140,8 @@ class Runtime:
         self.warnings: list[str] = []
         self.started = False
         self.executors: list[Executor] = []
+        #: (agent, lease epoch) -> the running attempt's crossings (diagnostics if it is cancelled)
+        self._attempts: dict[tuple[str, int], list[dict[str, Any]]] = {}
         self.listeners: list[Callable[[dict[str, Any]], None]] = []
         self.wakeup = asyncio.Event()
         self._stop = asyncio.Event()
@@ -283,10 +285,27 @@ class Runtime:
     async def run_step(
         self, record: Record, lease: Lease, root_input: dict[str, Any]
     ) -> Transition | Fault:
-        with telemetry.step_span(self.tracer, record) as span:
-            outcome = await self._run_step(record, lease, root_input)
-            telemetry.step_outcome(span, outcome)
-            return outcome
+        attempt = (record.id, lease.epoch)
+        try:
+            with telemetry.step_span(self.tracer, record) as span:
+                outcome = await self._run_step(record, lease, root_input)
+                telemetry.step_outcome(span, outcome)
+        except asyncio.CancelledError:
+            raise  # its calls stay for `attempt_crossings`: the attempt did not commit
+        except BaseException:
+            self._attempts.pop(attempt, None)
+            raise
+        self._attempts.pop(attempt, None)
+        return outcome
+
+    def attempt_crossings(self, agent_id: str, epoch: int) -> list[dict[str, Any]]:
+        """The effect calls of a cancelled attempt (once; the executor keeps them)."""
+        return self._attempts.pop((agent_id, epoch), [])
+
+    async def attempts(self, agent_id: str) -> list[dict[str, Any]]:
+        """Attempts of the agent that did not commit: why, and their effect calls."""
+        events = await self.store.read_events(agent_id.split("/")[0])
+        return [e for e in events if e.get("kind") == "attempt" and e.get("agent") == agent_id]
 
     async def _run_step(
         self, record: Record, lease: Lease, root_input: dict[str, Any]
@@ -326,6 +345,7 @@ class Runtime:
             self.workspaces.session_of(record.id),
         )
         ctx.effects.schema_version = schema_version
+        self._attempts[(record.id, lease.epoch)] = ctx.effects.crossings  # filled as it calls
         outcome = await run_state(cls, record, ctx)
         problem = await self.effects.settle(ctx)
         if problem is not None:
@@ -491,10 +511,11 @@ class Runtime:
         attach: str | None = None,
         attach_mode: str = "ro",
         inherit: dict[str, Any] | None = None,
+        budget: dict[str, float] | None = None,
     ) -> str:
         """A new root. `attach`: work against that root's workspace (read-only unless
         `attach_mode="rw"`); `inherit` ({"root", "agents"}): a fork reading that run's outputs
-        for the agents it keeps."""
+        for the agents it keeps; `budget`: limits per unit for the tree's metered calls."""
         self._require_started()
         definition = self.registry.agent(name)
         given = dict(input or {})
@@ -525,6 +546,8 @@ class Runtime:
         # so a crash in between is finished by the executor like any other intent
         if not await self.store.create(record):
             raise ValueError(f"{root_id} exists")
+        if budget is not None:  # before its first step: set while it is not active yet
+            await self.store.set_budget(root_id, budget)
         await self.initialize(record, init)
         await self._activate(root_id, init["id"])
         await self.refresh_views(root_id)
@@ -598,6 +621,17 @@ class Runtime:
     async def maintenance(self, on: bool | None = None) -> bool:
         """Store-wide maintenance mode: running steps finish, no new step starts (None: read)."""
         return await operate.maintenance(self, on)
+
+    async def budget(self, root: str) -> dict[str, Any] | None:
+        """The tree's budget: `limit`, `spent` and `held` per unit (None: no budget)."""
+        return await self.store.budget(root)
+
+    async def set_budget(self, root: str, limit: dict[str, float] | None) -> dict[str, Any]:
+        """Set the tree's limits (raise one to let a refused call go on, then CONT)."""
+        await self.store.load(root)
+        found = await self.store.set_budget(root, limit)
+        self.notify()
+        return found
 
     async def faults(self) -> list[dict[str, Any]]:
         """Every agent suspended by a fault: error, failing state and step, its calls."""

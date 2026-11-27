@@ -39,7 +39,17 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .process import ChildView, Fault, Lease, Record, Transition
-from .store import Busy, Conflict, Ended, Fenced, StateStore, StoreError, Unread, _payload
+from .store import (
+    Busy,
+    Conflict,
+    Ended,
+    Fenced,
+    LimitReached,
+    StateStore,
+    StoreError,
+    Unread,
+    _payload,
+)
 from .transitions import (
     InvalidAnswer,
     InvalidTransition,
@@ -445,8 +455,10 @@ class Executor:
         self._cancelled.discard(agent_id)
         committed = False
         heart: asyncio.Task[None] | None = None
+        #: why this attempt did not commit (kept as an `attempt` event with its calls)
+        why = "the executor stopped"
+        outcome: Transition | Fault | None = None
         try:
-            outcome: Transition | Fault
             try:
                 await self.env.prepare(agent_id)
                 root = agent_id.split("/")[0]
@@ -459,6 +471,7 @@ class Executor:
                 if asyncio.current_task().cancelling():  # this executor is being cancelled
                     raise
                 if agent_id in self._cancelled:  # KILL, lease loss or stop: nothing committed
+                    why = "cancelled (KILL, lease lost or executor stopping)"
                     log.warning(
                         "%s: step %d cancelled; nothing committed",
                         agent_id,
@@ -474,9 +487,13 @@ class Executor:
             current = await self.store.lease(agent_id)
             lease = current if current and current.epoch == lease.epoch else lease
             try:
-                await self.store.commit_step(agent_id, lease, record.step, outcome, self.now())
+                limits = getattr(self.env, "limits", None)
+                await self.store.commit_step(
+                    agent_id, lease, record.step, outcome, self.now(), limits=limits
+                )
                 committed = True
             except Unread:
+                why = "messages arrived as it ended; the state runs again"
                 log.info(
                     "%s: messages arrived as it ended; running the state again",
                     agent_id,
@@ -491,15 +508,17 @@ class Executor:
                     if isinstance(exc, InvalidTransition)
                     else (f"the step's result could not be stored ({type(exc).__name__})")
                 )
-                await self.store.commit_step(
-                    agent_id, lease, record.step, Fault(f"{kind}: {exc}"), self.now()
-                )
+                message = str(exc) if isinstance(exc, LimitReached) else f"{kind}: {exc}"
+                fault = Fault(message, crossings=list(outcome.crossings))
+                await self.store.commit_step(agent_id, lease, record.step, fault, self.now())
                 committed = True
         except (Fenced, Conflict) as exc:
+            why = f"not committed: {exc}"
             log.warning(
                 "%s: step %d not committed: %s", agent_id, record.step, exc, extra=_ids(agent_id)
             )
         except StoreError as exc:
+            why = f"the store failed: {type(exc).__name__}: {exc}"
             self._failed(agent_id, "step", exc)
         finally:
             if heart is not None:
@@ -509,7 +528,24 @@ class Executor:
             if not committed:  # never leave the lease to expire (stop, cancel, store errors)
                 with contextlib.suppress(Exception):
                     await asyncio.shield(self.store.release(agent_id, lease))
+            if not committed:
+                await self._diagnose(record, lease, why, outcome)
             self._cancelled.discard(agent_id)
+
+    async def _diagnose(
+        self, record: Record, lease: Lease, why: str, outcome: Transition | Fault | None
+    ) -> None:
+        """Keep an uncommitted attempt's reason and effect calls (best effort: the store may be
+        what failed)."""
+        crossings = list(outcome.crossings) if outcome is not None else []
+        if outcome is None:
+            found = getattr(self.env, "attempt_crossings", None)
+            crossings = list(found(record.id, lease.epoch)) if found is not None else []
+        entry = {"why": why[:500], "state": record.state, "crossings": crossings}
+        with contextlib.suppress(Exception):
+            await asyncio.shield(
+                self.store.record_attempt(record.id, record.step, lease.epoch, entry)
+            )
 
     async def _heartbeat(self, agent_id: str, lease: Lease, work: asyncio.Task[Any]) -> None:
         """Renew the lease; when renewal fails the step has lost it: cancel the step (it could

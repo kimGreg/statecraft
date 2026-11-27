@@ -64,8 +64,10 @@ class StatecraftClient:
         attach: str | None = None,
         attach_mode: str = "ro",
         inherit: dict[str, Any] | None = None,
+        budget: dict[str, float] | None = None,
     ) -> str:
         body = {
+            "budget": budget,
             "agent": agent,
             "input": input or {},
             "root": root_id,
@@ -131,6 +133,15 @@ class StatecraftClient:
         return await self._json(
             "POST", f"/calls/{_path(key)}/resolve", json={"outcome": outcome, "result": result}
         )
+
+    async def budget(self, root: str) -> dict[str, Any] | None:
+        return await self._json("GET", f"/agents/{_path(root)}/budget")
+
+    async def set_budget(self, root: str, limit: dict[str, float] | None) -> dict[str, Any]:
+        return await self._json("POST", f"/agents/{_path(root)}/budget", json={"limit": limit})
+
+    async def attempts(self, agent_id: str) -> list[dict[str, Any]]:
+        return await self._json("GET", f"/agents/{_path(agent_id)}/attempts")
 
     async def faults(self) -> list[dict[str, Any]]:
         return await self._json("GET", "/faults")

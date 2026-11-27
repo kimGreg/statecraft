@@ -8,6 +8,11 @@ Policy: `read_only` (no side effects), `deterministic: false` (a repeat may answ
 `cost: metered` (a repeat costs again). Committed replies are reused on recovery; only an
 unfinished turn asks again. The model's private reasoning is never kept.
 
+Budgets (statecraft's per-tree reservations): before each request the provider holds `tokens`
+(the request's estimate and a reply allowance, `reply_tokens`) and, when the client has `prices`
+(USD per token: {"prompt", "completion"}), `usd`; it settles with the reply's usage (`cost`, when
+the endpoint reports it, is the `usd` spent).
+
 Clients: `ChatModel` (any OpenAI-compatible endpoint; `openrouter(...)` asks for zero retention),
 `ScriptedModel` (tests: replayed steps or a function).
 """
@@ -88,6 +93,8 @@ class ChatModel:
     key_envs: tuple[str, ...] = ("OPENAI_API_KEY",)
     extra_body: dict[str, Any] = field(default_factory=dict)
     timeout: float = 180
+    #: USD per token ({"prompt": ..., "completion": ...}): lets a budget hold and count `usd`
+    prices: dict[str, float] | None = None
 
     def _key(self) -> str | None:
         return next((os.environ[e] for e in self.key_envs if os.environ.get(e)), None)
@@ -123,7 +130,8 @@ def openrouter(model: str) -> ChatModel:
         name=model.removeprefix("openrouter/"),
         base_url=OPENROUTER_BASE,
         key_envs=OPENROUTER_KEY_ENVS,
-        extra_body=OPENROUTER_PRIVACY,
+        # the reply's usage carries its cost (`usd` for budgets)
+        extra_body={**OPENROUTER_PRIVACY, "usage": {"include": True}},
     )
 
 
@@ -252,9 +260,41 @@ def client_from(settings: dict[str, Any]) -> Client:
 class ModelProvider:
     """Carries out `model.<name>` effects with the configured clients."""
 
-    def __init__(self, *, concurrency: int | None = None) -> None:
+    def __init__(self, *, concurrency: int | None = None, reply_tokens: int = 4096) -> None:
         self.models: dict[str, Client] = {}
         self.concurrency = concurrency
+        #: the reply allowance a request holds against a budget until it is settled
+        self.reply_tokens = reply_tokens
+
+    def estimate_of(self, operation: str, arguments: dict[str, Any]) -> dict[str, float]:
+        """What one request may use, held against the tree's budget before it is sent."""
+        prompt = estimate(list(arguments.get("messages") or []))
+        found: dict[str, float] = {"tokens": prompt + self.reply_tokens}
+        prices = getattr(self.models.get(operation), "prices", None)
+        if prices:
+            found["usd"] = prompt * prices.get("prompt", 0) + self.reply_tokens * prices.get(
+                "completion", 0
+            )
+        return found
+
+    def charge_of(self, operation: str, result: Any) -> dict[str, float]:
+        """What a reply used, from its usage (empty: the hold is counted)."""
+        usage = self.usage_of(result)
+        prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        found: dict[str, float] = {}
+        total = usage.get("total_tokens")
+        if total is None and isinstance(prompt, int) and isinstance(completion, int):
+            total = prompt + completion
+        if isinstance(total, int | float):
+            found["tokens"] = total
+        prices = getattr(self.models.get(operation), "prices", None)
+        if isinstance(usage.get("cost"), int | float):
+            found["usd"] = usage["cost"]
+        elif prices and isinstance(prompt, int) and isinstance(completion, int):
+            found["usd"] = prompt * prices.get("prompt", 0) + completion * prices.get(
+                "completion", 0
+            )
+        return found
 
     def add(self, name: str, client: Client) -> None:
         self.models[name] = client

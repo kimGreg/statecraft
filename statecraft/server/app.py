@@ -13,6 +13,8 @@ GET  /agents/{root}/files?prefix=           workspace files; /file?path= one of 
 GET  /questions                             open questions
 POST /questions/{id}/answer                 {"answer", "by"?}
 GET  /agents/{id}/calls                     the agent's journaled calls
+GET  /agents/{id}/attempts                  its attempts that did not commit, with their calls
+GET  /agents/{root}/budget                  limit, spent and held per unit; POST {"limit"} (admin)
 POST /calls/{key}/resolve                   {"outcome": completed|failed|replay, "result"?}
 GET  /faults                                agents suspended by a fault, with their calls
 GET  /metrics                               Prometheus text (?format=json: the same as JSON)
@@ -179,6 +181,7 @@ def server_app(
                 attach=attach,
                 attach_mode=optional_field(body, "attach_mode", str, "ro"),
                 inherit=inherit,
+                budget=optional_field(body, "budget", dict),
             )
         except (KeyError, ValueError, TypeError) as exc:
             return _json({"error": str(exc)}, 400)
@@ -342,6 +345,25 @@ def server_app(
         must_own(request, agent_id)
         return _json(await runtime.calls(agent_id))
 
+    async def budget(request: Request) -> Response:
+        root = request.path_params["id"]
+        must_own(request, root)
+        if request.method == "GET":
+            return _json(await runtime.budget(root))
+        must_allow(request, "admin")
+        limit = optional_field(await read_body(request), "limit", dict)
+        try:
+            found = await runtime.set_budget(root, limit)
+        except KeyError:
+            return _json({"error": "no such root"}, 404)
+        await audit(request, root, "budget", limit=limit)
+        return _json(found)
+
+    async def attempts(request: Request) -> Response:
+        agent_id = request.path_params["id"]
+        must_own(request, agent_id)
+        return _json(await runtime.attempts(agent_id))
+
     async def resolve(request: Request) -> Response:
         principal = must_allow(request, "admin")
         body = await read_body(request)
@@ -420,6 +442,8 @@ def server_app(
             Route("/agents/{id:path}/files", files),
             Route("/agents/{id:path}/file", file),
             Route("/agents/{id:path}/calls", calls),
+            Route("/agents/{id:path}/attempts", attempts),
+            Route("/agents/{id:path}/budget", budget, methods=["GET", "POST"]),
             Route("/agents/{id:path}", get),
             Route("/questions", questions),
             Route("/questions/{id:path}/answer", answer, methods=["POST"]),

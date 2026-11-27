@@ -216,6 +216,7 @@ async def agent(runtime: Any, agent_id: str) -> dict[str, Any]:
         "undelivered": _jsonable(record.undelivered),
         "joins": _jsonable([r for r in record.reasons if r.get("kind") == "join"]),
         "calls": _jsonable(await runtime.calls(agent_id)),
+        "attempts": _jsonable(await runtime.attempts(agent_id)),
     }
 
 
