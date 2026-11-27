@@ -6,7 +6,9 @@ contract kits, native edits); A2 done; A3 done on `p1-a3` (internal links beneat
 mount plan, mountable and workspace_requires, host-path rule, folder fsync, W9, W10); A4 done
 (`packages/statecraft-opensandbox`: the effect contract kit passes on the fake backend and on a
 real OpenSandbox 1.2.1 server, in both cancel modes; the A4 hardening rows are configuration of
-the OpenSandbox deployment, documented in the package README, not yet automated). Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
+the OpenSandbox deployment, documented in the package README, not yet automated); A5 done
+(`examples/shared_coding`, the chaos harness in `chaos/` with a shell effect, a real-model run
+through the sandbox shell). Track A is done except the optional A6. Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.
 
