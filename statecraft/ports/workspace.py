@@ -19,8 +19,26 @@ class Files(Protocol):
 
 
 class WorkspaceProvider(Protocol):
+    """A provider may declare `capabilities`: `mountable` (it has `host_path(workspace_id,
+    relative) -> str`, a host folder a sandbox can mount) and `internal_links` (reads follow
+    links that stay within their area)."""
+
     async def open(self, workspace_id: str) -> Files: ...
     async def close(self) -> None: ...
+
+
+#: Where an agent's areas appear inside a sandbox (a provider maps them; agents see these).
+MOUNT_TARGETS = {"shared": "/workspace", "private": "/home/agent"}
+
+
+def mount_plan(scope: dict) -> list[dict]:
+    """What a sandbox may mount for an agent, from its authorized scope: the workspace's
+    `shared` folder with the granted mode, and the agent's own private folder read-write.
+    Never staging, objects, skills, the runtime's `run/` folder or any receipt storage."""
+    return [
+        {"source": "shared", "target": MOUNT_TARGETS["shared"], "mode": scope["shared"]},
+        {"source": scope["private"], "target": MOUNT_TARGETS["private"], "mode": "rw"},
+    ]
 
 
 def clean(path: str) -> str:
@@ -34,4 +52,28 @@ def home(agent_id: str) -> str:
     return f"home/{agent_id}"
 
 
-__all__ = ["HOME_FOLDERS", "Files", "WorkspaceProvider", "clean", "home"]
+def link_anchor(parts: list[str]) -> int | None:
+    """How many leading components of a path form the area a symbolic link inside it may stay
+    within: the `shared` folder, or one folder of an agent's home (`home/<agent>/private`, ...).
+    None for paths outside such an area (links are not followed there)."""
+    for i, part in enumerate(parts):
+        if part == "shared":
+            return i + 1
+        if part == "home":
+            for j in range(i + 2, len(parts)):
+                if parts[j] in HOME_FOLDERS:
+                    return j + 1
+            return None
+    return None
+
+
+__all__ = [
+    "HOME_FOLDERS",
+    "MOUNT_TARGETS",
+    "Files",
+    "WorkspaceProvider",
+    "clean",
+    "home",
+    "link_anchor",
+    "mount_plan",
+]

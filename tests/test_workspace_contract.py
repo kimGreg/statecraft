@@ -9,6 +9,10 @@ from statecraft.testing.workspace_contract import *  # noqa: F403
 
 
 @pytest.fixture(params=["memory", "local"])
-async def files(request, tmp_path):
-    workspace = MemoryWorkspace() if request.param == "memory" else LocalWorkspace(tmp_path)
+def workspace(request, tmp_path):
+    return MemoryWorkspace() if request.param == "memory" else LocalWorkspace(tmp_path)
+
+
+@pytest.fixture
+async def files(workspace):
     return await workspace.open("w")

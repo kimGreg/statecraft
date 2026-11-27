@@ -2,7 +2,8 @@
 
 Status: approved with amendments (applied below). In progress on branch `p1`: B1 done;
 A1 done (identity, journal, indeterminate, scope, capabilities, provider view, local shell,
-contract kits, native edits); A2 done. Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
+contract kits, native edits); A2 done; A3 done on `p1-a3` (internal links beneath their area,
+mount plan, mountable and workspace_requires, host-path rule, folder fsync, W9, W10). Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.
 

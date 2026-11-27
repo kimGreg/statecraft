@@ -63,6 +63,7 @@ def _alive(pgid: int) -> bool:
 class LocalShell:
     capabilities: ClassVar[frozenset[str]] = frozenset({"deduplicated", "reconcile", "remote_work"})
     capacity_scope = "process"
+    workspace_requires: ClassVar[frozenset[str]] = frozenset({"mountable"})
 
     def __init__(
         self, *, receipts: str | Path, workspaces: str | Path, concurrency: int | None = None
@@ -74,6 +75,11 @@ class LocalShell:
         self.receipts.mkdir(parents=True, exist_ok=True)
         self.concurrency = concurrency
         self._children: dict[int, asyncio.subprocess.Process] = {}
+        self._view: Any = None
+
+    def bind(self, view: Any) -> None:
+        """The runtime's view: the host folder of an agent's `shared` area comes from it."""
+        self._view = view
 
     # ---- receipts -----------------------------------------------------------------------------
     def _folder(self, key: str) -> Path:
@@ -157,8 +163,11 @@ class LocalShell:
                 ) from None
         if not self._claim(folder):
             return await self._attach(folder, context)
-        cwd = self.workspaces / context.workspace / "shared"
-        cwd.mkdir(parents=True, exist_ok=True)
+        if self._view is not None:
+            cwd = Path(self._view.host_path(context.workspace, "shared"))
+        else:
+            cwd = self.workspaces / context.workspace / "shared"
+            cwd.mkdir(parents=True, exist_ok=True)
         for name in ("out", "err"):
             (folder / name).write_text("")
         # the wrapper writes the receipt; the command itself runs in the workspace and is not

@@ -431,9 +431,23 @@ Attaching is itself a grant: an agent definition says `attach: none | ro | rw` (
 a spawn asks for at most that mode, and the target must be an existing root.
 
 `local` keeps every operation inside its folder even while links change under it: each path is
-opened component by component from the workspace folder (`dir_fd`, `O_NOFOLLOW`), a symbolic link
-anywhere on the way is refused (`Escape`) and skipped by listings, and a listing prefix is a
-folder inside the workspace (`..` is refused). The memory and local providers mean the same by a
+opened component by component from the workspace folder (`dir_fd`, `O_NOFOLLOW`), and a listing
+prefix is a folder inside the workspace (`..` is refused). Reads follow a symbolic link only while
+it stays within its **area**, the `shared` folder or one folder of an agent's home: the kernel
+resolves the rest of the path beneath the area (`openat2` with `RESOLVE_BENEATH`), so a link
+swapped in during the open cannot lead out, and a link from `shared/` into an agent's private
+folder is refused like one out of the workspace. Writes never follow links. Where the kernel
+cannot resolve beneath a folder (not Linux 5.6+), every link is refused.
+
+**Shells and sandboxes.** A workspace provider may declare `mountable` (it hands out the host
+folder of an area, `host_path`) and `internal_links`. The runtime computes each agent's **mount
+plan** from its authorized scope: `shared` with the granted mode (read-only when attached without
+a write grant) at `/workspace`, the agent's own private folder read-write at `/home/agent`;
+never staging, objects, skills, `run/` or any provider's receipts. An effect provider declares
+the workspace capabilities it needs (`workspace_requires`); a shell provider with a memory
+workspace is refused at start. No runtime code opens workspace paths itself (a test checks it):
+only the workspace provider does, contained, so a link a shell plants cannot mislead the
+runtime. An agent attached to a run reads the run's publications (its own tree first). The memory and local providers mean the same by a
 prefix. The workspace is a shared file system, not a transactional one: nothing more is
 promised than atomic single-file writes and create-only objects.
 Snapshots, retention and workspace garbage collection need reference tracking and policies of

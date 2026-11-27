@@ -17,6 +17,8 @@ or not, with full paths; paths are relative and clean, `..` is refused (`ValueEr
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 
 import pytest
 
@@ -67,11 +69,53 @@ async def test_paths_stay_inside(files) -> None:
     assert await files.get("shared/lead.txt") == b"x"
 
 
+# ---- optional capabilities (a `workspace` fixture: the provider; skipped unless declared) -----
+@pytest.fixture
+def workspace():
+    """The provider under test; a provider's test module defines its own `workspace` fixture
+    (after the import) to run the capability tests."""
+    return None
+
+
+def _provider(workspace, capability: str):
+    if workspace is None:
+        pytest.skip("no workspace fixture")
+    if capability not in (getattr(workspace, "capabilities", None) or ()):
+        pytest.skip(f"the workspace does not declare {capability}")
+    return workspace
+
+
+async def test_a_mountable_workspace_hands_out_the_same_files(workspace) -> None:
+    workspace = _provider(workspace, "mountable")
+    files = await workspace.open("mw")
+    folder = Path(workspace.host_path("mw", "shared"))
+    (folder / "from_host.txt").write_bytes(b"host")
+    assert await files.get("shared/from_host.txt") == b"host"
+    await files.put("shared/from_files.txt", b"files")
+    assert (folder / "from_files.txt").read_bytes() == b"files"
+
+
+async def test_internal_links_stay_within_their_area(workspace) -> None:
+    workspace = _provider(workspace, "internal_links")
+    files = await workspace.open("lw")
+    await files.put("shared/real.txt", b"shared")
+    await files.put("home/a/private/secret.txt", b"secret")
+    shared = Path(workspace.host_path("lw", "shared"))
+    os.symlink("real.txt", shared / "alias.txt")
+    os.symlink("../home/a/private/secret.txt", shared / "peek.txt")
+    assert await files.get("shared/alias.txt") == b"shared"
+    with pytest.raises(PermissionError):
+        await files.get("shared/peek.txt")
+
+
 __all__ = [
     "test_a_missing_file_is_not_found",
+    "test_a_mountable_workspace_hands_out_the_same_files",
     "test_concurrent_creates_have_one_winner",
     "test_create_is_create_only",
+    "test_internal_links_stay_within_their_area",
     "test_list_is_by_folder",
     "test_paths_stay_inside",
     "test_put_overwrites_and_get_reads_back",
+    "workspace",
 ]

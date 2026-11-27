@@ -172,7 +172,11 @@ class Runtime:
             for provider in self.registry.providers.values():
                 bind = getattr(provider, "bind", None)
                 if bind is not None:
-                    bind(ProviderView(self.store))
+                    bind(ProviderView(self.store, self.workspaces.provider))
+            problems = self._workspace_problems()
+            if problems:
+                await self._close_providers()
+                raise RegistryError(problems)
             self.registry.freeze()
             errors, warnings = self.registry.validate()
             self.warnings += warnings
@@ -217,6 +221,20 @@ class Runtime:
                 if asyncio.iscoroutine(result):
                     await result
         self.started = False
+
+    def _workspace_problems(self) -> list[str]:
+        """Effect providers that need what this workspace provider does not offer (a shell
+        needs a mountable workspace; a memory workspace is not)."""
+        offered = set(getattr(self.workspaces.provider, "capabilities", None) or ())
+        found = []
+        for name, provider in self.registry.providers.items():
+            needed = set(getattr(provider, "workspace_requires", None) or ())
+            if needed - offered:
+                found.append(
+                    f"provider {name} needs a workspace with {sorted(needed - offered)}; "
+                    f"{type(self.workspaces.provider).__name__} offers {sorted(offered) or 'none'}"
+                )
+        return found
 
     async def _close_providers(self) -> None:
         for provider in list(self.registry.providers.values()):
@@ -851,12 +869,20 @@ class Runtime:
 class ProviderView:
     """The read-only `RuntimeView` providers get: agents' status from the store."""
 
-    def __init__(self, store: StateStore) -> None:
+    def __init__(self, store: StateStore, workspace: Any = None) -> None:
         self._store = store
+        self._workspace = workspace
 
     async def agent_status(self, agent_id: str) -> str | None:
         record = await self._store.find(agent_id)
         return None if record is None else record.status
+
+    def host_path(self, workspace: str, relative: str) -> str:
+        """The host folder of an area of a mountable workspace (refused otherwise)."""
+        host_path = getattr(self._workspace, "host_path", None)
+        if host_path is None:
+            raise ValueError("the workspace is not mountable")
+        return host_path(workspace, relative)
 
     async def ended(self, agent_ids: list[str]) -> set[str]:
         gone = set()

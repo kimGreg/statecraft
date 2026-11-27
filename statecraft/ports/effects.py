@@ -8,6 +8,8 @@ after it started) are optional. It may declare:
     capabilities: frozenset of CAPABILITIES       optional contracts it implements (tested by
                                                   `statecraft.testing.contracts` when declared)
     capacity_scope: one of CAPACITY_SCOPES        where its `concurrency` limit holds
+    workspace_requires: frozenset of str          workspace capabilities it needs (`mountable`),
+                                                  checked at start
     concurrency: int | None                       calls at once (in this runtime process)
 """
 
@@ -82,6 +84,7 @@ class RuntimeView(Protocol):
 
     async def agent_status(self, agent_id: str) -> str | None: ...  # None: no such agent
     async def ended(self, agent_ids: list[str]) -> set[str]: ...  # those that ended or are gone
+    def host_path(self, workspace: str, relative: str) -> str: ...  # a mountable workspace's
 
 
 class EffectProvider(Protocol):

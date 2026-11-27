@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import jsonschema
 
 from ..kernel.process import Lease, Record
+from ..ports.workspace import mount_plan
 from ..sdk.agent import StepEffects
 from ..sdk.contracts import Artifact
 from .workspace import READABLE, AgentFiles, Files, home
@@ -65,6 +66,7 @@ class StepContext:
         self.files = AgentFiles(self)
         self.parameters = {**root_input, **record.input}
         self._tree: list[Record] | None = None
+        self._attached_tree: list[Record] | None = None
         self._inflight: set[asyncio.Future[Any]] = set()
         self._readable = (*READABLE, *runtime.view_paths)
 
@@ -115,11 +117,12 @@ class StepContext:
     def scope(self) -> dict[str, Any]:
         """What this agent may expose to a provider: its workspace, the shared folder's mode
         (read-only when it works attached without a write grant) and its private folder."""
-        return {
+        scope = {
             "workspace": self._workspace_id,
             "shared": "ro" if self._mode == "ro" else "rw",
             "private": f"{home(self.id)}/private",
         }
+        return {**scope, "mounts": mount_plan(scope)}
 
     def service(self, name: str) -> Any:
         """An object an extension provided (`registrar.provide`); None when absent."""
@@ -195,9 +198,19 @@ class StepContext:
             self._tree = await self._runtime.workspaces.visible_tree(self.record.id.split("/")[0])
         return self._tree
 
+    async def _attached_records(self) -> list[Record]:
+        """The tree of the run this agent works attached to (empty when it works in its own)."""
+        run = self._workspace_id
+        if not run or run == self.record.id.split("/")[0]:
+            return []
+        if self._attached_tree is None:
+            self._attached_tree = await self._runtime.workspaces.visible_tree(run)
+        return self._attached_tree
+
     async def _published_paths(self) -> set[str]:
         own = {ref["path"] for ref in self.effects.published.values()}
-        return own | {ref["path"] for r in await self._records() for ref in r.published.values()}
+        records = [*await self._records(), *await self._attached_records()]
+        return own | {ref["path"] for r in records for ref in r.published.values()}
 
     def _check_read(self, kind: str) -> None:
         if not self.definition.may_read(kind):
@@ -206,9 +219,13 @@ class StepContext:
     async def _ref(self, kind: str, by: str | None) -> dict[str, Any] | None:
         if kind in self.effects.published and by in (None, self.id):
             return self.effects.published[kind]
-        records = await self._records()
-        chosen = records if by is None else self._named(records, by)
-        found = [r for r in chosen if kind in r.published]
+        found: list[Record] = []
+        # its own tree first; an attached agent then reads the run it works in
+        for records in (await self._records(), await self._attached_records()):
+            chosen = records if by is None else self._named(records, by)
+            found = [r for r in chosen if kind in r.published]
+            if found:
+                break
         if not found:
             return None
         if len(found) > 1:

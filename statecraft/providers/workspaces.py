@@ -13,14 +13,17 @@ them in memory (tests).
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
+import functools
 import os
 import secrets
 import stat
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from ..ports.workspace import Files, clean
+from ..ports.workspace import Files, clean, link_anchor
 
 
 class Escape(PermissionError):
@@ -31,6 +34,43 @@ _DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: a FIFO or device opened for reading must not block: only regular files are read
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_RESOLVE_BENEATH, _RESOLVE_NO_MAGICLINKS, _OPENAT2 = 0x08, 0x02, 437
+
+
+class _OpenHow(ctypes.Structure):
+    _fields_: ClassVar = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+def _openat2(dir_fd: int, path: str, flags: int) -> int:
+    """`openat2` resolving `path` beneath `dir_fd`: links are followed only while they stay
+    beneath it (EXDEV otherwise), checked by the kernel, so no swap race can lead outside."""
+    how = _OpenHow(flags, 0, _RESOLVE_BENEATH | _RESOLVE_NO_MAGICLINKS)
+    fd = _libc().syscall(_OPENAT2, dir_fd, path.encode(), ctypes.byref(how), ctypes.sizeof(how))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), path)
+    return fd
+
+
+@functools.cache
+def _libc() -> Any:
+    return ctypes.CDLL(None, use_errno=True)
+
+
+@functools.cache
+def beneath_supported() -> bool:
+    """Whether this platform resolves paths beneath a folder in the kernel (Linux 5.6+)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        os.close(_openat2(-100, ".", os.O_RDONLY | _DIR))
+    except (OSError, AttributeError):
+        return False
+    return True
 
 
 class LocalFiles:
@@ -44,11 +84,17 @@ class LocalFiles:
     `create` uses an exclusive link, so two writers of the same object make one.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, internal_links: bool | None = None) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         if not (_NOFOLLOW and os.open in os.supports_dir_fd):
             raise OSError("LocalFiles needs a platform with O_NOFOLLOW and dir_fd (POSIX)")
+        #: follow links that stay within their area (`shared/`, one home folder) when reading;
+        #: only where the kernel resolves beneath a folder, refused elsewhere
+        supported = beneath_supported()
+        self.internal_links = supported if internal_links is None else internal_links
+        if self.internal_links and not supported:
+            raise OSError("internal links need openat2 (Linux 5.6 or later)")
 
     # ---- contained opening -------------------------------------------------------------------
     def _dir(self, parts: list[str], *, create: bool) -> int:
@@ -64,6 +110,7 @@ class LocalFiles:
                         raise
                     with contextlib.suppress(FileExistsError):
                         os.mkdir(part, dir_fd=fd)
+                        os.fsync(fd)  # the new folder's entry survives a power loss
                     nxt = os.open(part, _DIR | _NOFOLLOW, dir_fd=fd)
                 except OSError as exc:
                     if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
@@ -80,7 +127,42 @@ class LocalFiles:
         parts = clean(path).split("/")
         return parts[:-1], parts[-1]
 
+    def _anchor(self, path: str) -> int | None:
+        if not self.internal_links:
+            return None
+        parts = clean(path).split("/")
+        n = link_anchor(parts)
+        return n if n is not None and n < len(parts) else None
+
+    def _open_beneath(self, path: str, n: int) -> int:
+        """Open a file for reading, following links only while they stay within its area."""
+        parts = clean(path).split("/")
+        try:
+            dfd = self._dir(parts[:n], create=False)  # the area itself: no links on the way
+        except (FileNotFoundError, NotADirectoryError):
+            raise FileNotFoundError(path) from None
+        try:
+            return _openat2(dfd, "/".join(parts[n:]), os.O_RDONLY | _NONBLOCK)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.EISDIR):
+                raise FileNotFoundError(path) from None
+            if exc.errno in (errno.EXDEV, errno.ELOOP):
+                raise Escape(f"{path!r} leads outside its area: not followed") from None
+            raise
+        finally:
+            os.close(dfd)
+
+    @staticmethod
+    def _read(fd: int, path: str) -> bytes:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise FileNotFoundError(path)
+            return handle.read()
+
     async def get(self, path: str) -> bytes:
+        anchor = self._anchor(path)
+        if anchor is not None:
+            return self._read(self._open_beneath(path, anchor), path)
         folders, name = self._split(path)
         try:
             dfd = self._dir(folders, create=False)
@@ -98,10 +180,7 @@ class LocalFiles:
             raise
         finally:
             os.close(dfd)
-        with os.fdopen(fd, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                raise FileNotFoundError(path)
-            return handle.read()
+        return self._read(fd, path)
 
     def _temp(self, dfd: int, data: bytes) -> str:
         name = f".tmp-{secrets.token_hex(8)}"
@@ -144,6 +223,16 @@ class LocalFiles:
             os.close(dfd)
 
     async def exists(self, path: str) -> bool:
+        anchor = self._anchor(path)
+        if anchor is not None:
+            try:
+                fd = self._open_beneath(path, anchor)
+            except (FileNotFoundError, Escape):
+                return False
+            try:
+                return stat.S_ISREG(os.fstat(fd).st_mode)
+            finally:
+                os.close(fd)
         folders, name = self._split(path)
         try:
             dfd = self._dir(folders, create=False)
@@ -158,7 +247,9 @@ class LocalFiles:
             os.close(dfd)
 
     async def list(self, prefix: str) -> list[str]:
-        """Files under the folder `prefix` (all files for an empty prefix); links skipped."""
+        """Files under the folder `prefix` (all files for an empty prefix). A link is listed
+        when it is a file that stays within its area (internal links); other links are skipped,
+        and linked folders are not walked into."""
         start = prefix.strip("/")
         parts = clean(start).split("/") if start else []
         try:
@@ -167,12 +258,29 @@ class LocalFiles:
             return []
         found: list[str] = []
 
+        def linked_file(rel: str) -> bool:
+            anchor = self._anchor(rel)
+            if anchor is None:
+                return False
+            try:
+                fd = self._open_beneath(rel, anchor)
+            except (FileNotFoundError, Escape, OSError):
+                return False
+            try:
+                return stat.S_ISREG(os.fstat(fd).st_mode)
+            finally:
+                os.close(fd)
+
         def walk(fd: int, base: str) -> None:
             with os.scandir(fd) as entries:
                 for entry in entries:
-                    if entry.name.startswith(".tmp-") or entry.is_symlink():
+                    if entry.name.startswith(".tmp-"):
                         continue
                     rel = f"{base}/{entry.name}" if base else entry.name
+                    if entry.is_symlink():
+                        if linked_file(rel):
+                            found.append(rel)
+                        continue
                     if entry.is_file(follow_symlinks=False):
                         found.append(rel)
                     elif entry.is_dir(follow_symlinks=False):
@@ -256,10 +364,21 @@ class ScopedFiles:
 
 
 class LocalWorkspace:
-    """Each workspace is a folder under `root`."""
+    """Each workspace is a folder under `root`. Mountable: a sandbox provider gets the host
+    folder of an area it may expose (`host_path`)."""
 
-    def __init__(self, root: str | Path) -> None:
-        self.files = LocalFiles(root)
+    def __init__(self, root: str | Path, *, internal_links: bool | None = None) -> None:
+        self.files = LocalFiles(root, internal_links=internal_links)
+        self.capabilities = frozenset(
+            {"mountable", *(["internal_links"] if self.files.internal_links else [])}
+        )
+
+    def host_path(self, workspace_id: str, relative: str) -> str:
+        """The host folder of `relative` in a workspace, created if needed, with no link on the
+        way (Escape otherwise): what a sandbox mounts."""
+        parts = clean(f"{workspace_id}/{relative}").split("/")
+        os.close(self.files._dir(parts, create=True))
+        return str(self.files.root.resolve().joinpath(*parts))
 
     async def open(self, workspace_id: str) -> Files:
         return ScopedFiles(self.files, workspace_id)
