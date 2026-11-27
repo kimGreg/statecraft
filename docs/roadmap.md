@@ -79,7 +79,8 @@ Statecraft 1.0 is a durable execution runtime that a team can deploy for its own
    recovery tooling, documented upgrade path.
 5. **Extensible.** Providers and extensions plug in through public contracts; the core installs
    and runs alone; contract test kits let third parties verify their providers.
-6. **Released.** Frozen public API with semantic versions, packages published, documentation,
+6. **Released.** Frozen public API with semantic versions, packages published as a GitHub release
+   (not PyPI: the owner's decision; v0.3.0 at github.com/kimGreg/statecraft/releases), documentation,
    and the acceptance checklist (architecture §17) passing, including item 23 (an unrelated
    package builds and recovers a job).
 

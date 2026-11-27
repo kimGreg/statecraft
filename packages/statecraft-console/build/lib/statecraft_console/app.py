@@ -119,10 +119,22 @@ def console_app(
 
     async def health(request: Request) -> Response:
         principal = principal_of(request)
+        faults = [f for f in await runtime.faults() if principal.owns(f["root"])]
+        if principal.roots is not None:  # store-wide counts are for unrestricted principals
+            return _json(
+                {
+                    "faults": faults,
+                    "indeterminate_calls": "-",
+                    "undelivered_messages": "-",
+                    "maintenance": await runtime.maintenance(),
+                    "capacity": {},
+                    "effects": {},
+                }
+            )
         found = await runtime.metrics()
         return _json(
             {
-                "faults": [f for f in await runtime.faults() if principal.owns(f["root"])],
+                "faults": faults,
                 "indeterminate_calls": found["indeterminate_calls"],
                 "undelivered_messages": found["undelivered_messages"],
                 "maintenance": found["maintenance"],
