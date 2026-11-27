@@ -30,12 +30,13 @@ from typing import Any
 import jsonschema
 
 from ..kernel.executor import Executor, signal_name
-from ..kernel.process import Fault, Lease, Record, Transition
+from ..kernel.process import ChildView, Fault, Lease, Record, Transition
 from ..kernel.store import Busy, CallRefused, Conflict, Ended, StateStore
 from ..kernel.transitions import (
     InvalidAnswer,
     apply_answer,
     mark_intent_done,
+    resolve_wait,
     signal_problem,
     view,
 )
@@ -853,7 +854,17 @@ class Runtime:
         for r in records:  # a message not applied yet (a CONT just sent) is work to do
             if not r.ended and await self.store.read_inbox(r.id, r.inbox_applied):
                 return True
+            if not r.ended and r.reason("join") is not None and await self._join_clears(r):
+                return True  # its children ended: the join is about to clear
         return False
+
+    async def _join_clears(self, record: Record) -> bool:
+        children = {}
+        for name in record.reason("join")["children"]:
+            child = await self.store.find(record.children.get(name, ""))
+            if child is not None:
+                children[name] = ChildView.of(child)
+        return resolve_wait(record, children, self.clock()) != record
 
     async def _sleeping(self, root: str | None) -> bool:
         records = await self.store.tree(root) if root else await self.store.scan_work()

@@ -1,0 +1,22 @@
+# A lead and two workers in one shared workspace, each in its own sandbox.
+# `backend: fake` runs commands on this machine (no isolation; tests and demos). For a real
+# OpenSandbox server: backend: opensandbox, endpoint: http://127.0.0.1:8080,
+# api_key: ${OSB_KEY}, image: python:3.12-slim (its allowed_host_paths must cover the workspace).
+store: {provider: sqlite, path: .statecraft/shared_coding.db}
+workspace: {provider: local, root: .statecraft/shared_coding}
+runtime: {concurrency: 4}
+plugins: [opensandbox]
+effect_providers:
+  sh: {provider: opensandbox, backend: fake, scope: agent,
+       receipts: .statecraft/shared_coding-receipts.db}
+agents:
+  shared_coding:lead:
+    entry: examples.shared_coding.agents:Lead
+    spawns: [shared_coding:worker]
+    tools: [sh.exec]
+    writes: [result]
+  shared_coding:worker:
+    entry: examples.shared_coding.agents:Worker
+    input: {type: object, required: [module]}
+    tools: [sh.exec]
+    writes: [report]
