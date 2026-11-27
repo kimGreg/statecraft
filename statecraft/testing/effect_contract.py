@@ -196,15 +196,17 @@ async def test_a_cancelled_call_holds_its_work_until_it_ended(
             effect_harness.operation, effect_harness.slow_request(tag, 30), context
         )
     )
-    for _ in range(100):  # until the work runs
+    for _ in range(600):  # until the work runs (a real backend may first create a sandbox)
         await asyncio.sleep(0.05)
-        if alive(tag):
+        if alive(tag) or call.done():
             break
+    if call.done():
+        call.result()  # a failure is the provider's to explain
     assert alive(tag), "the slow request never ran"
     call.cancel()
     await asyncio.gather(call, return_exceptions=True)
     assert context.work, "work that outlives the call must be registered"
-    await asyncio.wait_for(asyncio.gather(*context.work, return_exceptions=True), 5)
+    await asyncio.wait_for(asyncio.gather(*context.work, return_exceptions=True), 30)
     # the work's end is the work's end: nothing it started runs once its futures are done
     assert not alive(tag), "the registered work ended while the work still runs"
     if effect_harness.declares("reconcile"):

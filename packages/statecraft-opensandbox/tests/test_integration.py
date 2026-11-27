@@ -5,6 +5,7 @@ STATECRAFT_OPENSANDBOX_ROOT): the conformance suite and a command in the shared 
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -35,14 +36,17 @@ class View:
         return set()
 
 
-@pytest.fixture
-def effect_harness(tmp_path: Path) -> EffectHarness:
+@pytest.fixture(params=["interrupt", "destroy_on_cancel"])
+async def effect_harness(request, tmp_path: Path):
     run = Path(ROOT or "") / f"it-{uuid.uuid4().hex[:8]}"
     backend = OpenSandboxHTTP(
         ENDPOINT or "", api_key=os.environ.get("STATECRAFT_OPENSANDBOX_KEY", "")
     )
     provider = OpenSandboxProvider(
-        backend, receipts=tmp_path / "receipts.db", poll=0.2, destroy_on_cancel=True
+        backend,
+        receipts=tmp_path / "receipts.db",
+        poll=0.2,
+        destroy_on_cancel=request.param == "destroy_on_cancel",
     )
     provider.bind(View(run))
     shared = run / "w" / "shared"
@@ -51,24 +55,33 @@ def effect_harness(tmp_path: Path) -> EffectHarness:
         log = shared / "applied.txt"
         return log.read_text().split().count(tag) if log.exists() else 0
 
-    def alive(tag: str) -> bool:  # inside the sandbox: a marker the command removes on exit
-        return (shared / f"{tag}.running").exists()
+    def alive(tag: str) -> bool:  # the command beats every 0.2 s while it runs
+        beat = shared / f"{tag}.beat"
+        if not beat.exists():
+            return False
+        before = beat.stat().st_mtime_ns
+        time.sleep(0.6)
+        return beat.stat().st_mtime_ns != before
 
     scope = {"workspace": "w", "shared": "rw", "private": "home/a/private"}
     scope["mounts"] = [
         {"source": "shared", "target": "/workspace", "mode": "rw"},
         {"source": "home/a/private", "target": "/home/agent", "mode": "rw"},
     ]
-    return EffectHarness(
+    yield EffectHarness(
         provider=provider,
         operation="exec",
         request=lambda tag: {"command": f"echo {tag} >> applied.txt"},
         applied=applied,
         slow_request=lambda tag, s: {
-            "command": f"echo {tag} >> applied.txt; touch {tag}.running; "
-            f"trap 'rm -f {tag}.running' EXIT; sleep {s}"
+            "command": f"echo {tag} >> applied.txt; "
+            f"i=0; while [ $i -lt {max(1, round(s / 0.2))} ]; do "
+            f"touch {tag}.beat; sleep 0.2; i=$((i + 1)); done"
         },
         bad_request={"command": ""},
         alive=alive,
         scope=scope,
     )
+    for row in await provider.receipts.sandboxes():  # the test's sandboxes go with it
+        if row["sandbox"]:
+            await backend.delete(row["sandbox"])

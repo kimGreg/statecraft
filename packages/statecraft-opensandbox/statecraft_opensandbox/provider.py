@@ -42,6 +42,8 @@ from .receipts import Receipts
 #: how long a claimed start may take before a receipt without an execution id is unknown
 START_GRACE = 30.0
 SCOPES = ("agent", "run", "call")
+#: sandbox states in which nothing runs any more (None: deleted)
+GONE = (None, "Terminated", "Failed", "Stopped", "Deleted")
 
 
 def _label(text: str) -> str:
@@ -278,7 +280,10 @@ class OpenSandboxProvider:
                 try:
                     status = await self.backend.status(row["sandbox"], row["execution"])
                 except Exception:
-                    status = {"running": True}  # cannot tell now: keep holding
+                    status = {"running": True}  # cannot tell now: keep holding, unless the
+                    with contextlib.suppress(Exception):  # sandbox itself is gone
+                        if await self.backend.state(row["sandbox"]) in GONE:
+                            status = None
                 if status is None or not status["running"]:
                     if row["state"] == "submitted":
                         await self._settled(key)  # keep the result in the receipt

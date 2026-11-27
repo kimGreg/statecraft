@@ -679,6 +679,16 @@ promise is refused at start. A repeated call is then applied once by the server;
 not claim more than that (an exactly-once commit of the step does not make the outside effect
 exactly once).
 
+### 12.4 statecraft-opensandbox
+
+Shell commands in OpenSandbox sandboxes as a `deduplicated` effect (`<provider>.exec`):
+per-agent sandboxes created with the runtime's mount plan, provider-owned receipts outside every
+workspace and sandbox (one call identity, one command; reconcile after restarts), unknown
+outcomes reported as `indeterminate`, capacity held until the sandbox says a cancelled command
+stopped (`destroy_on_cancel` destroys the sandbox and declares `tree_termination`). The kernel
+and runtime know nothing of it: it is a plugin and an effect provider. A `fake` backend runs the
+same provider logic on this machine for tests.
+
 ### 12.4 statecraft-console
 
 The visualizer, over the runtime API only: registry (agents with their states, tools with schemas
