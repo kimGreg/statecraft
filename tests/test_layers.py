@@ -31,7 +31,12 @@ ALLOWED = {
     "testing": {"kernel", "ports", "sdk", "providers", "runtime", "testing"},
 }
 LEAN: dict[str, set[str]] = {"kernel": set(), "ports": set(), "sdk": {"pydantic"}}
-EXTENSIONS = {"statecraft_agentic", "statecraft_mcp", "statecraft_console"}
+EXTENSIONS = {
+    "statecraft_agentic",
+    "statecraft_mcp",
+    "statecraft_console",
+    "statecraft_opensandbox",
+}
 IMPORT_NAMES = {"pyyaml": "yaml"}
 
 
