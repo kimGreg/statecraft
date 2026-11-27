@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-agentic"
-version = "0.2.0"
+version = "0.3.0"
 description = "Model-driven agents for statecraft: the agentic loop as states, models as tools, skills"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "httpx>=0.27", "pyyaml>=6.0", "jsonschema>=4.20"]
+dependencies = ["statecraft>=0.3,<0.4", "httpx>=0.27", "pyyaml>=6.0", "jsonschema>=4.20"]
 
 [project.entry-points."statecraft.plugins"]
 agentic = "statecraft_agentic.plugin:register"

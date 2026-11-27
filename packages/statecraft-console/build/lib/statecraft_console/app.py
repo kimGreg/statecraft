@@ -1,0 +1,335 @@
+"""The console's HTTP app over a `Runtime` (the runtime API only).
+
+app = console_app(runtime, title="statecraft")
+
+GET  /                                  the console page
+GET  /api/overview                      title, counts, providers' names
+GET  /api/registry                      agents (contract, state machine), warnings, lint
+GET  /api/graph                         spawns, providers, artifact flow
+GET  /api/servers                       providers with health and tools, who may call each
+GET  /api/runs                          every root with its status counts
+GET  /api/runs/{root}                   its tree and open questions
+GET  /api/agents/{id}                   one record: data, conversation, path, crossings
+GET  /api/runs/{root}/files?prefix=     the root's workspace files
+GET  /api/runs/{root}/file?path=        one file (text, capped)
+GET  /api/runs/{root}/events?since=     server-sent events from the durable log, resumable
+GET  /api/events?since=                 every root's events
+POST /api/runs                          {"agent", "input"?, "root"?} spawn a root
+POST /api/answers                       {"question_id", "answer"}
+POST /api/signals                       {"agent", "signal", "message"?}
+POST /api/agents/{id}/repin             accept the current definition and tools
+GET  /api/health                        faults, unknown outcomes, maintenance, capacity
+POST /api/calls/resolve                 {"key", "outcome", "result"?} (admin)
+
+With named tokens (`statecraft.server.tokens`), the page acts as the signed-in principal: it sees
+the runs that principal may touch, and every change it makes is audited in the run's event log.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import FileResponse, Response, StreamingResponse
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+
+from statecraft.kernel.store import Ended
+from statecraft.kernel.transitions import InvalidAnswer
+from statecraft.providers.workspaces import Escape
+from statecraft.runtime.runtime import agent_of_question
+from statecraft.server.app import (
+    BadRequest,
+    Forbidden,
+    forbidden,
+    must_allow,
+    must_own,
+    optional_field,
+    principal_of,
+    read_body,
+    refused,
+    root_of,
+    since_of,
+)
+from statecraft.server.guard import Guard
+from statecraft.server.tokens import OPERATOR, TokenBook
+
+from . import model
+
+STATIC = Path(__file__).parent / "static"
+POLL_SECONDS = 1.0
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _json(value: Any, status: int = 200) -> Response:
+    return Response(_dumps(value), status_code=status, media_type="application/json")
+
+
+def _sse(event: dict[str, Any]) -> str:
+    """One event as a plain message (its kind is in the data), so a page gets every kind."""
+    return f"id: {event['seq']}\ndata: {_dumps(event)}\n\n"
+
+
+def console_app(
+    runtime: Any,
+    *,
+    title: str = "statecraft",
+    token: str | None = None,
+    hosts: list[str] | tuple[str, ...] = (),
+    tokens: TokenBook | None = None,
+) -> Starlette:
+    """Every request passes the runtime's HTTP guard (`statecraft.server.guard`); with a token,
+    open `/?token=<token>` once and the page keeps it as a same-site cookie."""
+
+    async def owned_runs(request: Request) -> list[dict[str, Any]]:
+        principal = principal_of(request)
+        return [r for r in await runtime.runs() if principal.owns(r["id"])]
+
+    async def audit(request: Request, agent_id: str, op: str, **detail: Any) -> None:
+        entry = {"op": op, "agent": agent_id, "by": principal_of(request).name, **detail}
+        with contextlib.suppress(KeyError):
+            await runtime.store.audit(root_of(agent_id), entry)
+
+    async def page(request: Request) -> Response:
+        return FileResponse(STATIC / "index.html")
+
+    async def overview(request: Request) -> Response:
+        roots = await owned_runs(request)
+        return _json(
+            {
+                "title": title,
+                "features": len({n.rpartition(":")[0] for n in runtime.registry.agents}),
+                "agents": len(runtime.registry.agents),
+                "runs": len(roots),
+                "active": sum(1 for r in roots if r["status"] == "active"),
+                "questions": sum(r["questions"] for r in roots),
+                "servers": [p["name"] for p in runtime.providers()],
+            }
+        )
+
+    async def health(request: Request) -> Response:
+        principal = principal_of(request)
+        found = await runtime.metrics()
+        return _json(
+            {
+                "faults": [f for f in await runtime.faults() if principal.owns(f["root"])],
+                "indeterminate_calls": found["indeterminate_calls"],
+                "undelivered_messages": found["undelivered_messages"],
+                "maintenance": found["maintenance"],
+                "capacity": found["process"]["capacity"],
+                "effects": found["process"]["effects"],
+            }
+        )
+
+    async def resolve(request: Request) -> Response:
+        principal = must_allow(request, "admin")
+        body = await read_body(request)
+        key, outcome = body.get("key"), body.get("outcome")
+        if not isinstance(key, str) or not isinstance(outcome, str):
+            raise BadRequest('expected {"key", "outcome", "result"?}')
+        entry = await runtime.store.call(key)
+        if entry is None:
+            return _json({"error": f"no call {key}"}, 404)
+        must_own(request, entry["agent"])
+        try:
+            settled = await runtime.resolve_call(
+                key, outcome, result=body.get("result"), by=principal.name
+            )
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 409)
+        return _json(settled)
+
+    async def registry(request: Request) -> Response:
+        return _json(model.registry(runtime))
+
+    async def graph(request: Request) -> Response:
+        return _json(model.graph(runtime))
+
+    async def server_list(request: Request) -> Response:
+        return _json(model.servers(runtime))
+
+    async def run_list(request: Request) -> Response:
+        return _json(await owned_runs(request))
+
+    async def run(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
+        try:
+            return _json(await model.run(runtime, request.path_params["root"]))
+        except KeyError:
+            return _json({"error": "no such run"}, 404)
+
+    async def agent(request: Request) -> Response:
+        must_own(request, request.path_params["agent"])
+        try:
+            return _json(await model.agent(runtime, request.path_params["agent"]))
+        except KeyError:
+            return _json({"error": "no such agent"}, 404)
+
+    async def files(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
+        prefix = request.query_params.get("prefix", "")
+        return _json(await model.files(runtime, request.path_params["root"], prefix))
+
+    async def file(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
+        try:
+            found = await model.read_file(
+                runtime, request.path_params["root"], request.query_params["path"]
+            )
+        except Escape as exc:
+            return _json({"error": str(exc)}, 403)
+        except (KeyError, FileNotFoundError, IsADirectoryError):
+            return _json({"error": "no such file"}, 404)
+        except (ValueError, OSError) as exc:
+            return _json({"error": str(exc)}, 400)
+        return _json(found)
+
+    def stream(roots: Callable[[], Awaitable[list[str]]], since: int) -> StreamingResponse:
+        async def events() -> AsyncIterator[str]:
+            seen: dict[str, int] = {}
+            first = True
+            while True:
+                sent = False
+                for root in await roots():
+                    after = seen.get(root, since if first else 0)
+                    for event in await runtime.store.read_events(root, after):
+                        seen[root] = event["seq"]
+                        yield _sse(event)
+                        sent = True
+                first = False
+                if not sent:  # the durable log is the source; polling it is enough
+                    yield ": keep-alive\n\n"
+                    await asyncio.sleep(POLL_SECONDS)
+
+        return StreamingResponse(
+            events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        )
+
+    async def run_events(request: Request) -> Response:
+        root = request.path_params["root"]
+        must_own(request, root)
+        since = since_of(request)
+
+        async def one() -> list[str]:
+            return [root]
+
+        return stream(one, since)
+
+    async def all_events(request: Request) -> Response:
+        principal = principal_of(request)
+
+        async def every() -> list[str]:
+            return [r.id for r in await runtime.store.roots() if principal.owns(r.id)]
+
+        return stream(every, since_of(request))
+
+    async def spawn(request: Request) -> Response:
+        body = await read_body(request)
+        agent = body.get("agent")
+        if not isinstance(agent, str) or not agent:
+            raise BadRequest("'agent' must name an agent")
+        root_id = optional_field(body, "root", str)
+        principal = principal_of(request)
+        if principal.roots is not None and root_id is None:
+            raise Forbidden(f"{principal.name} must name the root (one of {principal.roots}*)")
+        if root_id is not None:
+            must_own(request, root_id)
+        try:
+            root = await runtime.spawn(
+                agent, optional_field(body, "input", dict) or {}, root_id=root_id
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            return _json({"error": str(exc)}, 400)
+        await audit(request, root, "spawn", definition=agent)
+        return _json({"root": root}, 201)
+
+    async def answer(request: Request) -> Response:
+        body = await read_body(request)
+        question = body.get("question_id")
+        if not isinstance(question, str):
+            raise BadRequest("'question_id' must name a question")
+        try:
+            agent_id = agent_of_question(question)
+        except InvalidAnswer as exc:
+            return _json({"error": str(exc)}, 409)
+        principal = must_own(request, agent_id)
+        by = "person" if principal is OPERATOR else principal.name
+        try:
+            await runtime.answer(question, body.get("answer"), by=by)
+        except (InvalidAnswer, KeyError, Ended) as exc:
+            return _json({"error": str(exc)}, 409)
+        except ValueError as exc:  # an answer that cannot be stored (not JSON)
+            return _json({"error": str(exc)}, 400)
+        await audit(request, agent_id, "answer", question=question)
+        return Response(status_code=204)
+
+    async def signal(request: Request) -> Response:
+        body = await read_body(request)
+        agent = body.get("agent")
+        if not isinstance(agent, str) or "signal" not in body:
+            raise BadRequest('expected {"agent", "signal", "message"?}')
+        must_own(request, agent)
+        sent: Any = body["signal"]
+        if sent == "USR":
+            sent = ("USR", body.get("message"))
+        try:
+            await runtime.signal(agent, sent)
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 400)
+        except KeyError as exc:
+            return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
+        await audit(request, agent, "signal", signal=body["signal"])
+        return Response(status_code=204)
+
+    async def repin(request: Request) -> Response:
+        agent_id = request.path_params["agent"]
+        must_own(request, agent_id)
+        try:
+            changed = await runtime.repin(agent_id)
+        except KeyError as exc:
+            return _json({"error": str(exc)}, 404)
+        except Ended as exc:
+            return _json({"error": str(exc)}, 409)
+        await audit(request, agent_id, "repin")
+        return _json(changed)
+
+    return Starlette(
+        routes=[
+            Route("/", page),
+            Route("/api/overview", overview),
+            Route("/api/health", health),
+            Route("/api/calls/resolve", resolve, methods=["POST"]),
+            Route("/api/registry", registry),
+            Route("/api/graph", graph),
+            Route("/api/servers", server_list),
+            Route("/api/runs", run_list),
+            Route("/api/runs", spawn, methods=["POST"]),
+            Route("/api/runs/{root}", run),
+            Route("/api/runs/{root}/files", files),
+            Route("/api/runs/{root}/file", file),
+            Route("/api/runs/{root}/events", run_events),
+            Route("/api/events", all_events),
+            Route("/api/agents/{agent:path}/repin", repin, methods=["POST"]),
+            Route("/api/agents/{agent:path}", agent),
+            Route("/api/answers", answer, methods=["POST"]),
+            Route("/api/signals", signal, methods=["POST"]),
+            Mount("/static", StaticFiles(directory=STATIC), name="static"),
+        ],
+        middleware=[Middleware(Guard, token=token, hosts=tuple(hosts), cookie=True, tokens=tokens)],
+        exception_handlers={BadRequest: refused, Forbidden: forbidden},
+    )
+
+
+__all__ = ["console_app"]

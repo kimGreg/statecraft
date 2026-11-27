@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-console"
-version = "0.2.0"
+version = "0.3.0"
 description = "The statecraft console: registry, graphs, providers and live runs"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "starlette>=0.37", "uvicorn>=0.29"]
+dependencies = ["statecraft>=0.3,<0.4", "starlette>=0.37", "uvicorn>=0.29"]
 
 [project.scripts]
 statecraft-console = "statecraft_console.__main__:main"

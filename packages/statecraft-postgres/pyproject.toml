@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-postgres"
-version = "0.1.0"
+version = "0.3.0"
 description = "The statecraft state store on PostgreSQL: executors on several hosts, one database"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "psycopg[binary]>=3.1"]
+dependencies = ["statecraft>=0.3,<0.4", "psycopg[binary]>=3.1"]
 
 [project.entry-points."statecraft.stores"]
 postgres = "statecraft_postgres.store:from_config"

@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-opensandbox"
-version = "0.1.0"
+version = "0.3.0"
 description = "Shell commands in OpenSandbox sandboxes as a durable statecraft effect"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "httpx>=0.27"]
+dependencies = ["statecraft>=0.3,<0.4", "httpx>=0.27"]
 
 [project.entry-points."statecraft.plugins"]
 opensandbox = "statecraft_opensandbox.plugin:register"

@@ -20,6 +20,7 @@ GET  /faults                                agents suspended by a fault, with th
 GET  /metrics                               Prometheus text (?format=json: the same as JSON)
 GET  /maintenance | POST /maintenance       {"on": bool}: no new steps start (admin to change)
 GET  /health                                {"ok", "started"}: served without a token
+GET  /openapi.json                          this API as an OpenAPI 3.1 document
 GET  /registry/agents | /registry/tools | /registry/providers
 
 Every request passes the guard (`guard.py`): same-origin, JSON bodies, loopback names unless a
@@ -53,6 +54,7 @@ from ..kernel.transitions import InvalidAnswer
 from ..providers.workspaces import Escape
 from ..runtime import operate
 from ..runtime.runtime import Runtime, agent_of_question
+from . import openapi
 from .guard import Guard
 from .tokens import OPERATOR, Principal, TokenBook
 
@@ -408,6 +410,9 @@ def server_app(
         )
         return _json({"on": changed})
 
+    async def spec(request: Request) -> Response:
+        return _json(openapi.document())
+
     async def health(request: Request) -> Response:
         return _json({"ok": True, "started": runtime.started})
 
@@ -452,6 +457,7 @@ def server_app(
             Route("/metrics", metrics),
             Route("/maintenance", maintenance, methods=["GET", "POST"]),
             Route("/health", health),
+            Route("/openapi.json", spec),
             Route("/registry/agents", agents),
             Route("/registry/tools", tools),
             Route("/registry/providers", providers),

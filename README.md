@@ -146,12 +146,20 @@ scripted or a real model), recovery (a killed process resumes), and a plugin pac
 | `statecraft-agentic` (`packages/`) | `AgenticAgent`, model tools, skills, decider, skill agent, sequence and fan-out |
 | `statecraft-mcp` (`packages/`) | MCP servers (HTTP, stdio, in memory) as tool providers |
 | `statecraft-console` (`packages/`) | the web console over the runtime API |
+| `statecraft-opensandbox` (`packages/`) | shell commands in OpenSandbox sandboxes as a durable effect |
+| `statecraft-postgres` (`packages/`) | the state store on PostgreSQL, for executors on several hosts |
+| `statecraft-coding` (`packages/`) | a coding agent and a durable terminal session |
+
+What is and is not exactly once: [docs/guarantees.md](docs/guarantees.md). Writing providers:
+[docs/providers.md](docs/providers.md). Stable surface and versions:
+[docs/stability.md](docs/stability.md).
 
 ## Develop
 
 ```bash
 python -m pip install -e ".[dev]" -e packages/statecraft-agentic -e packages/statecraft-mcp \
-  -e packages/statecraft-console -e examples/notes_plugin
+  -e packages/statecraft-console -e packages/statecraft-opensandbox \
+  -e packages/statecraft-postgres -e packages/statecraft-coding -e examples/notes_plugin
 python -m pytest -q
 ```
 

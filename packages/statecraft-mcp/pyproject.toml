@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP servers as statecraft tool providers"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "mcp>=1.20"]
+dependencies = ["statecraft>=0.3,<0.4", "mcp>=1.20"]
 
 [project.entry-points."statecraft.plugins"]
 mcp = "statecraft_mcp.provider:register"

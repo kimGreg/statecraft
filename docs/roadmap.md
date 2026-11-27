@@ -42,7 +42,12 @@ store kinds come from packages through `statecraft.stores`; separate hosts not t
 LISTEN/NOTIFY: executors poll). F1 done (`packages/statecraft-coding`: project discovery with
 AGENTS.md, list/read/write/edit tools safe to repeat, the shell through the granted effect,
 output shaping, sessions and a terminal session; a real-model run fixed a bug and checked it;
-an empty text answer is now asked for again in the agentic loop).
+an empty text answer is now asked for again in the agentic loop). R1 done (the HTTP API as an
+OpenAPI 3.1 document at `/openapi.json`, every served route in it; the stable names, ports,
+store contract and configuration listed in `tests/test_public_api.py`; deprecation policy, store
+formats and a compatibility matrix in `docs/stability.md`; packages in lockstep at 0.3.0, each
+requiring statecraft 0.3; `scripts/check_wheels.sh` installs each extension alone from its wheel;
+`docs/guarantees.md` and `docs/providers.md`; `mkdocs.yml` for a site, not built here).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.

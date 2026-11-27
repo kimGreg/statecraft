@@ -1,0 +1,359 @@
+"""MCP as an effect provider (architecture §12.3): a server's tools become statecraft tools.
+
+    MCPProvider("search", url="http://localhost:8001/mcp")            # streamable HTTP
+    MCPProvider("files", command="python", args=["-m", "my_server"])   # stdio
+    MCPProvider("calc", server=my_mcp_server)                          # in memory (same process)
+
+Tools are named `<provider>.<tool>`. Discovery lists the server's tools with their schemas; the
+policy is **proposed** from the tool's annotations only when the provider is `trusted`
+(read-only hint -> read_only, idempotent hint -> idempotent); otherwise, and for unannotated
+tools, it is `non_repeatable` (refused) until the operator sets one (`policies` in the
+configuration). Annotations are hints, not guarantees.
+
+Idempotency (deduplicated tools): every attempt of a call carries the call's idempotency key in
+the request's `_meta` under `io.statecraft/idempotencyKey` (the same key on retries and on a
+rerun of the state). Sending a key is not deduplication: a server must apply each key once and
+return the first result again. A tool may be `deduplicated` only when its server declares that
+for it (the tool's `_meta` `io.statecraft/deduplicates: true` in the listing) or the operator
+says so (`deduplicating=[tool, ...]`); otherwise the runtime refuses to start.
+
+Sessions: with `session_header`, each root gets its own connection carrying the root's workspace
+id in that header (the server works in that session); otherwise one connection is shared.
+Failures: a connection that cannot be opened, or that was already closed when the request was to
+be written, is `unavailable` (not sent); a tool's error result is `failed`; a JSON-RPC error the
+server answered about the request itself (bad parameters, unknown method) is `invalid`, another
+answered error `failed` (an answer: never retried); anything else during a call is `transient`
+(it may have been executed).
+
+Connections: one per session key, opened outside the provider's lock (a slow connect never holds
+up calls on other sessions; callers of the same key wait for one connect); a connection that
+broke (a dead stdio server, a closed stream) is dropped and opened again on the next call; a
+connect that is cancelled or fails leaves nothing running; the least recently used session is
+closed when there are more than `max_sessions`, never while calls on it are in flight. The tool
+list (every page of it) is read at start; a server's list-changed notification applies at the
+next start, when the registry is built again.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import sys
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any
+
+from statecraft import EffectDefinition, EffectError, EffectPolicy
+
+UNANNOTATED = EffectPolicy(kind="non_repeatable")
+#: JSON-RPC errors that say the request itself was wrong (nothing was done)
+INVALID_CODES = (-32700, -32600, -32601, -32602)
+#: the JSON-RPC code the client uses when the connection closed with a request out
+CONNECTION_CLOSED = -32000
+#: errors raised when writing to a connection that is already closed (the request never left)
+NOT_SENT = ("ClosedResourceError", "BrokenResourceError")
+#: errors that mean the connection broke while a request was out (it may have been executed)
+BROKEN = ("EndOfStream", "BrokenPipeError", "ConnectionResetError", "RemoteProtocolError")
+
+
+@dataclass
+class _Session:
+    task: asyncio.Task[None]
+    client: Any
+    closing: asyncio.Event
+    active: int = 0
+    broken: bool = False
+
+    @property
+    def usable(self) -> bool:
+        return not self.broken and not self.task.done()
+
+
+#: Where a call's idempotency key goes (request `_meta`), and where a server declares that a tool
+#: applies each key once (tool `_meta` in the listing).
+KEY_META = "io.statecraft/idempotencyKey"
+DEDUP_META = "io.statecraft/deduplicates"
+
+
+class MCPProvider:
+    def __init__(
+        self,
+        name: str,
+        *,
+        url: str | None = None,
+        command: str | None = None,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        server: Any = None,
+        session_header: str | None = None,
+        trusted: bool = False,
+        concurrency: int | None = None,
+        timeout: float = 30,
+        max_sessions: int = 64,
+        deduplicating: list[str] | None = None,
+    ) -> None:
+        if sum(x is not None for x in (url, command, server)) != 1:
+            raise ValueError("an MCP provider has exactly one of url, command, server")
+        self.name = name
+        self.url, self.command, self.args, self.env = url, command, list(args or []), env
+        self.server = server
+        self.session_header = session_header
+        self.trusted = trusted
+        self.concurrency = concurrency
+        self.timeout = timeout
+        self.max_sessions = max_sessions
+        #: tools the operator vouches apply each idempotency key once (besides declared ones)
+        self.deduplicating = set(deduplicating or [])
+        self._declared: set[str] = set()  # tools whose server declares deduplication
+        self.server_version = ""
+        self._sessions: OrderedDict[str, _Session] = OrderedDict()
+        self._connecting: dict[str, asyncio.Future[None]] = {}
+        self._lock = asyncio.Lock()
+
+    # ---- connections ------------------------------------------------------------------------
+    def _target(self, session: str | None) -> Any:
+        from mcp import StdioServerParameters
+
+        if self.server is not None:
+            return self.server
+        if self.command is not None:
+            # `python` means the interpreter running statecraft (its environment has the server)
+            command = sys.executable if self.command in ("python", "python3") else self.command
+            return StdioServerParameters(command=command, args=self.args, env=self.env)
+        if self.session_header and session:
+            import httpx2
+            from mcp.client.streamable_http import streamable_http_client
+
+            http = httpx2.AsyncClient(headers={self.session_header: session}, timeout=self.timeout)
+            return streamable_http_client(self.url, http_client=http)
+        return self.url
+
+    async def _hold(self, key: str, ready: asyncio.Future[Any], closing: asyncio.Event) -> None:
+        """Open the connection, hand it out, keep it until closing: a connection is closed by
+        the task that opened it."""
+        from mcp import Client
+
+        try:
+            async with Client(self._target(key or None)) as client:
+                if not ready.done():
+                    ready.set_result(client)
+                await closing.wait()
+        except Exception as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+
+    async def _session(self, session: str | None) -> _Session:
+        """The open connection of a session key, counted as in use (`_release` when done)."""
+        key = session if self.session_header else ""
+        while True:
+            async with self._lock:
+                held = self._sessions.get(key)
+                if held is not None and held.usable:
+                    held.active += 1
+                    self._sessions.move_to_end(key)
+                    return held
+                if held is not None:  # broken or ended: drop it, open another
+                    self._drop(key)
+                pending = self._connecting.get(key)
+                mine = pending is None
+                if mine:
+                    pending = asyncio.get_running_loop().create_future()
+                    self._connecting[key] = pending
+            assert pending is not None
+            if not mine:  # someone opens this key's connection: wait for it, then look again
+                try:
+                    await asyncio.shield(pending)
+                except EffectError:
+                    raise
+                except Exception as exc:
+                    raise self._unreachable(exc) from exc
+                continue
+            await self._connect(key, pending)
+
+    async def _connect(self, key: str, pending: asyncio.Future[None]) -> None:
+        ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        closing = asyncio.Event()
+        task = asyncio.create_task(self._hold(key, ready, closing))
+        try:
+            client = await asyncio.wait_for(asyncio.shield(ready), self.timeout)
+        except BaseException as exc:  # cancelled or failed: nothing is left running
+            closing.set()
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(task), 1)
+            async with self._lock:
+                self._connecting.pop(key, None)
+            if isinstance(exc, asyncio.CancelledError):
+                if not pending.done():
+                    pending.set_exception(ConnectionError("the connect was cancelled"))
+                    pending.exception()  # retrieved: waiters get it, nobody else must
+                raise
+            failure = self._unreachable(exc)
+            if not pending.done():
+                pending.set_exception(failure)
+                pending.exception()
+            raise failure from exc
+        async with self._lock:
+            self._sessions[key] = _Session(task, client, closing)
+            self._connecting.pop(key, None)
+            self._evict()
+        if not pending.done():
+            pending.set_result(None)
+
+    def _unreachable(self, exc: BaseException) -> EffectError:
+        return EffectError(
+            "unavailable",
+            f"cannot connect: {type(exc).__name__}: {exc}",
+            effect=self.name,
+            sent=False,
+        )
+
+    def _drop(self, key: str) -> None:
+        held = self._sessions.pop(key, None)
+        if held is not None:
+            held.closing.set()
+
+    def _evict(self) -> None:
+        """Close the least recently used sessions over `max_sessions`, never one in use."""
+        for key in list(self._sessions):
+            if len(self._sessions) <= self.max_sessions:
+                return
+            if self._sessions[key].active == 0:
+                self._drop(key)
+
+    async def _release(self, held: _Session) -> None:
+        async with self._lock:
+            held.active -= 1
+            if held.broken:
+                held.closing.set()
+            self._evict()
+
+    async def _client(self, session: str | None) -> Any:
+        """A connection for one request that holds no session open (discovery)."""
+        held = await self._session(session)
+        await self._release(held)
+        return held.client
+
+    async def start(self) -> None:
+        await self._client(None)
+
+    async def close(self) -> None:
+        for held in self._sessions.values():
+            held.closing.set()
+        for held in self._sessions.values():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(held.task, 5)
+        self._sessions.clear()
+
+    # ---- the provider interface -------------------------------------------------------------
+    def deduplicates(self, operation: str) -> bool:
+        """Whether a key sent with a call of this tool is applied once by its server."""
+        return operation in self._declared or operation in self.deduplicating
+
+    def policy_problem(self, definition: EffectDefinition) -> str | None:
+        """Why the tool's policy cannot hold with this server, or None (checked at start)."""
+        operation = definition.operation or definition.name
+        if definition.policy.kind == "deduplicated" and not self.deduplicates(operation):
+            return (
+                f"tool {definition.name} is deduplicated, but its server does not declare that it "
+                f"applies an idempotency key once ({DEDUP_META} in the tool's _meta) and the "
+                "operator did not vouch for it (deduplicating=[...]): keys alone do not deduplicate"
+            )
+        return None
+
+    def _policy(self, annotations: Any, declared: bool = False) -> EffectPolicy:
+        if self.trusted and declared:
+            return EffectPolicy(kind="deduplicated", timeout=self.timeout)
+        if not self.trusted or annotations is None:
+            return UNANNOTATED
+        if getattr(annotations, "read_only_hint", None):
+            return EffectPolicy(kind="read_only", timeout=self.timeout)
+        if getattr(annotations, "idempotent_hint", None):
+            return EffectPolicy(kind="idempotent", timeout=self.timeout)
+        return UNANNOTATED
+
+    async def discover(self) -> list[EffectDefinition]:
+        client = await self._client(None)
+        listed = await client.list_tools()
+        info = getattr(client, "server_info", None)
+        self.server_version = str(getattr(info, "version", "") or "") if info else ""
+        found = []
+        for tool in listed.tools:
+            declared = bool((tool.meta or {}).get(DEDUP_META))
+            if declared:
+                self._declared.add(tool.name)
+            output = tool.output_schema
+            if _wrapped(output):
+                output = output["properties"]["result"]
+            found.append(
+                EffectDefinition(
+                    name=f"{self.name}.{tool.name}",
+                    description=tool.description or "",
+                    input_schema=tool.input_schema or {"type": "object"},
+                    output_schema=output,
+                    policy=self._policy(tool.annotations, declared),
+                    provider=self.name,
+                    operation=tool.name,
+                    version=self.server_version,
+                )
+            )
+        return found
+
+    async def invoke(self, operation: str, arguments: dict[str, Any], context: Any) -> Any:
+        held = await self._session(getattr(context, "workspace", None))
+        effect = f"{self.name}.{operation}"
+        try:
+            key = getattr(context, "key", None)
+            meta = {KEY_META: key} if key else None  # every attempt carries the same key
+            result = await held.client.call_tool(operation, arguments, meta=meta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failure = self._failure(exc, effect)
+            if failure.cls in ("unavailable", "transient"):
+                held.broken = True  # the connection is not trusted again: the next call reopens
+            raise failure from exc
+        finally:
+            await self._release(held)
+        if result.is_error:
+            text = " ".join(getattr(c, "text", "") for c in result.content)
+            raise EffectError(
+                "failed",
+                text[:500] or "the tool reported an error",
+                effect=f"{self.name}.{operation}",
+            )
+        structured = result.structured_content
+        if isinstance(structured, dict) and set(structured) == {"result"}:
+            return structured["result"]
+        if structured is not None:
+            return structured
+        texts = [getattr(c, "text", None) for c in result.content]
+        return texts[0] if len(texts) == 1 else texts
+
+    @staticmethod
+    def _failure(exc: BaseException, effect: str) -> EffectError:
+        names = {k.__name__ for k in type(exc).__mro__}
+        message = f"{type(exc).__name__}: {exc}"[:300]
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and code != CONNECTION_CLOSED:  # an answer from the server
+            cls = "invalid" if code in INVALID_CODES else "failed"
+            return EffectError(cls, message, effect=effect, code=str(code))
+        if names & set(NOT_SENT):
+            return EffectError("unavailable", message, effect=effect, sent=False)
+        return EffectError("transient", message, effect=effect)
+
+
+def _wrapped(schema: Any) -> bool:
+    return (
+        isinstance(schema, dict)
+        and set(schema.get("properties") or {}) == {"result"}
+        and schema.get("required") == ["result"]
+    )
+
+
+def register(registrar: Any) -> None:
+    """The plugin (`plugins: [mcp]`): configuration can name `provider: mcp`."""
+    registrar.providers.factory("mcp", lambda name, **cfg: MCPProvider(name, **cfg))
+
+
+__all__ = ["MCPProvider", "register"]

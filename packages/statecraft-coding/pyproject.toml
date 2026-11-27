@@ -1,10 +1,10 @@
 [project]
 name = "statecraft-coding"
-version = "0.1.0"
+version = "0.3.0"
 description = "A coding agent on statecraft's agentic harness, with a durable terminal session"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["statecraft", "statecraft-agentic"]
+dependencies = ["statecraft>=0.3,<0.4", "statecraft-agentic>=0.3,<0.4"]
 
 [build-system]
 requires = ["setuptools>=68"]
