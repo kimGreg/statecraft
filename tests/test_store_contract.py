@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from statecraft.kernel.process import Fault, Record, Transition
-from statecraft.kernel.store import Busy, Conflict, Fenced
+from statecraft.kernel.store import Busy, CallRefused, Conflict, Fenced
 from statecraft.kernel.transitions import apply_signal
 from statecraft.providers.stores import MemoryStore, SqliteStore
 
@@ -193,3 +193,32 @@ async def test_an_expired_lease_cannot_be_renewed(store) -> None:
     lease = await store.try_acquire("root", "a", 10, now=0)
     assert await store.renew("root", lease, 10, now=11) is None  # expired, even unclaimed
     assert await store.renew("root", lease, 10, now=5) is not None
+
+
+async def test_the_call_journal_keeps_identities_and_unknown_outcomes(store) -> None:
+    await store.create(Record(id="a", agent="x", state="go"))
+    await store.create(Record(id="b", agent="x", state="go"))
+    entry, created = await store.begin_call("a", "a/0/go/call/c1", "pay.charge", "d1", 1.0)
+    assert created and entry["status"] == "sent"
+    again, created = await store.begin_call("a", "a/0/go/call/c1", "pay.charge", "d1", 2.0)
+    assert not created and again["since"] == 1.0
+    with pytest.raises(CallRefused, match="different request"):
+        await store.begin_call("a", "a/0/go/call/c1", "pay.charge", "d2", 3.0)
+    with pytest.raises(CallRefused, match="belongs to a"):
+        await store.begin_call("b", "a/0/go/call/c1", "pay.charge", "d1", 3.0)
+    marked = await store.end_call("a/0/go/call/c1", "indeterminate", clear_by="resend")
+    assert marked["clear_by"] == "resend"
+    with pytest.raises(CallRefused, match="unknown outcome"):  # no new key around it
+        await store.begin_call("a", "a/1/go/call/c2", "pay.charge", "d3", 4.0)
+    await store.begin_call("a", "a/1/go/call/c3", "mail.send", "d4", 4.0)  # another effect
+    await store.begin_call("b", "b/0/go/call/c1", "pay.charge", "d5", 4.0)  # another agent
+    settled = await store.end_call("a/0/go/call/c1", "completed", result={"ok": 1})
+    assert "clear_by" not in settled and settled["result"] == {"ok": 1}
+    await store.begin_call("a", "a/1/go/call/c2", "pay.charge", "d3", 5.0)  # settled: free
+    assert [c["key"] for c in await store.calls("a")] == [
+        "a/0/go/call/c1",
+        "a/1/go/call/c3",
+        "a/1/go/call/c2",
+    ]
+    with pytest.raises(ValueError):
+        await store.end_call("a/0/go/call/c1", "maybe")

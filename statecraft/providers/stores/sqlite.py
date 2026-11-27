@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS events  (root TEXT NOT NULL, seq INTEGER NOT NULL, id
                                     body TEXT NOT NULL, PRIMARY KEY (root, seq), UNIQUE (root, id));
 CREATE TABLE IF NOT EXISTS history (agent TEXT NOT NULL, revision INTEGER NOT NULL,
                                     body TEXT NOT NULL, PRIMARY KEY (agent, revision));
+CREATE TABLE IF NOT EXISTS calls   (key TEXT PRIMARY KEY, agent TEXT NOT NULL, n INTEGER NOT NULL,
+                                    body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS calls_agent ON calls(agent, n);
 """
 
 
@@ -137,6 +140,26 @@ class _Tables:
             "SELECT revision, body FROM history WHERE agent = ? ORDER BY revision", (agent_id,)
         ).fetchall()
         return [{"revision": r, **json.loads(b)} for r, b in rows]
+
+    def call_get(self, key: str) -> dict[str, Any] | None:
+        row = self._one("SELECT body FROM calls WHERE key = ?", key)
+        return json.loads(row[0]) if row else None
+
+    def call_put(self, key: str, agent_id: str, entry: dict[str, Any]) -> None:
+        body = _dump({**entry, "agent": agent_id})
+        if self._one("SELECT 1 FROM calls WHERE key = ?", key):
+            self.db.execute("UPDATE calls SET body = ? WHERE key = ?", (body, key))
+            return
+        n = self._one("SELECT COALESCE(MAX(n), 0) + 1 FROM calls WHERE agent = ?", agent_id)[0]
+        self.db.execute(
+            "INSERT INTO calls (key, agent, n, body) VALUES (?, ?, ?, ?)", (key, agent_id, n, body)
+        )
+
+    def calls_of(self, agent_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT body FROM calls WHERE agent = ? ORDER BY n", (agent_id,)
+        ).fetchall()
+        return [json.loads(b) for (b,) in rows]
 
     def tree_ids(self, root: str) -> list[str]:
         rows = self.db.execute(

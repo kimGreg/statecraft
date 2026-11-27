@@ -70,6 +70,19 @@ class Unread(StoreError):
     again, so the agent sees them before it ends."""
 
 
+class CallRefused(Exception):
+    """A keyed call refused before anything was sent: its identity names another request or
+    another agent, or the agent has an unresolved call to that effect."""
+
+
+#: The states of a journaled call. `sent`: sent at least once, no outcome yet. `completed` and
+#: `failed`: settled. `indeterminate`: it may have been applied and its outcome is unknown;
+#: `clear_by` says how it may be settled: `resend` (the provider applies a key once, so sending
+#: the same key again is its reconciliation), `reconcile` (the provider can tell the outcome) or
+#: `operator` (only a person, through `resolve_call`). `replay`: a person allowed one new send.
+CALL_STATES = ("sent", "completed", "failed", "indeterminate", "replay")
+
+
 class Tables(Protocol):
     """One transaction's view of the adapter's tables."""
 
@@ -86,6 +99,9 @@ class Tables(Protocol):
     def work_ids(self) -> list[str]: ...
     def tree_ids(self, root: str) -> list[str]: ...
     def root_ids(self) -> list[str]: ...
+    def call_get(self, key: str) -> dict[str, Any] | None: ...
+    def call_put(self, key: str, agent_id: str, entry: dict[str, Any]) -> None: ...
+    def calls_of(self, agent_id: str) -> list[dict[str, Any]]: ...
 
 
 def _payload(message: Any) -> Any:
@@ -324,6 +340,76 @@ class StateStore:
 
         return await self._txn(body)
 
+    # ---- the call journal: identities of keyed calls, their digests and outcomes ------------
+    async def begin_call(
+        self, agent_id: str, key: str, effect: str, digest: str, now: float
+    ) -> tuple[dict[str, Any], bool]:
+        """Record a keyed call before it is sent, or return its existing entry; and whether it
+        was created now (never sent before). Refused
+        (`CallRefused`) when the identity names a different request or another agent, or when
+        the agent has an unresolved (`indeterminate`) call to the same effect under another
+        identity: a new identity is never a way around an unknown outcome."""
+
+        def body(t: Tables) -> tuple[dict[str, Any], bool]:
+            existing = t.call_get(key)
+            if existing is not None:
+                if existing["agent"] != agent_id:
+                    raise CallRefused(f"call {key} belongs to {existing['agent']}")
+                if existing["digest"] != digest:
+                    raise CallRefused(
+                        f"call {key} was made with a different request; an identity names one "
+                        "request (effect, operation, arguments, workspace and scope)"
+                    )
+            for other in t.calls_of(agent_id):
+                if (
+                    other["key"] != key
+                    and other["effect"] == effect
+                    and other["status"] == "indeterminate"
+                ):
+                    raise CallRefused(
+                        f"an earlier call to {effect} ({other['key']}) has an unknown outcome; "
+                        "it must be settled first (CONT reconciles it, or an operator resolves it)"
+                    )
+            if existing is not None:
+                return existing, False
+            entry = {
+                "key": key,
+                "agent": agent_id,
+                "effect": effect,
+                "digest": digest,
+                "status": "sent",
+                "since": now,
+            }
+            t.call_put(key, agent_id, entry)
+            return entry, True
+
+        return await self._txn(body)
+
+    async def end_call(self, key: str, status: str, **detail: Any) -> dict[str, Any]:
+        """Settle or mark a journaled call (`completed`, `failed`, `indeterminate` with
+        `clear_by`, or back to `sent` when a replay starts)."""
+        if status not in CALL_STATES:
+            raise ValueError(f"call state must be one of {CALL_STATES}, not {status!r}")
+        detail = jsonable(detail)
+
+        def body(t: Tables) -> dict[str, Any]:
+            entry = t.call_get(key)
+            if entry is None:
+                raise KeyError(key)
+            entry = {k: v for k, v in entry.items() if k not in ("clear_by", "error", "result")}
+            entry.update(detail, status=status)
+            t.call_put(key, entry["agent"], entry)
+            return entry
+
+        return await self._txn(body)
+
+    async def call(self, key: str) -> dict[str, Any] | None:
+        return await self._txn(lambda t: t.call_get(key), write=False)
+
+    async def calls(self, agent_id: str) -> list[dict[str, Any]]:
+        """The journaled calls of an agent, oldest first."""
+        return await self._txn(lambda t: t.calls_of(agent_id), write=False)
+
     async def append_inbox(
         self,
         agent_id: str,
@@ -350,7 +436,9 @@ class StateStore:
 
 
 __all__ = [
+    "CALL_STATES",
     "Busy",
+    "CallRefused",
     "Conflict",
     "Ended",
     "Fenced",

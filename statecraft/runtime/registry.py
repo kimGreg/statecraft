@@ -27,6 +27,7 @@ from typing import Any
 import yaml
 
 from ..kernel.effects import EffectPolicy
+from ..ports.effects import CAPABILITIES, CAPACITY_SCOPES
 from ..sdk.agent import Agent, AgentDefinitionError, states_of
 from ..sdk.effect import EffectDefinition, definition_of
 
@@ -274,6 +275,22 @@ class Registry:
         """(errors, warnings). Errors refuse the start; warnings are reported."""
         errors = list(self.problems)
         warnings: list[str] = []
+        for name, provider in self.providers.items():
+            declared = set(getattr(provider, "capabilities", None) or ())
+            unknown = sorted(declared - CAPABILITIES)
+            if unknown:
+                errors.append(
+                    f"provider {name} declares unknown capabilities {unknown}; "
+                    f"known: {sorted(CAPABILITIES)}"
+                )
+            if "reconcile" in declared and not callable(getattr(provider, "reconcile", None)):
+                errors.append(f"provider {name} declares reconcile but has no reconcile()")
+            scope = getattr(provider, "capacity_scope", "process") or "process"
+            if scope not in CAPACITY_SCOPES:
+                errors.append(
+                    f"provider {name}: capacity_scope must be one of {CAPACITY_SCOPES}, "
+                    f"not {scope!r}"
+                )
         for name, definition in self.agents.items():
             cls = definition.cls
             if cls is None:

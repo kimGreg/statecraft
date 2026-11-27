@@ -24,7 +24,7 @@ from typing import Any
 
 KINDS = ("read_only", "idempotent", "deduplicated", "non_repeatable")
 COSTS = ("none", "metered")
-FAILURES = ("invalid", "refused", "transient", "timeout", "unavailable", "failed")
+FAILURES = ("invalid", "refused", "transient", "timeout", "unavailable", "failed", "indeterminate")
 
 
 @dataclass(frozen=True)

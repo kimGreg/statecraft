@@ -112,6 +112,15 @@ class StepContext:
     def effect_key(self, name: str) -> str:
         return self.record.key(name)
 
+    def scope(self) -> dict[str, Any]:
+        """What this agent may expose to a provider: its workspace, the shared folder's mode
+        (read-only when it works attached without a write grant) and its private folder."""
+        return {
+            "workspace": self._workspace_id,
+            "shared": "ro" if self._mode == "ro" else "rw",
+            "private": f"{home(self.id)}/private",
+        }
+
     def service(self, name: str) -> Any:
         """An object an extension provided (`registrar.provide`); None when absent."""
         return self._runtime.registry.services.get(name)
@@ -122,11 +131,24 @@ class StepContext:
 
     # ---- tools --------------------------------------------------------------------------------
     async def call(
-        self, effect: str, /, *, idempotency_key: str | None = None, **arguments: Any
+        self,
+        effect: str,
+        /,
+        *,
+        call_name: str | None = None,
+        idempotency_key: str | None = None,
+        **arguments: Any,
     ) -> Any:
-        """Call a permitted tool through the effect manager. `idempotency_key` is for
-        deduplicated tools (`ctx.effect_key(...)`)."""
-        return await self._runtime.effects.call(self, effect, arguments, idempotency_key)
+        """Call a permitted tool through the effect manager.
+
+        A deduplicated tool needs the call's logical identity: `call_name`, a name for this call
+        that stays the same when the state runs again (the same call made again after a crash
+        or a CONT), or an explicit `idempotency_key`. The identity is never derived from the
+        order of calls: two different calls in one state need two names."""
+        if call_name is not None and idempotency_key is not None:
+            raise ValueError("give call_name or idempotency_key, not both")
+        key = idempotency_key or (self.record.key("call", call_name) if call_name else None)
+        return await self._runtime.effects.call(self, effect, arguments, key)
 
     def tools(self) -> list[str]:
         """The tools this instance may call (its pinned bindings)."""

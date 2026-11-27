@@ -298,7 +298,10 @@ class AgenticAgent(Agent):
                 data["boundary"] = {"name": name, "arguments": arguments}
                 return boundary
             return self._answer(data, boundary)
-        return self._answer(data, await self._call_tool(ctx, data, name, arguments))
+        # the call's identity comes from the committed model reply: the same call when this
+        # state runs again, a different one for every other tool call
+        identity = f"tool/{call_.get('id') or data['cursor']}"
+        return self._answer(data, await self._call_tool(ctx, data, name, arguments, identity))
 
     @state
     async def wait_result(self, ctx, data):
@@ -663,7 +666,9 @@ class AgenticAgent(Agent):
             raise KeyError(f"skill {name!r} is not available to this agent")
         return await ctx.service(SKILLS_SERVICE).read(ctx, pinned)
 
-    async def _call_tool(self, ctx, data, name: str, arguments: dict[str, Any]) -> Any:
+    async def _call_tool(
+        self, ctx, data, name: str, arguments: dict[str, Any], identity: str | None = None
+    ) -> Any:
         try:
             if name == "read_artifact":
                 artifact = await ctx.read(str(arguments.get("type")), by=arguments.get("by"))
@@ -679,7 +684,7 @@ class AgenticAgent(Agent):
             offered = {model_name_of(t): t for t in self.offered(ctx)}
             if name not in offered:
                 return {"error": f"unknown tool {name!r}"}
-            return await ctx.call(offered[name], **dict(arguments or {}))
+            return await ctx.call(offered[name], call_name=identity, **dict(arguments or {}))
         except EffectError as exc:  # classified by the runtime: the model decides what next
             return {
                 "error": {

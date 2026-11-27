@@ -66,6 +66,16 @@ class _Tables:
     def root_ids(self) -> list[str]:
         return sorted(i for i in self.s["agents"] if "/" not in i)
 
+    def call_get(self, key: str) -> dict[str, Any] | None:
+        entry = self.s["calls"].get(key)
+        return copy.deepcopy(entry) if entry is not None else None
+
+    def call_put(self, key: str, agent_id: str, entry: dict[str, Any]) -> None:
+        self.s["calls"][key] = {**copy.deepcopy(entry), "agent": agent_id}
+
+    def calls_of(self, agent_id: str) -> list[dict[str, Any]]:
+        return copy.deepcopy([e for e in self.s["calls"].values() if e["agent"] == agent_id])
+
     def work_ids(self) -> list[str]:
         return sorted(
             i
@@ -82,6 +92,7 @@ class MemoryStore(StateStore):
             "inbox": {},
             "events": {},
             "history": {},
+            "calls": {},
         }
         self._lock = threading.RLock()
 

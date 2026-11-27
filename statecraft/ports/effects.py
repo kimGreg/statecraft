@@ -2,7 +2,8 @@
 helpers to classify the failures of network calls. Providers import this, never the runtime.
 
 A provider is any object with `invoke(operation, arguments, context)`; `start()`, `discover()`,
-`close()` and `reconcile(operation, key, context)` are optional. It may declare:
+`close()`, `reconcile(operation, key, context)` and `bind(view)` (a read-only `RuntimeView`, given
+after it started) are optional. It may declare:
 
     capabilities: frozenset of CAPABILITIES       optional contracts it implements (tested by
                                                   `statecraft.testing.contracts` when declared)
@@ -68,6 +69,14 @@ class Reconciled:
     work: asyncio.Future[Any] | None = None
 
 
+class RuntimeView(Protocol):
+    """What a provider may ask the runtime, read only (given to `bind(view)` at start): to
+    clean up what it holds for agents that ended, and to reconcile after a restart."""
+
+    async def agent_status(self, agent_id: str) -> str | None: ...  # None: no such agent
+    async def ended(self, agent_ids: list[str]) -> set[str]: ...  # those that ended or are gone
+
+
 class EffectProvider(Protocol):
     async def invoke(self, operation: str, arguments: dict[str, Any], context: Any) -> Any: ...
 
@@ -118,6 +127,7 @@ __all__ = [
     "EffectContext",
     "EffectProvider",
     "Reconciled",
+    "RuntimeView",
     "classify",
     "classify_status",
 ]

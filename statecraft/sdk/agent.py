@@ -129,6 +129,9 @@ class StepEffects:
     notes: dict[str, Any] = field(default_factory=dict)
     schema_version: int | None = None
     crossings: list[dict[str, Any]] = field(default_factory=list)
+    #: Calls whose outcome is unknown: once there is one, no further call is made in this step
+    #: and the step faults, whatever the state does with the error.
+    blocked: list[dict[str, Any]] = field(default_factory=list)
 
 
 def states_of(agent: type) -> set[str]:

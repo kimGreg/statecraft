@@ -104,7 +104,7 @@ class Runtime:
         self.store = store
         self.registry = registry or Registry()
         self.registrar = Registrar(self.registry)
-        self.effects = EffectManager(self.registry)
+        self.effects = EffectManager(self.registry, store=store)
         self.workspaces = WorkspaceService(workspace, store)
         if lease_ttl <= 0 or beat <= 0 or beat >= lease_ttl:
             raise ValueError(
@@ -169,6 +169,10 @@ class Runtime:
         `start()` starts the executors again (the registry stays as it was)."""
         if not self.started:
             self.warnings += await self.registry.start_providers()
+            for provider in self.registry.providers.values():
+                bind = getattr(provider, "bind", None)
+                if bind is not None:
+                    bind(ProviderView(self.store))
             self.registry.freeze()
             errors, warnings = self.registry.validate()
             self.warnings += warnings
@@ -558,6 +562,31 @@ class Runtime:
             raise InvalidAnswer(f"{question_id} is already answered")
         self.notify()
 
+    async def calls(self, agent_id: str) -> list[dict[str, Any]]:
+        """The agent's journaled calls (keyed calls: identity, request digest, outcome)."""
+        return await self.store.calls(agent_id)
+
+    async def resolve_call(
+        self, key: str, outcome: str, *, result: Any = None, by: str = "operator"
+    ) -> dict[str, Any]:
+        """Settle a call whose outcome is unknown, from what a person established:
+        `completed` (the effect happened; `result` is what the state receives), `failed` (it did
+        not happen), or `replay` (allow exactly one new send). CONT the agent afterwards. This
+        is the only way a call with an unknown outcome is sent again without the provider's
+        own key or reconciliation contract."""
+        entry = await self.store.call(key)
+        if entry is None:
+            raise KeyError(f"no call {key}")
+        if entry["status"] != "indeterminate":
+            raise ValueError(f"call {key} is {entry['status']}, not indeterminate")
+        if outcome == "completed":
+            return await self.store.end_call(key, "completed", result=result, by=by)
+        if outcome == "failed":
+            return await self.store.end_call(key, "failed", error=f"resolved by {by}", by=by)
+        if outcome == "replay":
+            return await self.store.end_call(key, "replay", by=by)
+        raise ValueError(f"outcome must be completed, failed or replay, not {outcome!r}")
+
     async def repin(self, agent_id: str) -> dict[str, Any]:
         """Accept the current definition and tools for an instance whose pins changed (then CONT
         it). Recorded like a signal."""
@@ -814,4 +843,23 @@ class Runtime:
         return False
 
 
-__all__ = ["LIMITS", "NotStarted", "Runtime", "agent_of_question"]
+class ProviderView:
+    """The read-only `RuntimeView` providers get: agents' status from the store."""
+
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+
+    async def agent_status(self, agent_id: str) -> str | None:
+        record = await self._store.find(agent_id)
+        return None if record is None else record.status
+
+    async def ended(self, agent_ids: list[str]) -> set[str]:
+        gone = set()
+        for agent_id in agent_ids:
+            record = await self._store.find(agent_id)
+            if record is None or record.ended:
+                gone.add(agent_id)
+        return gone
+
+
+__all__ = ["LIMITS", "NotStarted", "ProviderView", "Runtime", "agent_of_question"]
