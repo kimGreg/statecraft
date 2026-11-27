@@ -145,17 +145,40 @@ def _store(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tokens(args: argparse.Namespace) -> int:
+    from ..server.tokens import TokenBook
+
+    book = TokenBook(args.tokens)
+    if args.action == "add":
+        if not args.name or not args.scope:
+            raise SystemExit("token add needs NAME and at least one --scope")
+        try:
+            secret = book.add(args.name, scopes=args.scope, roots=args.root)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+        print(secret)  # shown once: the file keeps only its salted hash
+        return 0
+    if args.action == "revoke":
+        if not args.name:
+            raise SystemExit("token revoke needs NAME")
+        return 0 if book.revoke(args.name) else 1
+    show(book.names())
+    return 0
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     from ..runtime.runtime import Runtime
     from ..server import server_app
     from ..server.guard import require_token
+    from ..server.tokens import TokenBook
 
-    token = require_token(args.host, args.token)
+    tokens = TokenBook(args.tokens) if args.tokens else None
+    token = require_token(args.host, args.token, tokens)
     overrides = {} if args.executors is None else {"executors": args.executors}
     runtime = Runtime.from_config(args.config, **overrides)
-    app = server_app(runtime, manage=True, token=token, hosts=args.allow_host or ())
+    app = server_app(runtime, manage=True, token=token, hosts=args.allow_host or (), tokens=tokens)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
@@ -179,9 +202,16 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--executors", type=int)
     serve.add_argument("--token", help="require this bearer token (default: $STATECRAFT_TOKEN)")
+    serve.add_argument("--tokens", help="a token book (`statecraft token add`): named tokens")
     serve.add_argument(
         "--allow-host", action="append", help="a Host name served without a token (repeatable)"
     )
+    token = sub.add_parser("token", help="make, list or revoke named API tokens")
+    token.add_argument("action", choices=["add", "list", "revoke"])
+    token.add_argument("name", nargs="?")
+    token.add_argument("--tokens", required=True, help="the token book file")
+    token.add_argument("--scope", action="append", choices=["read", "control", "admin"])
+    token.add_argument("--root", action="append", help="a run id prefix it may touch (repeatable)")
     run = sub.add_parser("run")
     run.add_argument("name")
     run.add_argument("--config", required=True)
@@ -213,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "store":
         return _store(args)
+    if args.command == "token":
+        return _tokens(args)
     return asyncio.run(_call(args))
 
 

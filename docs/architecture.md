@@ -770,9 +770,18 @@ a browser makes for another site (a foreign or opaque `Origin`, `Sec-Fetch-Site:
 changes that are not JSON (`text/plain` and form posts), and, without a token, any `Host` other
 than loopback or the names the operator allows (DNS rebinding). With a token (`--token` or
 `STATECRAFT_TOKEN`), every request carries `Authorization: Bearer <token>`; serving on a
-non-loopback address without one is refused. This is one shared secret, not user accounts or
-per-root permissions: proper authentication, and a versioned store format with migrations, are
-release gates before any deployment beyond one operator's machine.
+non-loopback address without one is refused.
+
+Named tokens (`--tokens FILE`, made with `statecraft token add NAME --scope ... [--root PREFIX]`)
+are kept as salted PBKDF2 hashes; a token is shown once. Each names a principal with scopes
+(`read` looks, `control` spawns, signals, answers and repins, `admin` also settles calls of unknown
+outcome through `POST /calls/{key}/resolve`) and, optionally, run id prefixes: a restricted
+principal lists only its runs and questions, is refused every other run, must name a new root
+inside its prefixes and cannot attach to or inherit from a run it does not own. Every change made
+over HTTP is an `audit` event in the run's durable event log naming the principal; an answer is
+recorded as given by the principal. The console signs in with the same tokens. These are
+operator-issued credentials for a team, not user accounts or tenants: multi-tenancy stays after
+1.0, and untrusted agent code still needs isolated workers (D2).
 
 ## 16. Package layout
 

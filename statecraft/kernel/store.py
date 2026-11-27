@@ -17,6 +17,7 @@ transaction. Times are passed in, so the store never reads a clock of its own.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Any, Protocol, TypeVar
@@ -420,6 +421,13 @@ class StateStore:
     async def calls(self, agent_id: str) -> list[dict[str, Any]]:
         """The journaled calls of an agent, oldest first."""
         return await self._txn(lambda t: t.calls_of(agent_id), write=False)
+
+    async def audit(self, root: str, entry: dict[str, Any]) -> int:
+        """Record who did what to a run (a control operation, an operator's decision)
+        in the run's durable event log, as an `audit` event."""
+        event_id = f"audit/{uuid.uuid4().hex}"
+        event = jsonable({"id": event_id, "kind": "audit", **entry})
+        return await self._txn(lambda t: t.event_append(root, event_id, event))
 
     async def append_inbox(
         self,

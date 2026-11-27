@@ -11,6 +11,10 @@ What must hold
   * with a token, every request carries it (`Authorization: Bearer <token>`, or the console's
     cookie set by opening `/?token=<token>` once); the Host is then free, since a rebound page
     does not know the token;
+  * with named tokens (`tokens.py`), the token names a principal: GET and HEAD need `read`,
+    anything else `control`; the principal is left in `scope["state"]["principal"]` for the
+    routes, which check the runs it may touch. Without any token, the local caller is the
+    machine's operator;
   * a server bound to a non-loopback address must have a token (`require_token`).
 """
 
@@ -23,6 +27,8 @@ import os
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+
+from .tokens import OPERATOR, Principal, TokenBook
 
 TOKEN_ENV = "STATECRAFT_TOKEN"
 COOKIE = "statecraft_token"
@@ -42,13 +48,13 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def require_token(host: str, token: str | None) -> str | None:
+def require_token(host: str, token: str | None, tokens: Any = None) -> str | None:
     """The token to serve with, from the argument or `STATECRAFT_TOKEN`; refuses to serve a
-    non-loopback address without one."""
+    non-loopback address without one or a token book (`tokens`)."""
     token = token or os.environ.get(TOKEN_ENV) or None
-    if token is None and not is_loopback(host):
+    if token is None and tokens is None and not is_loopback(host):
         raise SystemExit(
-            f"serving on {host} needs a token: pass --token or set {TOKEN_ENV} "
+            f"serving on {host} needs a token: pass --token, --tokens FILE or set {TOKEN_ENV} "
             "(clients send it as `Authorization: Bearer <token>`)"
         )
     return token
@@ -71,9 +77,12 @@ class Guard:
         token: str | None = None,
         hosts: Iterable[str] = (),
         cookie: bool = False,
+        tokens: TokenBook | None = None,
     ) -> None:
         self.app = app
         self.token = token or None
+        #: named tokens with scopes and runs; with them (or `token`), every request is signed in
+        self.tokens = tokens
         self.hosts = {h.lower() for h in hosts}
         self.cookie = cookie
 
@@ -85,17 +94,47 @@ class Guard:
         if problem is not None:
             status, message = problem
             return await _refuse(send, status, message)
-        if self.cookie and self.token is not None and _query_token(scope) is not None:
-            return await _set_cookie(send, self.token)  # the token was checked above
+        given = _query_token(scope)
+        if self.cookie and self._signs_in and given is not None:
+            return await _set_cookie(send, given)  # the token was checked above
         return await self.app(scope, receive, send)
+
+    @property
+    def _signs_in(self) -> bool:
+        return self.token is not None or self.tokens is not None
+
+    def _presented(self, scope: dict[str, Any], headers: dict[str, str]) -> str | None:
+        given = headers.get("authorization", "")
+        if given.lower().startswith("bearer "):
+            return given[7:]
+        if self.cookie:
+            for part in headers.get("cookie", "").split(";"):
+                name, _, value = part.strip().partition("=")
+                if name == COOKIE and value:
+                    return value
+            return _query_token(scope)
+        return None
+
+    def _principal(self, presented: str | None) -> Principal | None:
+        if presented is None:
+            return None
+        if self.token is not None and hmac.compare_digest(presented, self.token):
+            return OPERATOR
+        return self.tokens.verify(presented) if self.tokens is not None else None
 
     def problem(self, scope: dict[str, Any], headers: dict[str, str]) -> tuple[int, str] | None:
         host = headers.get("host", "")
-        if self.token is not None:
-            if not self._has_token(scope, headers):
+        principal: Principal | None = OPERATOR  # local, without tokens: the machine's operator
+        if self._signs_in:
+            principal = self._principal(self._presented(scope, headers))
+            if principal is None:
                 return 401, "a token is required (Authorization: Bearer <token>)"
+            needed = "read" if scope.get("method") in ("GET", "HEAD") else "control"
+            if not principal.allows(needed):
+                return 403, f"{principal.name} may not {needed}"
         elif _name(host).lower() not in self.hosts and not is_loopback(_name(host)):
             return 403, f"host {host!r} is not served without a token"
+        scope.setdefault("state", {})["principal"] = principal
         origin = headers.get("origin")
         if origin is not None and origin != "null":
             parts = urlsplit(origin)
@@ -112,21 +151,6 @@ class Guard:
             if kind != "application/json" and not empty:
                 return 415, "a request that changes something must send application/json"
         return None
-
-    def _has_token(self, scope: dict[str, Any], headers: dict[str, str]) -> bool:
-        assert self.token is not None
-        given = headers.get("authorization", "")
-        if given.lower().startswith("bearer ") and hmac.compare_digest(given[7:], self.token):
-            return True
-        if self.cookie:
-            for part in headers.get("cookie", "").split(";"):
-                name, _, value = part.strip().partition("=")
-                if name == COOKIE and hmac.compare_digest(value, self.token):
-                    return True
-            given = _query_token(scope)
-            if given is not None and hmac.compare_digest(given, self.token):
-                return True
-        return False
 
 
 def _query_token(scope: dict[str, Any]) -> str | None:

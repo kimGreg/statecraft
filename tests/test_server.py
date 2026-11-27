@@ -64,7 +64,8 @@ async def scenario(api: Any) -> dict[str, Any]:
         await asyncio.sleep(0.01)
     events = []
     async for event in api.events(root, follow=False):
-        events.append((event["kind"], event["state"]))
+        if event["kind"] != "audit":  # changes over HTTP are audited as well; the rest is equal
+            events.append((event["kind"], event["state"]))
     return {
         "result": (await api.artifact(root, "result"))["payload"],
         "tree": [(r["id"], r["view"]) for r in await api.tree(root)],

@@ -30,12 +30,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--executors", type=int, default=None)
     parser.add_argument("--token", help="require this token (default: $STATECRAFT_TOKEN)")
+    parser.add_argument("--tokens", help="a token book (`statecraft token add`): named tokens")
     parser.add_argument("--allow-host", action="append", help="a Host served without a token")
     args = parser.parse_args(argv)
-    token = require_token(args.host, args.token)
+    from statecraft.server.tokens import TokenBook
+
+    tokens = TokenBook(args.tokens) if args.tokens else None
+    token = require_token(args.host, args.token, tokens)
     overrides = {} if args.executors is None else {"executors": args.executors}
     runtime = Runtime.from_config(args.config, **overrides)
-    inner = console_app(runtime, title=args.title, token=token, hosts=args.allow_host or ())
+    inner = console_app(
+        runtime, title=args.title, token=token, hosts=args.allow_host or (), tokens=tokens
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:

@@ -610,11 +610,22 @@ class Runtime:
         if outcome not in settle:
             raise ValueError(f"outcome must be completed, failed or replay, not {outcome!r}")
         try:
-            return await self.store.end_call(
+            settled = await self.store.end_call(
                 key, outcome, expected="indeterminate", by=by, **settle[outcome]
             )
         except CallRefused as exc:
             raise ValueError(str(exc)) from None
+        await self.store.audit(
+            entry["agent"].split("/")[0],
+            {
+                "op": "resolve_call",
+                "agent": entry["agent"],
+                "call": key,
+                "outcome": outcome,
+                "by": by,
+            },
+        )
+        return settled
 
     async def repin(self, agent_id: str) -> dict[str, Any]:
         """Accept the current definition and tools for an instance whose pins changed (then CONT

@@ -13,7 +13,11 @@ partly: a connection closed with a request out stays `transient`, the client can
 unsent). B3 done (A4, A6, A7, A8, A11, A12, A13, V8, R7, R8, compaction quality, T8, T9, T10,
 T14; R11 moves with E1; T13 partly: the `run()` races behind the flaky tests are fixed).
 C1 done (store format 2 recorded; 0.2 stores refused until `statecraft store migrate`; newer
-formats refused; `store check`; tested from the 0.2 schema).
+formats refused; `store check`; tested from the 0.2 schema). D1 done (named tokens hashed at
+rest in a token book, `statecraft token add|list|revoke`; scopes read, control, admin; per-run
+prefixes filter lists and refuse other runs; HTTP changes audited in the run's event log; admin
+routes to list an agent's calls and settle one of unknown outcome; the console signs in with the
+same tokens; `--token` stays as the operator's single secret).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.

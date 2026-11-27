@@ -18,11 +18,15 @@ POST /api/runs                          {"agent", "input"?, "root"?} spawn a roo
 POST /api/answers                       {"question_id", "answer"}
 POST /api/signals                       {"agent", "signal", "message"?}
 POST /api/agents/{id}/repin             accept the current definition and tools
+
+With named tokens (`statecraft.server.tokens`), the page acts as the signed-in principal: it sees
+the runs that principal may touch, and every change it makes is audited in the run's event log.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -38,8 +42,21 @@ from starlette.staticfiles import StaticFiles
 from statecraft.kernel.store import Ended
 from statecraft.kernel.transitions import InvalidAnswer
 from statecraft.providers.workspaces import Escape
-from statecraft.server.app import BadRequest, optional_field, read_body, refused, since_of
+from statecraft.runtime.runtime import agent_of_question
+from statecraft.server.app import (
+    BadRequest,
+    Forbidden,
+    forbidden,
+    must_own,
+    optional_field,
+    principal_of,
+    read_body,
+    refused,
+    root_of,
+    since_of,
+)
 from statecraft.server.guard import Guard
+from statecraft.server.tokens import OPERATOR, TokenBook
 
 from . import model
 
@@ -66,15 +83,25 @@ def console_app(
     title: str = "statecraft",
     token: str | None = None,
     hosts: list[str] | tuple[str, ...] = (),
+    tokens: TokenBook | None = None,
 ) -> Starlette:
     """Every request passes the runtime's HTTP guard (`statecraft.server.guard`); with a token,
     open `/?token=<token>` once and the page keeps it as a same-site cookie."""
+
+    async def owned_runs(request: Request) -> list[dict[str, Any]]:
+        principal = principal_of(request)
+        return [r for r in await runtime.runs() if principal.owns(r["id"])]
+
+    async def audit(request: Request, agent_id: str, op: str, **detail: Any) -> None:
+        entry = {"op": op, "agent": agent_id, "by": principal_of(request).name, **detail}
+        with contextlib.suppress(KeyError):
+            await runtime.store.audit(root_of(agent_id), entry)
 
     async def page(request: Request) -> Response:
         return FileResponse(STATIC / "index.html")
 
     async def overview(request: Request) -> Response:
-        roots = await runtime.runs()
+        roots = await owned_runs(request)
         return _json(
             {
                 "title": title,
@@ -97,25 +124,29 @@ def console_app(
         return _json(model.servers(runtime))
 
     async def run_list(request: Request) -> Response:
-        return _json(await runtime.runs())
+        return _json(await owned_runs(request))
 
     async def run(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
         try:
             return _json(await model.run(runtime, request.path_params["root"]))
         except KeyError:
             return _json({"error": "no such run"}, 404)
 
     async def agent(request: Request) -> Response:
+        must_own(request, request.path_params["agent"])
         try:
             return _json(await model.agent(runtime, request.path_params["agent"]))
         except KeyError:
             return _json({"error": "no such agent"}, 404)
 
     async def files(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
         prefix = request.query_params.get("prefix", "")
         return _json(await model.files(runtime, request.path_params["root"], prefix))
 
     async def file(request: Request) -> Response:
+        must_own(request, request.path_params["root"])
         try:
             found = await model.read_file(
                 runtime, request.path_params["root"], request.query_params["path"]
@@ -151,6 +182,7 @@ def console_app(
 
     async def run_events(request: Request) -> Response:
         root = request.path_params["root"]
+        must_own(request, root)
         since = since_of(request)
 
         async def one() -> list[str]:
@@ -159,8 +191,10 @@ def console_app(
         return stream(one, since)
 
     async def all_events(request: Request) -> Response:
+        principal = principal_of(request)
+
         async def every() -> list[str]:
-            return [r.id for r in await runtime.store.roots()]
+            return [r.id for r in await runtime.store.roots() if principal.owns(r.id)]
 
         return stream(every, since_of(request))
 
@@ -169,14 +203,19 @@ def console_app(
         agent = body.get("agent")
         if not isinstance(agent, str) or not agent:
             raise BadRequest("'agent' must name an agent")
+        root_id = optional_field(body, "root", str)
+        principal = principal_of(request)
+        if principal.roots is not None and root_id is None:
+            raise Forbidden(f"{principal.name} must name the root (one of {principal.roots}*)")
+        if root_id is not None:
+            must_own(request, root_id)
         try:
             root = await runtime.spawn(
-                agent,
-                optional_field(body, "input", dict) or {},
-                root_id=optional_field(body, "root", str),
+                agent, optional_field(body, "input", dict) or {}, root_id=root_id
             )
         except (KeyError, ValueError, TypeError) as exc:
             return _json({"error": str(exc)}, 400)
+        await audit(request, root, "spawn", definition=agent)
         return _json({"root": root}, 201)
 
     async def answer(request: Request) -> Response:
@@ -185,11 +224,18 @@ def console_app(
         if not isinstance(question, str):
             raise BadRequest("'question_id' must name a question")
         try:
-            await runtime.answer(question, body.get("answer"))
+            agent_id = agent_of_question(question)
+        except InvalidAnswer as exc:
+            return _json({"error": str(exc)}, 409)
+        principal = must_own(request, agent_id)
+        by = "person" if principal is OPERATOR else principal.name
+        try:
+            await runtime.answer(question, body.get("answer"), by=by)
         except (InvalidAnswer, KeyError, Ended) as exc:
             return _json({"error": str(exc)}, 409)
         except ValueError as exc:  # an answer that cannot be stored (not JSON)
             return _json({"error": str(exc)}, 400)
+        await audit(request, agent_id, "answer", question=question)
         return Response(status_code=204)
 
     async def signal(request: Request) -> Response:
@@ -197,6 +243,7 @@ def console_app(
         agent = body.get("agent")
         if not isinstance(agent, str) or "signal" not in body:
             raise BadRequest('expected {"agent", "signal", "message"?}')
+        must_own(request, agent)
         sent: Any = body["signal"]
         if sent == "USR":
             sent = ("USR", body.get("message"))
@@ -208,15 +255,20 @@ def console_app(
             return _json({"error": str(exc)}, 404)
         except Ended as exc:
             return _json({"error": str(exc)}, 409)
+        await audit(request, agent, "signal", signal=body["signal"])
         return Response(status_code=204)
 
     async def repin(request: Request) -> Response:
+        agent_id = request.path_params["agent"]
+        must_own(request, agent_id)
         try:
-            return _json(await runtime.repin(request.path_params["agent"]))
+            changed = await runtime.repin(agent_id)
         except KeyError as exc:
             return _json({"error": str(exc)}, 404)
         except Ended as exc:
             return _json({"error": str(exc)}, 409)
+        await audit(request, agent_id, "repin")
+        return _json(changed)
 
     return Starlette(
         routes=[
@@ -238,8 +290,8 @@ def console_app(
             Route("/api/signals", signal, methods=["POST"]),
             Mount("/static", StaticFiles(directory=STATIC), name="static"),
         ],
-        middleware=[Middleware(Guard, token=token, hosts=tuple(hosts), cookie=True)],
-        exception_handlers={BadRequest: refused},
+        middleware=[Middleware(Guard, token=token, hosts=tuple(hosts), cookie=True, tokens=tokens)],
+        exception_handlers={BadRequest: refused, Forbidden: forbidden},
     )
 
 
