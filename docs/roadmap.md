@@ -1,6 +1,8 @@
 # Statecraft roadmap: from P0.6 to 1.0
 
-Status: approved with amendments (applied below). Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
+Status: approved with amendments (applied below). In progress on branch `p1`: B1 done;
+A1 done (identity, journal, indeterminate, scope, capabilities, provider view, local shell,
+contract kits, native edits); A2 done. Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.
 
@@ -99,7 +101,7 @@ contract (payments, remote jobs and database changes need it as much as shells).
 | # | Work |
 |---|---|
 | A1.1 | Define a **logical call identity**: what makes two calls "the same call" across a rerun of the state. It is the agent, the step, the state (already in `record.key`) plus a call name the code gives (`ctx.call(effect, ..., call="charge-order")`, or `ctx.effect_key(name)` today) |
-| A1.2 | Automatic identity only where it is provably stable: a state that makes exactly one call to a non-repeatable-safe effect, or calls whose identity comes from committed data (the agentic loop's `tool_call_id` from the committed model reply). Order-, branch- or parallelism-dependent derivation (a call counter) is **not** used; a `deduplicated` or non-repeatable call without a stable identity is refused with the reason |
+| A1.2 | Automatic identity only from committed data: the agentic loop names each tool call by the `tool_call_id` of the committed model reply. The runtime never derives an identity from the order of calls, branches or parallelism (whether a state makes one call or several cannot be known when the first call is made); a `deduplicated` call without an identity is refused with the reason |
 | A1.3 | **Request identity record**, persisted and checked across restarts: identity → digest of (effect binding: provider, version, schema and policy digests; operation; arguments; workspace identity; authorized scope from A1.11). Same identity with a different digest is refused before anything is sent. The record lives in the state store (generic, provider-neutral) and is written before the first send |
 
 **A1.b Indeterminate outcomes.**
@@ -163,6 +165,17 @@ Outcome: a decision record naming the reference backend (OpenSandbox, or another
 E2B or a Kubernetes agent sandbox for the same contract), and the A1 interface changes the
 evidence requires.
 
+**Result (done).** Decision record and evidence: `statecraft-spikes/a2-opensandbox/REPORT.md`
+(outside the repo; OpenSandbox server 1.2.1, `execd` 1.1.0). OpenSandbox is the reference
+backend for A4, with provider-side receipts; not a security boundary until the A4 hardening
+below is in place. Findings that shaped A1: no server-side dedup (receipts are the provider's);
+execution ids are chosen by the server and arrive in the first stream event (a submission whose
+answer is lost before that is `indeterminate`); command records live in memory in `execd` and are
+lost when it restarts (`unknown`, with a reason); cancellation ends the process group but not a
+process that left it (capability `tree_termination` added; only destroying the sandbox ends
+everything); mounts do what A3 needs (shared ro/rw, symlinks resolved inside the container,
+host paths checked).
+
 ### A3. Workspaces for shells — M (after A1/A2)
 
 | # | Work |
@@ -190,6 +203,7 @@ the A1 optional capabilities the backend supports (A2 evidence).
 | Recovery | on start, reconcile every receipt: completed keeps its result, running reattaches, unknown becomes `indeterminate` |
 | Capacity | declared scope (A1.10); backend or provider-store slots across processes |
 | Configuration | `effect_providers.sh: {provider: opensandbox, endpoint, image, scope, limits}`; strict keys |
+| Hardening (from A2) | a network per sandbox or an `execd` credential (any sandbox can reach another's `execd` otherwise); commands as a non-root user or in a user namespace, mounts `nosuid` (root and setuid files land in the workspace otherwise); egress closed by default; unique creation labels and cleanup of sandboxes stuck in `Pending`; the execution id stored in the receipt the moment it arrives; `tree_termination` declared only when cancellation destroys the sandbox |
 
 Gate: the contract kits against a real backend; kill the runtime, the provider and the sandbox
 service during a command at each lost-response point; the stored result, a reattach, or

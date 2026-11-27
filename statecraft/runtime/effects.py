@@ -298,6 +298,8 @@ class EffectManager:
                 continue
             break
         reason = f"{name}: the outcome of call {key} cannot be established yet"
+        if found.reason:
+            reason += f" ({found.reason[:200]})"
         await journal.end_call(key, "indeterminate", clear_by="reconcile", error=reason)
         self._block(ctx, name, key, reason)
         raise EffectError("indeterminate", reason, effect=name, sent=False)

@@ -326,9 +326,28 @@ Failures have one type with a class:
 | `timeout` | deadline passed | as `transient` |
 | `unavailable` | the request **provably was not sent** (connection refused, no session) | retried with backoff within the deadline; otherwise as `transient` |
 | `failed` | the effect reported an error result | returned to the caller |
+| `indeterminate` | the request may have been applied and its outcome cannot be established | blocks the step (below) |
 
 A dropped connection does not prove a request was not executed: unless the provider can show it
 was never sent, it is `transient`, and only repeated when the policy allows it.
+
+**Keyed calls and the call journal.** A `deduplicated` call carries a logical identity: a name
+the agent gives the call (`ctx.call(effect, ..., call_name="charge")`), stable when the state
+runs again, or an explicit `idempotency_key`; the agentic loop names each tool call by its
+committed tool-call id. Identities are never derived from the order of calls. Before the first
+send, the identity is journaled in the state store with the request digest (binding, operation,
+arguments, workspace and authorized scope); the same identity with another request, or another
+agent, is refused before anything is sent, also after a restart.
+
+**Unknown outcomes.** When a keyed call's outcome cannot be established (the provider says so,
+or the request may have been applied and no answer came after the policy's attempts), the call is
+`indeterminate`: no further call is made in that step, the step faults even if the state caught
+the error, the journal keeps the call across restarts, and while it is unresolved a new identity
+for the same effect is refused. CONT settles it without replay: a deduplicated provider gets the
+same key again (it applies a key once), a provider that declares `reconcile` is asked what became
+of it, and otherwise only an operator settles it (`runtime.resolve_call(key, "completed",
+result=...)`, `"failed"`, or `"replay"` for exactly one new send). `non_repeatable` calls are
+refused: a side effect is made safe by a provider that applies a key once or can reconcile.
 
 ### 7.4 Providers
 
@@ -343,8 +362,26 @@ class EffectProvider(Protocol):
     async def close(self) -> None: ...                           # release connections
 ```
 
-`EffectContext` carries the root (the session), the agent, the step, the effect key, the deadline
-and a cancellation signal. Providers must be safe for concurrent `invoke` calls up to their
+`EffectContext` (in `statecraft/ports/effects.py`, the port providers import instead of the
+runtime) carries the root (the session), the agent, the step, the effect key, the deadline, the
+attempt, the **authorized scope** (the workspace, the shared folder's mode, the agent's private
+folder: computed by the runtime from grants and attachment, never by a model) and `work`.
+
+A provider declares the optional contracts it implements (`capabilities`): `deduplicated`,
+`reconcile` (`reconcile(operation, key, context) -> Reconciled`: completed, failed, running,
+absent or unknown, with a reason), `remote_work`, `tree_termination` (cancellation ends every
+process the work started, not only the call's own) and `shared_capacity`; and where its
+`concurrency` holds (`capacity_scope`: `process`, the runtime's own slots, by default; `shared`,
+the provider's store across processes; `backend`). Undeclared capabilities are not assumed;
+unknown names are refused at start. A provider may also take `bind(view)`: a read-only view of
+agents' status, to clean up what it holds for agents that ended and to reconcile after a restart.
+
+Conformance suites are public testing API: `statecraft.testing.effect_contract` (a baseline for
+every provider and a test group per declared capability), `store_contract` and
+`workspace_contract`. A provider package defines one fixture and imports the suite.
+`statecraft.testing.local_shell` is the reference shell provider (no isolation): durable receipts
+outside the workspaces, one execution per key, reconcile, process-group cancellation that holds
+capacity until the group is gone. Providers must be safe for concurrent `invoke` calls up to their
 declared `concurrency`, and must honour cancellation. Work a provider starts but cannot stop (a
 thread, a process, a request it cannot withdraw) goes into `context.work`: the effect manager
 then keeps the call's capacity slot, and makes a retry wait, until that work really ends. The

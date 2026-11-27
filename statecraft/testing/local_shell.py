@@ -9,7 +9,8 @@ the same contract and adds isolation.
     registrar.tools.register(EffectDefinition(name="sh.exec", provider="sh", operation="exec",
         policy=EffectPolicy(kind="deduplicated", timeout=600)))
 
-Contract (declared capabilities: deduplicated, reconcile, remote_work):
+Contract (declared capabilities: deduplicated, reconcile, remote_work; not tree_termination: a
+process that leaves the command's process group, `setsid`, is not ended with it):
   * one key, one execution: the receipt folder of a key is created atomically (`mkdir`), so two
     executors, or a call and its retry, never start a key twice; the same key with another
     command is refused;
@@ -215,7 +216,11 @@ class LocalShell:
             return Reconciled("absent")
         if state == "running":
             return Reconciled("running", work=asyncio.ensure_future(self._ended(folder)))
-        return Reconciled("unknown")
+        if (folder / "cancelled").exists():
+            return Reconciled(
+                "unknown", reason="cancelled midway; it may have done part of its work"
+            )
+        return Reconciled("unknown", reason="its process is gone without an exit code")
 
     async def close(self) -> None:
         for proc in list(self._children.values()):

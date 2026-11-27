@@ -734,6 +734,18 @@ Isolation and accounting:
 44. A cancelled or timed-out thread call keeps its slot until the thread ends; the retry waits.
 45. A symbolic link swapped in while a path is opened is refused.
 
+Keyed effects:
+46. The same call identity with a different request is refused, also after a restart.
+47. An unknown outcome faults the step even when the state caught the error, and no further call
+    is made in that step.
+48. A new identity is refused while an earlier call to the same effect is unresolved.
+49. CONT settles an unknown outcome without replay (same key to a deduplicated provider, or
+    reconcile); only an operator allows a replay.
+50. A rerun state gets a completed command's recorded result; a command killed by its timeout is
+    never run again by CONT.
+51. Capacity held by a cancelled command returns only after its process group is gone.
+52. An edit made against a committed digest is applied once and refused after a concurrent change.
+
 Three levels of tests: **pure kernel** (record in, record out), **store contract** (the same
 suite for the memory and SQLite stores: atomicity, leases, fencing), **crash integration** (a
 subprocess killed with `SIGKILL`, then recovery from the SQLite file and the workspace alone;

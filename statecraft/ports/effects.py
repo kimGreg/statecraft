@@ -23,8 +23,13 @@ from ..kernel.effects import EffectError
 #: applied once per key. `reconcile`: `reconcile(operation, key, context)` tells the outcome of
 #: a keyed request sent before (a restart, a lost answer) without sending it again.
 #: `remote_work`: work that outlives a cancelled call is registered in `context.work` until it
-#: is confirmed ended. `shared_capacity`: `concurrency` holds across processes and hosts.
-CAPABILITIES = frozenset({"deduplicated", "reconcile", "remote_work", "shared_capacity"})
+#: is confirmed ended. `tree_termination`: that confirmation covers every process the work
+#: started, not only the one the call ran (without it, a process that left its group or session
+#: may outlive the call; only destroying the sandbox ends it). `shared_capacity`: `concurrency`
+#: holds across processes and hosts.
+CAPABILITIES = frozenset(
+    {"deduplicated", "reconcile", "remote_work", "tree_termination", "shared_capacity"}
+)
 
 #: `process`: the runtime's slots, per runtime process (the default). `shared`: the provider
 #: enforces its limit across processes (its own store). `backend`: the backend enforces it.
@@ -61,12 +66,14 @@ class Reconciled:
     """The outcome of a keyed request sent before. `status`: `completed` (with `result`),
     `failed` (with `error`, an EffectError that was definitely not applied or definitely
     failed), `running` (`work` ends when it does), `absent` (never received: safe to send),
-    `unknown` (cannot be established)."""
+    `unknown` (cannot be established: it was cancelled midway, the backend lost its record, the
+    submission's answer was lost before its id was kept). `reason` says why, for people."""
 
     status: str
     result: Any = None
     error: EffectError | None = None
     work: asyncio.Future[Any] | None = None
+    reason: str = ""
 
 
 class RuntimeView(Protocol):
