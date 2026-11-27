@@ -159,14 +159,25 @@ const VIEW_COLOR = { succeeded: "#1f9d55", running: "#3559e0", suspended: "#c98a
 // ---- overview ------------------------------------------------------------------------------
 async function showOverview() {
   const main = current;
-  const [o, runs] = await Promise.all([api("/api/overview"), api("/api/runs")]);
+  const [o, runs, health] = await Promise.all([api("/api/overview"), api("/api/runs"), api("/api/health")]);
   $("#title").textContent = o.title;
   const card = (n, label) => h("div", { class: "card" }, h("div", { class: "n" }, n), h("div", { class: "dim" }, label));
   const feed = h("div", { class: "events", id: "feed" });
   fill(main, 
     h("div", { class: "grid cards" }, card(o.features, "features"), card(o.agents, "agents"),
       card(o.servers.length, "tool servers"), card(o.runs, "runs"), card(o.active, "active runs"),
-      card(o.questions, "open questions")),
+      card(o.questions, "open questions"), card(health.faults.length, "faulted agents"),
+      card(health.indeterminate_calls, "unknown outcomes"), card(health.undelivered_messages, "undelivered"),
+      card(health.maintenance ? "on" : "off", "maintenance")),
+    health.faults.length ? h("div", { class: "panel", style: "margin-top: 14px" }, h("h2", {}, "Faults"),
+      h("table", {}, h("tr", {}, h("th", {}, "agent"), h("th", {}, "state"), h("th", {}, "error"), h("th", {}, "calls")),
+        health.faults.map((f) => h("tr", { class: "clickable", onclick: () => (location.hash = `#/runs/${encodeURIComponent(f.root)}`) },
+          h("td", {}, h("code", {}, f.agent)), h("td", {}, h("code", {}, f.state)),
+          h("td", { class: "v-terminated" }, (f.error || "").slice(0, 160)),
+          h("td", {}, (f.crossings || []).map((c) => `${c.effect}${c.ok ? "" : " ✗"}`).join(", ")))))) : null,
+    Object.keys(health.capacity).length ? h("div", { class: "panel", style: "margin-top: 14px" }, h("h2", {}, "Capacity"),
+      h("table", {}, h("tr", {}, h("th", {}, "provider"), h("th", {}, "held"), h("th", {}, "limit"), h("th", {}, "lingering")),
+        Object.entries(health.capacity).map(([name, c]) => h("tr", {}, h("td", {}, name), h("td", {}, c.held), h("td", {}, c.limit), h("td", {}, c.lingering))))) : null,
     h("div", { class: "grid", style: "grid-template-columns: 1fr 1fr; margin-top: 14px" },
       h("div", { class: "panel" }, h("h2", {}, "Recent runs"), runsTable(runs.slice(-12).reverse())),
       h("div", { class: "panel" }, h("h2", {}, "Live events (all runs)"), feed)));
@@ -438,6 +449,21 @@ async function signal(agent, sig) {
   try { await post("/api/signals", { agent, signal: sig }); } catch (e) { alertBox(e.message); }
 }
 
+function callsTable(calls) {
+  return h("table", {}, h("tr", {}, h("th", {}, "call"), h("th", {}, "effect"), h("th", {}, "status"), h("th", {}, "")),
+    calls.map((c) => h("tr", {}, h("td", {}, h("code", {}, c.key)), h("td", {}, c.effect),
+      h("td", { class: c.status === "indeterminate" ? "v-terminated" : "" }, c.status,
+        c.clear_by ? ` · cleared by ${c.clear_by}` : "", c.generation ? ` · replay ${c.generation}` : ""),
+      h("td", {}, c.status === "indeterminate" && c.clear_by === "operator"
+        ? ["completed", "failed", "replay"].map((o) => h("button", { onclick: () => resolveCall(c.key, o) }, o)) : null))));
+}
+
+async function resolveCall(key, outcome) {
+  try { await post("/api/calls/resolve", { key, outcome }); }
+  catch (e) { alertBox(e.message); return; }
+  if (state.run) await drawAgent(state.run.side);
+}
+
 async function drawAgent(side) {
   const id = state.run.selected;
   let a;
@@ -460,7 +486,16 @@ async function drawAgent(side) {
         h("tr", {}, h("th", {}, "status"), h("td", {}, r.status), h("th", {}, "lease"), h("td", {}, a.lease ? `${a.lease.owner} · epoch ${a.lease.epoch}` : "—")),
         h("tr", {}, h("th", {}, "waits"), h("td", { colspan: 3 }, r.reasons.length ? h("pre", {}, pretty(r.reasons)) : "—")),
         r.error ? h("tr", {}, h("th", {}, "error"), h("td", { colspan: 3 }, h("pre", { class: "v-terminated" }, r.error))) : null,
-        h("tr", {}, h("th", {}, "published"), h("td", { colspan: 3 }, chips(Object.keys(r.published || {}))))),
+        h("tr", {}, h("th", {}, "published"), h("td", { colspan: 3 }, chips(Object.keys(r.published || {})))),
+        a.joins.length ? h("tr", {}, h("th", {}, "joins"), h("td", { colspan: 3 }, a.joins.map((j) =>
+          h("div", {}, h("code", {}, (j.children || []).join(", ")),
+            j.timeout != null || j.deadline != null ? ` · until ${j.deadline ?? j.timeout}` : "",
+            j.messages ? " · a message interrupts it" : "")))) : null,
+        a.intents.length ? h("tr", {}, h("th", {}, "pending"), h("td", { colspan: 3 }, a.intents.map((i) =>
+          h("div", {}, h("b", {}, i.kind), " ", h("code", {}, i.id))))) : null,
+        a.undelivered.length ? h("tr", {}, h("th", {}, "undelivered"), h("td", { colspan: 3 }, a.undelivered.map((u) =>
+          h("div", { class: "v-terminated" }, u.reason || "", " ", h("code", {}, JSON.stringify(u.message ?? u).slice(0, 120)))))) : null,
+        a.calls.length ? h("tr", {}, h("th", {}, "calls"), h("td", { colspan: 3 }, callsTable(a.calls))) : null),
         h("div", { class: "toolbar", style: "margin-top:8px" },
           ["STOP", "CONT", "TERM", "KILL"].map((s) => h("button", { class: s === "TERM" || s === "KILL" ? "danger" : "", onclick: () => signal(r.id, s) }, s))),
         agentDefinition(a.definition, walked));

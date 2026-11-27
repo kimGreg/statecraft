@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from ...kernel.process import Lease, Record
-from ...kernel.store import StateStore
+from ...kernel.store import COMPACTED, StateStore
 from ...kernel.transitions import has_work
 
 
@@ -60,6 +60,37 @@ class _Tables:
     def history_read(self, agent_id: str) -> list[dict[str, Any]]:
         return copy.deepcopy(self.s["history"].get(agent_id, []))
 
+    def history_trim(self, agent_id: str, revision: int, entry: dict[str, Any]) -> int:
+        entries = self.s["history"].get(agent_id, [])
+        self.s["history"][agent_id] = [{"revision": revision, **copy.deepcopy(entry)}]
+        return len(entries) - 1
+
+    def event_drop(self, root: str, seqs: list[int]) -> None:
+        gone = set(seqs)
+        self.s["events"][root] = [e for e in self.s["events"].get(root, []) if e["seq"] not in gone]
+
+    def inbox_compact(self, agent_id: str, upto: int) -> int:
+        n = 0
+        for m in self.s["inbox"].get(agent_id, []):
+            if m["n"] <= upto and m["message"] != COMPACTED:
+                m["message"] = dict(COMPACTED)
+                n += 1
+        return n
+
+    def forget(self, agent_ids: list[str], root: str) -> None:
+        for table in ("agents", "leases", "inbox", "history"):
+            for agent_id in agent_ids:
+                self.s[table].pop(agent_id, None)
+        gone = set(agent_ids)
+        self.s["calls"] = {k: e for k, e in self.s["calls"].items() if e["agent"] not in gone}
+        self.s["events"].pop(root, None)
+
+    def setting_get(self, name: str) -> Any:
+        return copy.deepcopy(self.s["settings"].get(name))
+
+    def setting_put(self, name: str, value: Any) -> None:
+        self.s["settings"][name] = copy.deepcopy(value)
+
     def tree_ids(self, root: str) -> list[str]:
         return sorted(i for i in self.s["agents"] if i == root or i.startswith(root + "/"))
 
@@ -93,6 +124,7 @@ class MemoryStore(StateStore):
             "events": {},
             "history": {},
             "calls": {},
+            "settings": {},
         }
         self._lock = threading.RLock()
 

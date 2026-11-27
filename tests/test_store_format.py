@@ -1,7 +1,7 @@
 """The store's data format is versioned, and an old one is migrated explicitly (roadmap C1).
 
 What must hold
-  * a new SQLite store records its format; this statecraft reads format 2;
+  * a new SQLite store records its format; this statecraft reads format 3;
   * a statecraft 0.2 store (format 1, written by its schema) is refused with what to do; after
     `statecraft store migrate` (which backs it up first) it opens, its records load as they were,
     and the call journal works;
@@ -54,7 +54,7 @@ def store_0_2(path: Path) -> Record:
 
 async def test_a_new_store_records_its_format(tmp_path: Path) -> None:
     SqliteStore(tmp_path / "new.db").close()
-    assert FORMAT == 2 and check(tmp_path / "new.db")["format"] == 2
+    assert FORMAT == 3 and check(tmp_path / "new.db")["format"] == 3
 
 
 async def test_an_old_store_is_refused_then_migrated(tmp_path: Path) -> None:
@@ -65,11 +65,11 @@ async def test_an_old_store_is_refused_then_migrated(tmp_path: Path) -> None:
     assert check(path) == {
         "path": str(path),
         "format": 1,
-        "reads": 2,
+        "reads": 3,
         "ok": False,
         "action": "migrate",
     }
-    assert migrate(path) == (1, 2)
+    assert migrate(path) == (1, 3)
     assert (tmp_path / "old.db.format-1.bak").exists()
     store = SqliteStore(path)
     loaded = await store.load("old")
@@ -97,4 +97,4 @@ def test_the_cli_checks_and_migrates(tmp_path: Path, capsys) -> None:
     assert cli(["store", "check", "--config", str(config)]) == 1
     assert cli(["store", "migrate", "--config", str(config)]) == 0
     assert cli(["store", "check", "--config", str(config)]) == 0
-    assert '"format": 2' in capsys.readouterr().out
+    assert '"format": 3' in capsys.readouterr().out

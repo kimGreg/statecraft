@@ -14,6 +14,10 @@ GET  /questions                             open questions
 POST /questions/{id}/answer                 {"answer", "by"?}
 GET  /agents/{id}/calls                     the agent's journaled calls
 POST /calls/{key}/resolve                   {"outcome": completed|failed|replay, "result"?}
+GET  /faults                                agents suspended by a fault, with their calls
+GET  /metrics                               Prometheus text (?format=json: the same as JSON)
+GET  /maintenance | POST /maintenance       {"on": bool}: no new steps start (admin to change)
+GET  /health                                {"ok", "started"}: served without a token
 GET  /registry/agents | /registry/tools | /registry/providers
 
 Every request passes the guard (`guard.py`): same-origin, JSON bodies, loopback names unless a
@@ -32,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -44,6 +49,7 @@ from starlette.routing import Route
 from ..kernel.store import Ended
 from ..kernel.transitions import InvalidAnswer
 from ..providers.workspaces import Escape
+from ..runtime import operate
 from ..runtime.runtime import Runtime, agent_of_question
 from .guard import Guard
 from .tokens import OPERATOR, Principal, TokenBook
@@ -357,6 +363,32 @@ def server_app(
             return _json({"error": str(exc)}, 409)
         return _json(settled)
 
+    async def faults(request: Request) -> Response:
+        principal = principal_of(request)
+        return _json([f for f in await runtime.faults() if principal.owns(f["root"])])
+
+    async def metrics(request: Request) -> Response:
+        found = await runtime.metrics()
+        if request.query_params.get("format") == "json":
+            return _json(found)
+        return Response(operate.prometheus(found), media_type="text/plain; version=0.0.4")
+
+    async def maintenance(request: Request) -> Response:
+        if request.method == "GET":
+            return _json({"on": await runtime.maintenance()})
+        principal = must_allow(request, "admin")
+        on = (await read_body(request)).get("on")
+        if not isinstance(on, bool):
+            raise BadRequest("'on' must be true or false")
+        changed = await runtime.maintenance(on)
+        logging.getLogger("statecraft.server").warning(
+            "maintenance %s by %s", "on" if on else "off", principal.name
+        )
+        return _json({"on": changed})
+
+    async def health(request: Request) -> Response:
+        return _json({"ok": True, "started": runtime.started})
+
     async def agents(request: Request) -> Response:
         return _json(runtime.agents())
 
@@ -392,6 +424,10 @@ def server_app(
             Route("/questions", questions),
             Route("/questions/{id:path}/answer", answer, methods=["POST"]),
             Route("/calls/{key:path}/resolve", resolve, methods=["POST"]),
+            Route("/faults", faults),
+            Route("/metrics", metrics),
+            Route("/maintenance", maintenance, methods=["GET", "POST"]),
+            Route("/health", health),
             Route("/registry/agents", agents),
             Route("/registry/tools", tools),
             Route("/registry/providers", providers),

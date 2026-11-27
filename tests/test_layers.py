@@ -37,7 +37,7 @@ EXTENSIONS = {
     "statecraft_console",
     "statecraft_opensandbox",
 }
-IMPORT_NAMES = {"pyyaml": "yaml"}
+IMPORT_NAMES = {"pyyaml": "yaml", "opentelemetry-api": "opentelemetry"}
 
 
 def modules() -> list[tuple[str, Path]]:

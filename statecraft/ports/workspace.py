@@ -20,8 +20,9 @@ class Files(Protocol):
 
 class WorkspaceProvider(Protocol):
     """A provider may declare `capabilities`: `mountable` (it has `host_path(workspace_id,
-    relative) -> str`, a host folder a sandbox can mount) and `internal_links` (reads follow
-    links that stay within their area)."""
+    relative) -> str`, a host folder a sandbox can mount), `internal_links` (reads follow
+    links that stay within their area) and `collectable` (its files also have `remove(path)`,
+    `modified(path)` and `prune(prefix)`: what garbage collection needs)."""
 
     async def open(self, workspace_id: str) -> Files: ...
     async def close(self) -> None: ...

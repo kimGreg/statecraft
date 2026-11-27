@@ -602,6 +602,8 @@ GET  /agents/{id}/history         its committed steps
 GET  /agents/{id}/events          server-sent events from the durable log, resumable
 POST /agents/{id}/signals         STOP | CONT | TERM | KILL | USR
 POST /questions/{id}/answer       answer a waiting question
+GET  /agents/{id}/calls           its journaled calls; POST /calls/{key}/resolve (admin)
+GET  /faults | /metrics | /health | /maintenance (POST: admin)
 GET  /registry/agents | /registry/tools | /registry/providers
 ```
 
@@ -746,7 +748,24 @@ duration, wait for capacity, attempts, failure class, effect key, and usage when
 reports it. Crossings are committed with the step in its history entry; a step that does not
 commit leaves its crossings in a per-attempt diagnostic area for recovery tooling. Payloads are
 referenced, not copied. Extensions add observation hooks without the kernel understanding them.
-An OpenTelemetry exporter is optional.
+
+Tracing uses the OpenTelemetry API only (`statecraft[otel]`): a `statecraft.step` span per step
+(agent, root, state, step, outcome, error) and a `statecraft.effect` span per call inside it,
+timed from its crossing; without an SDK configured by the application they cost nothing.
+Arguments, results and credentials are never span attributes. `runtime.metrics()` and
+`GET /metrics` (Prometheus text) count agents by view, unknown outcomes, undelivered messages
+and maintenance mode across the store, and this process's running steps, executor failures,
+effect calls, failures, retries, capacity waits and capacity held. `GET /health` answers without
+a token and says nothing about runs. Executor log records carry `agent` and `root`.
+
+Recovery tooling: `runtime.faults()` (`GET /faults`, `statecraft faults`) lists every agent
+suspended by a fault with its error, the failing state and step and the calls of the failing
+attempt; `statecraft repin ID`, `calls ID` and `resolve KEY completed|failed|replay` act on one;
+maintenance mode (`runtime.maintenance(True)`, `statecraft maintenance on`, admin over HTTP) is
+store-wide: running steps finish, no new step starts, signals, answers and intents are still
+applied. The console shows faults, unknown outcomes, undelivered messages, maintenance and
+capacity on its overview, and an agent's pending intents (`init` included), undelivered messages,
+joins and journaled calls, where an operator with `admin` settles an unknown outcome.
 
 ## 15. Security and trust
 
@@ -936,5 +955,6 @@ Where the implementation settles details this design left open:
 | message accounting | every message accepted into an inbox ends in exactly one place: applied (a USR message in the mailbox until a step commits past it), or `undelivered` with a reason (arrived as it ended, was killed, could not be applied). "Refused" means not accepted: the caller is told and nothing is stored |
 | root creation | `spawn` reserves the id (create-only), creates the record with an `init` intent, prepares the workspace and writes the input (both idempotent), then marks the intent done; a crash in between is finished by the next executor, and a spawn whose root an executor activated first still succeeds. A workspace that cannot be prepared faults the root; CONT tries again. Root ids are one path segment and may not be the workspace's top-level folder names (`home`, `shared`, `run`, ...) |
 | store | every operation is one transaction (`transaction(write=)`); values are normalized to JSON before they are stored, so the memory and SQLite stores keep the same data (`NotJSON` otherwise). SQLite: one thread owns each connection (never the event loop), `BEGIN IMMEDIATE` for writes, WAL, `busy_timeout`; a lock held past it is `Unavailable` (transient), and several processes may share one file. PostgreSQL is a separate provider, later |
-| store format | the SQLite store records its data format (`meta.format`; 1 is statecraft 0.2, 2 adds the call journal). A store with an older format is refused until it is migrated (`statecraft store migrate --config ...`, which backs the file up first); a newer one is refused (upgrade statecraft); `statecraft store check` says which. The record, history entry and event shapes are part of the format: changing them is a new format with a migration and a test from every released format |
+| storage growth | history keeps a full record every 32 revisions and a structural delta in between (a growing list costs its new items), so a run's history is linear in what it did; measured: a 300-turn conversation keeps 0.79 MB of history instead of about 19 MB of snapshots. `runtime.compact(root)` keeps only the bodies of unapplied messages and, once the run has ended, each agent's final record, its last event and every audit event; `runtime.forget(root, files=True)` deletes an ended run nobody reads. `runtime.collect()` (dry by default) removes staging of committed steps and of ended agents, and objects no committed reference names (record and retained history) once older than a grace period, each agent swept while collection holds its lease; CLI `statecraft store collect\|compact\|forget` |
+| store format | the SQLite store records its data format (`meta.format`; 1 is statecraft 0.2, 2 adds the call journal, 3 history deltas and compacted inbox messages). A store with an older format is refused until it is migrated (`statecraft store migrate --config ...`, which backs the file up first); a newer one is refused (upgrade statecraft); `statecraft store check` says which. The record, history entry and event shapes are part of the format: changing them is a new format with a migration and a test from every released format |
 | children as processes | `ctx.children_view()` gives each child's phase (running, waiting, faulted, stopped, ended), state, step, publications, error and open question; the agentic loop offers it to models as `list_agents`/`inspect_agent`, with `join_agents` and `signal_agent` |

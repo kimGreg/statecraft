@@ -18,6 +18,8 @@ POST /api/runs                          {"agent", "input"?, "root"?} spawn a roo
 POST /api/answers                       {"question_id", "answer"}
 POST /api/signals                       {"agent", "signal", "message"?}
 POST /api/agents/{id}/repin             accept the current definition and tools
+GET  /api/health                        faults, unknown outcomes, maintenance, capacity
+POST /api/calls/resolve                 {"key", "outcome", "result"?} (admin)
 
 With named tokens (`statecraft.server.tokens`), the page acts as the signed-in principal: it sees
 the runs that principal may touch, and every change it makes is audited in the run's event log.
@@ -47,6 +49,7 @@ from statecraft.server.app import (
     BadRequest,
     Forbidden,
     forbidden,
+    must_allow,
     must_own,
     optional_field,
     principal_of,
@@ -113,6 +116,38 @@ def console_app(
                 "servers": [p["name"] for p in runtime.providers()],
             }
         )
+
+    async def health(request: Request) -> Response:
+        principal = principal_of(request)
+        found = await runtime.metrics()
+        return _json(
+            {
+                "faults": [f for f in await runtime.faults() if principal.owns(f["root"])],
+                "indeterminate_calls": found["indeterminate_calls"],
+                "undelivered_messages": found["undelivered_messages"],
+                "maintenance": found["maintenance"],
+                "capacity": found["process"]["capacity"],
+                "effects": found["process"]["effects"],
+            }
+        )
+
+    async def resolve(request: Request) -> Response:
+        principal = must_allow(request, "admin")
+        body = await read_body(request)
+        key, outcome = body.get("key"), body.get("outcome")
+        if not isinstance(key, str) or not isinstance(outcome, str):
+            raise BadRequest('expected {"key", "outcome", "result"?}')
+        entry = await runtime.store.call(key)
+        if entry is None:
+            return _json({"error": f"no call {key}"}, 404)
+        must_own(request, entry["agent"])
+        try:
+            settled = await runtime.resolve_call(
+                key, outcome, result=body.get("result"), by=principal.name
+            )
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 409)
+        return _json(settled)
 
     async def registry(request: Request) -> Response:
         return _json(model.registry(runtime))
@@ -274,6 +309,8 @@ def console_app(
         routes=[
             Route("/", page),
             Route("/api/overview", overview),
+            Route("/api/health", health),
+            Route("/api/calls/resolve", resolve, methods=["POST"]),
             Route("/api/registry", registry),
             Route("/api/graph", graph),
             Route("/api/servers", server_list),

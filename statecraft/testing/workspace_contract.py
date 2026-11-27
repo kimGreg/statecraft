@@ -108,7 +108,23 @@ async def test_internal_links_stay_within_their_area(workspace) -> None:
         await files.get("shared/peek.txt")
 
 
+async def test_a_collectable_workspace_removes_ages_and_prunes(workspace) -> None:
+    workspace = _provider(workspace, "collectable")
+    files = await workspace.open("cw")
+    await files.put("home/a/staging/1/1/x.txt", b"x")
+    await files.put("home/a/staging/2/1/y.txt", b"y")
+    assert await files.modified("home/a/staging/1/1/x.txt") > 0
+    assert await files.remove("home/a/staging/1/1/x.txt") is True
+    assert await files.remove("home/a/staging/1/1/x.txt") is False
+    assert not await files.exists("home/a/staging/1/1/x.txt")
+    await files.prune("home/a/staging")
+    assert await files.list("home/a/staging") == ["home/a/staging/2/1/y.txt"]
+    with pytest.raises(FileNotFoundError):
+        await files.modified("home/a/gone.txt")
+
+
 __all__ = [
+    "test_a_collectable_workspace_removes_ages_and_prunes",
     "test_a_missing_file_is_not_found",
     "test_a_mountable_workspace_hands_out_the_same_files",
     "test_concurrent_creates_have_one_winner",

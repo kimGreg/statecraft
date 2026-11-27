@@ -22,8 +22,9 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Any, Protocol, TypeVar
 
+from .delta import diff, patch
 from .process import Fault, Lease, Record, Transition
-from .transitions import apply_outcome, apply_signal, undeliver
+from .transitions import apply_outcome, apply_signal, has_work, undeliver
 
 T = TypeVar("T")
 
@@ -108,6 +109,37 @@ class Tables(Protocol):
     def call_get(self, key: str) -> dict[str, Any] | None: ...
     def call_put(self, key: str, agent_id: str, entry: dict[str, Any]) -> None: ...
     def calls_of(self, agent_id: str) -> list[dict[str, Any]]: ...
+    # storage upkeep (C2)
+    def history_trim(self, agent_id: str, revision: int, entry: dict[str, Any]) -> int: ...
+    def event_drop(self, root: str, seqs: list[int]) -> None: ...
+    def inbox_compact(self, agent_id: str, upto: int) -> int: ...
+    def forget(self, agent_ids: list[str], root: str) -> None: ...
+    # store-wide settings that every executor reads (maintenance mode)
+    def setting_get(self, name: str) -> Any: ...
+    def setting_put(self, name: str, value: Any) -> None: ...
+
+
+#: History keeps a full record every CHECKPOINT revisions and a delta from the previous revision
+#: in between (`delta.py`); reading reconstructs every entry's record.
+CHECKPOINT = 32
+#: What an applied inbox message is compacted to: its id and position stay (a message sent again
+#: with the same id is still refused), its body goes.
+COMPACTED = {"kind": "compacted"}
+
+
+def expand(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """History entries with each entry's full record, from checkpoints and deltas."""
+    record: Any = None
+    found = []
+    for entry in entries:
+        if "record" in entry:
+            record = entry["record"]
+        else:
+            entry = dict(entry)
+            record = patch(record, entry.pop("delta"))
+            entry["record"] = record
+        found.append(entry)
+    return found
 
 
 def _payload(message: Any) -> Any:
@@ -184,7 +216,7 @@ class StateStore:
         return await self._txn(lambda t: t.event_read(root, after_seq), write=False)
 
     async def history(self, agent_id: str) -> list[dict[str, Any]]:
-        return await self._txn(lambda t: t.history_read(agent_id), write=False)
+        return expand(await self._txn(lambda t: t.history_read(agent_id), write=False))
 
     # ---- writes ------------------------------------------------------------------------------
 
@@ -222,7 +254,11 @@ class StateStore:
             }
             after = after.but(published=stamped)
         t.put(after)
-        entry: dict[str, Any] = {"kind": kind, "record": after.to_dict()}
+        entry: dict[str, Any] = {"kind": kind}
+        if before is None or after.revision % CHECKPOINT == 1:
+            entry["record"] = after.to_dict()
+        else:  # `before` is what the previous entry recorded: every record write goes through here
+            entry["delta"] = diff(before.to_dict(), after.to_dict())
         if detail:  # why (a rejected message, the signal applied, the intent carried out)
             entry["detail"] = dict(detail)
         if crossings:
@@ -453,9 +489,90 @@ class StateStore:
 
         return await self._txn(body)
 
+    # ---- store-wide settings ------------------------------------------------------------------
+    async def setting(self, name: str) -> Any:
+        """A store-wide setting (None when unset), seen by every process on this store."""
+        return await self._txn(lambda t: t.setting_get(name), write=False)
+
+    async def set_setting(self, name: str, value: Any) -> None:
+        value = jsonable(value)
+        await self._txn(lambda t: t.setting_put(name, value))
+
+    # ---- storage upkeep (C2): compacting and forgetting ended runs -----------------------------
+    async def compact(self, root: str, *, dry_run: bool = False) -> dict[str, int]:
+        """Make a run smaller without changing what it is. Always: applied inbox messages keep
+        only their id. Once every agent of the run has ended with no work left: each agent's
+        history becomes its last entry (a full record), and its events become the last event of
+        each agent and every `audit` event. Returns what was (or, dry, would be) removed."""
+
+        def body(t: Tables) -> dict[str, int]:
+            ids = t.tree_ids(root)
+            if not ids:
+                raise KeyError(root)
+            records = [r for r in (t.get(i) for i in ids) if r is not None]
+            done = {"inbox": 0, "history": 0, "events": 0}
+            for record in records:
+                applied = [
+                    m
+                    for m in t.inbox_read(record.id, 0)
+                    if m["n"] <= record.inbox_applied and m["message"] != COMPACTED
+                ]
+                done["inbox"] += len(applied)
+                if applied and not dry_run:
+                    t.inbox_compact(record.id, record.inbox_applied)
+            if not all(r.ended and not has_work(r) for r in records):
+                return done
+            for record in records:
+                entries = expand(t.history_read(record.id))
+                if len(entries) > 1:
+                    done["history"] += len(entries) - 1
+                    if not dry_run:
+                        last = entries[-1]
+                        t.history_trim(record.id, last["revision"], _without_revision(last))
+            events = t.event_read(root, 0)
+            last_of = {e.get("agent"): e["seq"] for e in events if e.get("kind") != "audit"}
+            keep = set(last_of.values()) | {e["seq"] for e in events if e.get("kind") == "audit"}
+            dropped = [e["seq"] for e in events if e["seq"] not in keep]
+            done["events"] = len(dropped)
+            if dropped and not dry_run:
+                t.event_drop(root, dropped)
+            return done
+
+        return await self._txn(body, write=not dry_run)
+
+    async def forget(self, root: str, *, dry_run: bool = False) -> dict[str, int]:
+        """Delete a run whose agents have all ended with no work left: records, leases, inbox,
+        history, calls and events. Refused (`Busy`) for a run still at work, and for a run another
+        run inherits from or works attached to (it still reads it)."""
+
+        def body(t: Tables) -> dict[str, int]:
+            ids = t.tree_ids(root)
+            if not ids:
+                raise KeyError(root)
+            records = [r for r in (t.get(i) for i in ids) if r is not None]
+            if not all(r.ended and not has_work(r) for r in records):
+                raise Busy(f"{root} is still at work; it can be forgotten once it has ended")
+            for other_id in t.root_ids():
+                other = t.get(other_id)
+                if other is None or other_id == root:
+                    continue
+                if other.workspace == root or (other.inherits or {}).get("root") == root:
+                    raise Busy(f"{other_id} reads {root}; forget {other_id} first")
+            if not dry_run:
+                t.forget(ids, root)
+            return {"agents": len(ids)}
+
+        return await self._txn(body, write=not dry_run)
+
+
+def _without_revision(entry: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in entry.items() if k != "revision"}
+
 
 __all__ = [
     "CALL_STATES",
+    "CHECKPOINT",
+    "COMPACTED",
     "Busy",
     "CallRefused",
     "Conflict",
@@ -468,6 +585,7 @@ __all__ = [
     "Tables",
     "Unavailable",
     "Unread",
+    "expand",
     "jsonable",
     "root_of",
 ]

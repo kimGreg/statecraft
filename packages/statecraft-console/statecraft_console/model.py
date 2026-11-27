@@ -203,6 +203,7 @@ async def agent(runtime: Any, agent_id: str) -> dict[str, Any]:
     name = (got.get("definition") or {}).get("name") or got["agent"]
     if name in runtime.registry.agents:
         definition = describe(runtime, name)
+    record = await runtime.store.load(agent_id)
     return {
         "record": _jsonable(got),
         "data": _jsonable(data),
@@ -210,6 +211,11 @@ async def agent(runtime: Any, agent_id: str) -> dict[str, Any]:
         "path": _jsonable(path),
         "lease": got.get("lease"),
         "definition": definition,
+        # lifecycle and diagnostics (D3): what is pending, what never arrived, what is unknown
+        "intents": _jsonable([i for i in record.intents if not i.get("done")]),
+        "undelivered": _jsonable(record.undelivered),
+        "joins": _jsonable([r for r in record.reasons if r.get("kind") == "join"]),
+        "calls": _jsonable(await runtime.calls(agent_id)),
     }
 
 

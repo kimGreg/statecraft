@@ -21,6 +21,7 @@ import jsonschema
 from ..kernel.effects import EffectError, digest_of, may_retry
 from ..kernel.store import CallRefused, StateStore
 from ..ports.effects import EffectContext, Reconciled
+from . import telemetry
 
 if TYPE_CHECKING:
     from .context import StepContext
@@ -55,6 +56,23 @@ class EffectManager:
         self._capacity: dict[str, asyncio.Semaphore] = {}
         #: waiters that release capacity once work a cancelled call could not stop has ended
         self._lingering: set[asyncio.Task[None]] = set()
+        #: an OpenTelemetry tracer (set by the runtime) for a span per call
+        self.tracer: Any = None
+        #: process counters since start (metrics): calls, failures, retries, capacity waits
+        self.counters = {"calls": 0, "failures": 0, "retries": 0, "capacity_waits": 0}
+        self._limits: dict[str, int] = {}
+
+    def capacity(self) -> dict[str, dict[str, int]]:
+        """Each limited provider's slots: its limit and how many are held (by calls, and by
+        work a cancelled call could not stop); and how many such lingering waits there are."""
+        return {
+            name: {
+                "limit": self._limits[name],
+                "held": self._limits[name] - slots._value,
+                "lingering": len(self._lingering),
+            }
+            for name, slots in self._capacity.items()
+        }
 
     def _release_after(self, context: EffectContext, slots: asyncio.Semaphore | None) -> None:
         """Release the call's capacity now, or when the work it started ends."""
@@ -81,6 +99,7 @@ class EffectManager:
             return None
         if provider_name not in self._capacity:
             self._capacity[provider_name] = asyncio.Semaphore(int(limit))
+            self._limits[provider_name] = int(limit)
         return self._capacity[provider_name]
 
     async def call(
@@ -176,6 +195,8 @@ class EffectManager:
             try:
                 waited = time.monotonic()
                 if slots is not None:
+                    if slots.locked():
+                        self.counters["capacity_waits"] += 1
                     await slots.acquire()
                 crossing["waited"] = round(crossing.get("waited", 0) + time.monotonic() - waited, 4)
                 try:
@@ -201,6 +222,7 @@ class EffectManager:
                 failure = EffectError("transient", f"{type(exc).__name__}: {exc}", effect=name)
             if not may_retry(policy, failure, keyed=bool(key), attempt=attempt):
                 raise failure
+            self.counters["retries"] += 1
             await asyncio.sleep(min(self.backoff * 2 ** (attempt - 1), 2.0))
 
     async def _settle_earlier(
@@ -303,6 +325,8 @@ class EffectManager:
             if found.status == "running" and found.work is not None:
                 # a running execution holds capacity like a new one, until it really ended
                 if slots is not None:
+                    if slots.locked():
+                        self.counters["capacity_waits"] += 1
                     await slots.acquire()
                 try:
                     await asyncio.wait_for(asyncio.shield(found.work), definition.policy.timeout)
@@ -477,10 +501,13 @@ class EffectManager:
             return result
         except EffectError as exc:
             crossing.update(failure=exc.cls, error=exc.message[:300])
+            self.counters["failures"] += 1
             raise
         finally:
             crossing["duration"] = round(time.monotonic() - started, 4)
             ctx.effects.crossings.append(crossing)
+            self.counters["calls"] += 1
+            telemetry.effect_span(self.tracer, crossing)
 
 
 def _structured(result: Any) -> Any:

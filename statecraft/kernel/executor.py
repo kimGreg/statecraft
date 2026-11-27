@@ -59,6 +59,11 @@ FAILURES_KEPT = 100
 log = logging.getLogger("statecraft.executor")
 
 
+def _ids(agent_id: str) -> dict[str, str]:
+    """Structured fields of a log record about an agent (`record.agent`, `record.root`)."""
+    return {"agent": agent_id or "-", "root": (agent_id or "-").split("/")[0]}
+
+
 class Environment(Protocol):
     """What the executor needs from the runtime."""
 
@@ -109,6 +114,7 @@ class Executor:
         #: agent id -> (the state's work task, its lease) while a step holds a lease
         self._work: dict[str, tuple[asyncio.Task[Any], Lease]] = {}
         self.stopping = False
+        self.held = False
         self.peak = 0  # the most steps that ran at once (observability, tests)
         #: agents whose step this executor cancelled on purpose (KILL, lease loss, stop): any
         #: other cancellation of a step is the state's own, and a fault
@@ -168,13 +174,20 @@ class Executor:
         held = self._work.get(agent_id)
         if held is None:
             return False
-        log.info("%s: step cancelled (%s)", agent_id, reason)
+        log.info("%s: step cancelled (%s)", agent_id, reason, extra=_ids(agent_id))
         self._cancelled.add(agent_id)
         held[0].cancel()
         return True
 
     def _failed(self, agent_id: str, phase: str, exc: BaseException) -> None:
-        log.error("%s: %s failed: %s: %s", agent_id or "-", phase, type(exc).__name__, exc)
+        log.error(
+            "%s: %s failed: %s: %s",
+            agent_id or "-",
+            phase,
+            type(exc).__name__,
+            exc,
+            extra=_ids(agent_id),
+        )
         self.failures.append(
             {"agent": agent_id, "phase": phase, "error": f"{type(exc).__name__}: {exc}"[:500]}
         )
@@ -183,6 +196,9 @@ class Executor:
     async def tick(self) -> bool:
         """One pass over every record with work left. True if anything changed or started."""
         moved = False
+        #: maintenance mode (store-wide): messages, signals and intents are still applied,
+        #: running steps finish, no new step starts
+        self.held = bool(await self.store.setting("maintenance"))
         for record in await self.store.scan_work():
             if self.roots is not None and record.id.split("/")[0] not in self.roots:
                 continue
@@ -209,7 +225,7 @@ class Executor:
         record = await self._resolve(record)
         record = await self._carry_out(record)
         moved = record.revision != before
-        if not self.stopping and is_runnable(record, None, self.now()):
+        if not self.stopping and not self.held and is_runnable(record, None, self.now()):
             self._start(record)
             moved = True
         return moved
@@ -233,7 +249,13 @@ class Executor:
             if problem is None and record.ended:
                 problem = "arrived as it ended"
             if problem is not None:  # accepted, never received: accounted as undelivered
-                log.warning("%s: message %s undelivered: %s", record.id, item.get("id"), problem)
+                log.warning(
+                    "%s: message %s undelivered: %s",
+                    record.id,
+                    item.get("id"),
+                    problem,
+                    extra=_ids(record.id),
+                )
                 record = await self._control(
                     record,
                     lambda r, n=n, m=message, p=problem: undeliver(r, _payload(m), p, n),
@@ -253,7 +275,7 @@ class Executor:
                             by=message.get("by", "person"),
                         )
                     except InvalidAnswer as exc:
-                        log.warning("%s: answer dropped: %s", r.id, exc)
+                        log.warning("%s: answer dropped: %s", r.id, exc, extra=_ids(r.id))
                 elif message["kind"] == "repin":
                     r = r.but(definition=message["definition"], bindings=message["bindings"])
                 else:
@@ -300,7 +322,11 @@ class Executor:
         parent = await self.store.find(record.parent)
         if parent is not None and not parent.ended:
             return record  # its parent decides
-        log.warning("%s: cleanup faulted after its parent ended; ending it", record.id)
+        log.warning(
+            "%s: cleanup faulted after its parent ended; ending it",
+            record.id,
+            extra=_ids(record.id),
+        )
         return await self.store.kill(record.id)
 
     async def _child_view(self, child: Record, parent: Record) -> ChildView:
@@ -376,7 +402,7 @@ class Executor:
             detail: dict[str, Any] = {"intent": intent["id"]}
             if intent["kind"] == "signal" and target is None:
                 detail["outcome"] = f"no agent {intent['target']}: the signal was not delivered"
-                log.warning("%s: %s", record.id, detail["outcome"])
+                log.warning("%s: %s", record.id, detail["outcome"], extra=_ids(record.id))
             record = await self._control(
                 record, lambda r, i=intent["id"]: mark_intent_done(r, i), "intent", **detail
             )
@@ -433,7 +459,12 @@ class Executor:
                 if asyncio.current_task().cancelling():  # this executor is being cancelled
                     raise
                 if agent_id in self._cancelled:  # KILL, lease loss or stop: nothing committed
-                    log.warning("%s: step %d cancelled; nothing committed", agent_id, record.step)
+                    log.warning(
+                        "%s: step %d cancelled; nothing committed",
+                        agent_id,
+                        record.step,
+                        extra=_ids(agent_id),
+                    )
                     return
                 outcome = Fault("the state was cancelled from inside (CancelledError)")
             except StoreError:
@@ -446,7 +477,11 @@ class Executor:
                 await self.store.commit_step(agent_id, lease, record.step, outcome, self.now())
                 committed = True
             except Unread:
-                log.info("%s: messages arrived as it ended; running the state again", agent_id)
+                log.info(
+                    "%s: messages arrived as it ended; running the state again",
+                    agent_id,
+                    extra=_ids(agent_id),
+                )
                 self.env.notify()
             except (Fenced, Conflict, StoreError):
                 raise
@@ -461,7 +496,9 @@ class Executor:
                 )
                 committed = True
         except (Fenced, Conflict) as exc:
-            log.warning("%s: step %d not committed: %s", agent_id, record.step, exc)
+            log.warning(
+                "%s: step %d not committed: %s", agent_id, record.step, exc, extra=_ids(agent_id)
+            )
         except StoreError as exc:
             self._failed(agent_id, "step", exc)
         finally:
@@ -483,11 +520,16 @@ class Executor:
                 renewed = await self.store.renew(agent_id, lease, self.lease_ttl, self.now())
             except StoreError as exc:  # busy: try again until the lease would have expired
                 if lease.valid(self.now()):
-                    log.warning("%s: lease renewal failed (%s); trying again", agent_id, exc)
+                    log.warning(
+                        "%s: lease renewal failed (%s); trying again",
+                        agent_id,
+                        exc,
+                        extra=_ids(agent_id),
+                    )
                     continue
                 renewed = None
             if renewed is None:
-                log.warning("%s: lease lost; cancelling the step", agent_id)
+                log.warning("%s: lease lost; cancelling the step", agent_id, extra=_ids(agent_id))
                 self._cancelled.add(agent_id)
                 work.cancel()
                 return

@@ -15,7 +15,8 @@ What must hold
     anything else `control`; the principal is left in `scope["state"]["principal"]` for the
     routes, which check the runs it may touch. Without any token, the local caller is the
     machine's operator;
-  * a server bound to a non-loopback address must have a token (`require_token`).
+  * a server bound to a non-loopback address must have a token (`require_token`);
+  * `GET /health` is served to anyone (a liveness probe); it says nothing about runs.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ TOKEN_ENV = "STATECRAFT_TOKEN"
 COOKIE = "statecraft_token"
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 UNSAFE = ("POST", "PUT", "PATCH", "DELETE")
+#: paths served to anyone (GET only), saying nothing about runs: health probes
+OPEN = ("/health",)
 
 ASGI = Callable[..., Awaitable[None]]
 
@@ -125,6 +128,9 @@ class Guard:
     def problem(self, scope: dict[str, Any], headers: dict[str, str]) -> tuple[int, str] | None:
         host = headers.get("host", "")
         principal: Principal | None = OPERATOR  # local, without tokens: the machine's operator
+        if scope.get("path") in OPEN and scope.get("method") in ("GET", "HEAD"):
+            scope.setdefault("state", {})["principal"] = None
+            return None  # a liveness probe: it says only that the server answers
         if self._signs_in:
             principal = self._principal(self._presented(scope, headers))
             if principal is None:

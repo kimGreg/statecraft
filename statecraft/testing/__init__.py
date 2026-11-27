@@ -19,11 +19,16 @@ from ..runtime.runtime import Runtime
 
 
 def memory_runtime(**options: Any) -> Runtime:
-    """Memory store and workspace, no background executors (use `runtime.run(root)`)."""
+    """Memory store and workspace (unless given), no background executors (use
+    `runtime.run(root)`)."""
     return Runtime(
-        store=MemoryStore(),
-        workspace=MemoryWorkspace(),
-        **{"executors": 0, "scan_every": 0.01, **options},
+        **{
+            "store": MemoryStore(),
+            "workspace": MemoryWorkspace(),
+            "executors": 0,
+            "scan_every": 0.01,
+            **options,
+        }
     )
 
 

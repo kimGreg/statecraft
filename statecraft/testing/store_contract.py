@@ -13,6 +13,10 @@ releases the lease; renewals never make a commit fail; a stale worker's renew, r
 are refused; control commits need the current revision and no running step; kill always wins and
 fences the running step; inbox appends are deduplicated; every change writes its history entry
 and one durable event in the same transaction; ended records with intents left are still work.
+History reads back every revision's full record (checkpoints and deltas); compacting a run keeps
+its final records, last events, audit events and message ids, and changes nothing on a dry run;
+an active run only loses the bodies of applied messages; only an ended run nobody reads (attached
+or inheriting) is forgotten, and then entirely.
 """
 
 from __future__ import annotations
@@ -239,4 +243,87 @@ __all__ = [
     "test_the_call_journal_keeps_identities_and_unknown_outcomes",
     "test_the_expected_step_is_checked",
     "test_the_tree_is_the_root_and_its_descendants",
+]
+
+
+async def _ended_run(store, root: str = "root", steps: int = 40) -> None:
+    """A root that took `steps` steps (its data growing like a conversation), got a message,
+    and ended."""
+    await store.create(rec(root, data={"log": []}))
+    for n in range(steps):
+        lease = await store.try_acquire(root, "a", 10, now=n)
+        log = [*(await store.load(root)).data["log"], f"turn {n} " + "x" * 200]
+        await store.commit_step(root, lease, n, Transition(state="s0", data={"log": log}), now=n)
+    await store.append_inbox(root, "m1", {"kind": "signal", "signal": "STOP"})
+    record = await store.load(root)
+    await store.commit_control(root, record.revision, lambda r: r.but(inbox_applied=1), now=steps)
+    await store.kill(root)
+
+
+async def test_history_reads_back_every_record_from_checkpoints_and_deltas(store) -> None:
+    await _ended_run(store, steps=40)
+    history = await store.history("root")
+    assert [h["revision"] for h in history] == list(range(1, len(history) + 1))
+    assert [len(h["record"]["data"]["log"]) for h in history[:42]] == [0, *range(1, 41), 40]
+    assert history[-1]["record"]["status"] == "terminated"
+    assert history[-1]["record"] == (await store.load("root")).to_dict()
+
+
+async def test_compacting_an_ended_run_keeps_what_it_is(store) -> None:
+    await _ended_run(store)
+    final = (await store.load("root")).to_dict()
+    events_before = await store.read_events("root")
+    await store.audit("root", {"op": "signal", "by": "ops"})
+    dry = await store.compact("root", dry_run=True)
+    assert dry["history"] > 0 and dry["events"] > 0 and dry["inbox"] == 1
+    assert len(await store.history("root")) > 1  # a dry run changes nothing
+    assert await store.compact("root") == dry
+    [only] = await store.history("root")
+    assert only["record"] == final and only["revision"] == final["revision"]
+    kinds = [e["kind"] for e in await store.read_events("root")]
+    assert kinds == ["signal", "audit"] and len(events_before) > 2
+    [message] = await store.read_inbox("root", 0)
+    assert message["message"] == {"kind": "compacted"}
+    assert await store.compact("root") == {"inbox": 0, "history": 0, "events": 0}
+
+
+async def test_an_active_run_only_loses_applied_message_bodies(store) -> None:
+    await store.create(rec())
+    await store.append_inbox("root", "m1", {"kind": "signal", "signal": "STOP"})
+    await store.append_inbox("root", "m2", {"kind": "signal", "signal": "CONT"})
+    record = await store.load("root")
+    await store.commit_control("root", record.revision, lambda r: r.but(inbox_applied=1), now=0)
+    assert await store.compact("root") == {"inbox": 1, "history": 0, "events": 0}
+    box = await store.read_inbox("root", 0)
+    assert [m["message"] for m in box] == [
+        {"kind": "compacted"},
+        {"kind": "signal", "signal": "CONT"},
+    ]
+    assert not await store.append_inbox("root", "m1", {"kind": "signal", "signal": "STOP"})
+
+
+async def test_forgetting_needs_an_ended_run_nobody_reads(store) -> None:
+    await store.create(rec("live"))
+    with pytest.raises(Busy):
+        await store.forget("live")
+    await _ended_run(store, "old", steps=3)
+    await store.create(rec("fork", inherits={"root": "old"}))
+    with pytest.raises(Busy, match="fork"):
+        await store.forget("old")
+    await store.kill("fork")
+    await store.forget("fork")
+    assert await store.forget("old", dry_run=True) == {"agents": 1}
+    assert await store.find("old") is not None
+    await store.forget("old")
+    assert await store.find("old") is None and await store.history("old") == []
+    assert await store.read_events("old") == [] and await store.read_inbox("old", 0) == []
+    with pytest.raises(KeyError):
+        await store.forget("old")
+
+
+__all__ += [
+    "test_an_active_run_only_loses_applied_message_bodies",
+    "test_compacting_an_ended_run_keeps_what_it_is",
+    "test_forgetting_needs_an_ended_run_nobody_reads",
+    "test_history_reads_back_every_record_from_checkpoints_and_deltas",
 ]

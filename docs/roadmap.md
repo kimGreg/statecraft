@@ -17,7 +17,18 @@ formats refused; `store check`; tested from the 0.2 schema). D1 done (named toke
 rest in a token book, `statecraft token add|list|revoke`; scopes read, control, admin; per-run
 prefixes filter lists and refuse other runs; HTTP changes audited in the run's event log; admin
 routes to list an agent's calls and settle one of unknown outcome; the console signs in with the
-same tokens; `--token` stays as the operator's single secret).
+same tokens; `--token` stays as the operator's single secret). C2 done (history checkpoints
+every 32 revisions with structural deltas between, store format 3; measured 300 turns: 0.79 MB
+instead of about 19 MB; compact and forget for runs; collect for staging and unnamed objects,
+dry by default, swept under the agent's lease; `scan_work` was already indexed; A10, moving the
+agentic conversation out of `data`, is deferred: the history no longer grows with its square,
+but the record itself still holds the whole conversation). D3 done (spans per step and effect call
+through the OpenTelemetry API; metrics as JSON and Prometheus text; health; executor logs carry
+agent and root ids; the console shows faults, unknown outcomes and how they clear, undelivered
+messages, pending intents with `init`, joins, maintenance and capacity held; per-attempt
+diagnostics and budgets come with E1 and E3). D4 done (faults with the failing attempt's calls;
+CLI `faults`, `repin`, `calls`, `resolve`, `metrics`, `maintenance`; store-wide maintenance mode
+in which running steps finish and nothing new starts; resolving from the console, admin only).
 Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.

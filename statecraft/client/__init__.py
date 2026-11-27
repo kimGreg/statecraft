@@ -121,6 +121,31 @@ class StatecraftClient:
     async def providers(self) -> list[dict[str, Any]]:
         return await self._json("GET", "/registry/providers")
 
+    async def calls(self, agent_id: str) -> list[dict[str, Any]]:
+        return await self._json("GET", f"/agents/{_path(agent_id)}/calls")
+
+    async def resolve_call(
+        self, key: str, outcome: str, *, result: Any = None, by: str | None = None
+    ) -> dict[str, Any]:
+        # `by` is the principal the server knows the caller as; kept for the embedded signature
+        return await self._json(
+            "POST", f"/calls/{_path(key)}/resolve", json={"outcome": outcome, "result": result}
+        )
+
+    async def faults(self) -> list[dict[str, Any]]:
+        return await self._json("GET", "/faults")
+
+    async def metrics(self) -> dict[str, Any]:
+        return await self._json("GET", "/metrics", params={"format": "json"})
+
+    async def maintenance(self, on: bool | None = None) -> bool:
+        if on is None:
+            return (await self._json("GET", "/maintenance"))["on"]
+        return (await self._json("POST", "/maintenance", json={"on": on}))["on"]
+
+    async def health(self) -> dict[str, Any]:
+        return await self._json("GET", "/health")
+
     async def events(
         self, root: str, since: int = 0, *, follow: bool = True
     ) -> AsyncIterator[dict[str, Any]]:

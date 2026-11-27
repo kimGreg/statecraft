@@ -20,6 +20,7 @@ import os
 import secrets
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -299,12 +300,74 @@ class LocalFiles:
             os.close(top)
         return sorted(found)
 
+    # ---- upkeep (collectable): what garbage collection needs --------------------------------
+    async def remove(self, path: str) -> bool:
+        """Delete a file (a link is deleted, never followed); False when it is not there."""
+        folders, name = self._split(path)
+        try:
+            dfd = self._dir(folders, create=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        try:
+            os.unlink(name, dir_fd=dfd)
+            os.fsync(dfd)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            os.close(dfd)
+
+    async def modified(self, path: str) -> float:
+        """When the file was last written (seconds since the epoch), without following links."""
+        folders, name = self._split(path)
+        dfd = self._dir(folders, create=False)
+        try:
+            return os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mtime
+        finally:
+            os.close(dfd)
+
+    async def prune(self, prefix: str) -> int:
+        """Remove the empty folders under the folder `prefix` (not `prefix` itself)."""
+        parts = clean(prefix).split("/")
+        try:
+            top = self._dir(parts, create=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return 0
+        removed = 0
+
+        def walk(fd: int) -> bool:  # True when the folder is empty afterwards
+            nonlocal removed
+            empty = True
+            with os.scandir(fd) as entries:
+                listed = list(entries)
+            for entry in listed:
+                if entry.is_dir(follow_symlinks=False):
+                    sub = os.open(entry.name, _DIR | _NOFOLLOW, dir_fd=fd)
+                    try:
+                        inner_empty = walk(sub)
+                    finally:
+                        os.close(sub)
+                    if inner_empty:
+                        with contextlib.suppress(OSError):
+                            os.rmdir(entry.name, dir_fd=fd)
+                            removed += 1
+                            continue
+                empty = False
+            return empty
+
+        try:
+            walk(top)
+        finally:
+            os.close(top)
+        return removed
+
 
 class MemoryFiles:
     """Files in a dict (tests)."""
 
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
+        self.times: dict[str, float] = {}
 
     async def get(self, path: str) -> bytes:
         try:
@@ -314,13 +377,27 @@ class MemoryFiles:
 
     async def put(self, path: str, data: bytes) -> None:
         self.files[clean(path)] = bytes(data)
+        self.times[clean(path)] = time.time()
 
     async def create(self, path: str, data: bytes) -> bool:
         key = clean(path)
         if key in self.files:
             return False
         self.files[key] = bytes(data)
+        self.times[key] = time.time()
         return True
+
+    async def remove(self, path: str) -> bool:
+        self.times.pop(clean(path), None)
+        return self.files.pop(clean(path), None) is not None
+
+    async def modified(self, path: str) -> float:
+        if clean(path) not in self.files:
+            raise FileNotFoundError(path)
+        return self.times[clean(path)]
+
+    async def prune(self, prefix: str) -> int:
+        return 0  # no folders
 
     async def exists(self, path: str) -> bool:
         return clean(path) in self.files
@@ -362,15 +439,33 @@ class ScopedFiles:
         found = await self.files.list(inner)
         return [f.removeprefix(self.prefix) for f in found if f.startswith(self.prefix)]
 
+    @property
+    def collectable(self) -> bool:
+        return all(hasattr(self.files, m) for m in ("remove", "modified", "prune"))
+
+    async def remove(self, path: str) -> bool:
+        return bool(await self.files.remove(self._p(path)))
+
+    async def modified(self, path: str) -> float:
+        return float(await self.files.modified(self._p(path)))
+
+    async def prune(self, prefix: str) -> int:
+        return int(await self.files.prune(self._p(prefix)))
+
 
 class LocalWorkspace:
     """Each workspace is a folder under `root`. Mountable: a sandbox provider gets the host
-    folder of an area it may expose (`host_path`)."""
+    folder of an area it may expose (`host_path`). Collectable: its files can be removed, aged
+    (`modified`) and their empty folders pruned, which garbage collection needs."""
 
     def __init__(self, root: str | Path, *, internal_links: bool | None = None) -> None:
         self.files = LocalFiles(root, internal_links=internal_links)
         self.capabilities = frozenset(
-            {"mountable", *(["internal_links"] if self.files.internal_links else [])}
+            {
+                "mountable",
+                "collectable",
+                *(["internal_links"] if self.files.internal_links else []),
+            }
         )
 
     def host_path(self, workspace_id: str, relative: str) -> str:
@@ -388,6 +483,8 @@ class LocalWorkspace:
 
 
 class MemoryWorkspace:
+    capabilities = frozenset({"collectable"})
+
     def __init__(self) -> None:
         self.files = MemoryFiles()
 

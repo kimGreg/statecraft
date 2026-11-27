@@ -42,6 +42,7 @@ from ..kernel.transitions import (
 )
 from ..sdk.agent import run_state
 from ..sdk.contracts import Artifact
+from . import operate, telemetry, upkeep
 from .context import StepContext, dumps
 from .effects import EffectManager
 from .registry import AgentDefinition, Registrar, Registry, RegistryError
@@ -101,11 +102,15 @@ class Runtime:
         limits: dict[str, int] | None = None,
         clock: Callable[[], float] = time.time,
         owner: str | None = None,
+        tracer: Any = None,
     ) -> None:
+        """`tracer`: an OpenTelemetry tracer (default: the API's, when installed; False: none)."""
         self.store = store
         self.registry = registry or Registry()
         self.registrar = Registrar(self.registry)
         self.effects = EffectManager(self.registry, store=store)
+        self.tracer = None if tracer is False else tracer or telemetry.default_tracer()
+        self.effects.tracer = self.tracer
         self.workspaces = WorkspaceService(workspace, store)
         if lease_ttl <= 0 or beat <= 0 or beat >= lease_ttl:
             raise ValueError(
@@ -276,6 +281,14 @@ class Runtime:
         return self.registry.agent(record.definition.get("name") or record.agent)
 
     async def run_step(
+        self, record: Record, lease: Lease, root_input: dict[str, Any]
+    ) -> Transition | Fault:
+        with telemetry.step_span(self.tracer, record) as span:
+            outcome = await self._run_step(record, lease, root_input)
+            telemetry.step_outcome(span, outcome)
+            return outcome
+
+    async def _run_step(
         self, record: Record, lease: Lease, root_input: dict[str, Any]
     ) -> Transition | Fault:
         try:
@@ -580,6 +593,33 @@ class Runtime:
         if not stored:
             raise InvalidAnswer(f"{question_id} is already answered")
         self.notify()
+
+    # ---- operating (D3, D4, `operate.py`) ----------------------------------------------------
+    async def maintenance(self, on: bool | None = None) -> bool:
+        """Store-wide maintenance mode: running steps finish, no new step starts (None: read)."""
+        return await operate.maintenance(self, on)
+
+    async def faults(self) -> list[dict[str, Any]]:
+        """Every agent suspended by a fault: error, failing state and step, its calls."""
+        return await operate.faults(self)
+
+    async def metrics(self) -> dict[str, Any]:
+        return await operate.metrics(self)
+
+    # ---- storage upkeep (C2, `upkeep.py`) ------------------------------------------------------
+    async def collect(self, *, dry_run: bool = True, grace: float = 3600.0) -> dict[str, Any]:
+        """Remove staging of finished attempts and objects no commit names (dry by default)."""
+        return await upkeep.collect(self, dry_run=dry_run, grace=grace)
+
+    async def compact(self, root: str, *, dry_run: bool = False) -> dict[str, int]:
+        """Smaller history, events and inbox for a run, without changing what it is."""
+        return await self.store.compact(root, dry_run=dry_run)
+
+    async def forget(
+        self, root: str, *, files: bool = False, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Delete an ended run nobody reads; with `files`, its files too."""
+        return await upkeep.forget(self, root, files=files, dry_run=dry_run)
 
     async def calls(self, agent_id: str) -> list[dict[str, Any]]:
         """The agent's journaled calls (keyed calls: identity, request digest, outcome)."""

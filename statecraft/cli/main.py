@@ -9,7 +9,16 @@
     statecraft signal ID STOP|CONT|TERM|KILL|USR [MESSAGE] (--config FILE | --url URL)
     statecraft answer QUESTION_ID VALUE (--config FILE | --url URL)
     statecraft events ROOT [--since N] [--follow] (--config FILE | --url URL)
+    statecraft faults | metrics (--config FILE | --url URL)   faulted agents; counts
+    statecraft repin ID | calls ID (--config FILE | --url URL)
+    statecraft resolve KEY completed|failed|replay [--result JSON] (--config | --url)
+    statecraft maintenance on|off|status (--config FILE | --url URL)
     statecraft plugins                      installed plugins (not enabled ones)
+    statecraft store check|migrate --config FILE           the store's data format
+    statecraft store collect [--grace S] [--apply] --config FILE   staging and unnamed objects
+    statecraft store compact ROOT [--apply] --config FILE  smaller history, events and inbox
+    statecraft store forget ROOT [--files] [--apply] --config FILE   delete an ended run
+    statecraft token add NAME --scope S [--root PREFIX] --tokens FILE | list | revoke NAME
 
 `run` exits 0 when the run succeeded, 3 when it waits on a person, a stop or a fault, 1 otherwise.
 Embedded commands other than `run` and `serve` start no executors: they record and read.
@@ -117,15 +126,57 @@ async def _call(args: argparse.Namespace) -> int:
             await api.signal(args.id, signal)
         elif command == "answer":
             await api.answer(args.id, _value(args.value))
+        elif command == "faults":
+            show(await api.faults())
+        elif command == "metrics":
+            show(await api.metrics())
+        elif command == "repin":
+            show(await api.repin(args.id))
+        elif command == "calls":
+            show(await api.calls(args.id))
+        elif command == "resolve":
+            result = _value(args.result) if args.result is not None else None
+            show(await api.resolve_call(args.key, args.outcome, result=result))
+        elif command == "maintenance":
+            state = {"on": True, "off": False, "status": None}[args.state]
+            show({"maintenance": await api.maintenance(state)})
         elif command == "events":
             async for event in api.events(args.id, since=args.since, follow=args.follow):
                 print(json.dumps(event, ensure_ascii=False, default=str), flush=True)
     return 0
 
 
+async def _upkeep(args: argparse.Namespace) -> int:
+    """`store collect|compact|forget`: storage upkeep through the runtime (C2). Dry unless
+    `--apply`."""
+    from ..kernel.store import StoreError
+
+    dry = not args.apply
+    async with _Embedded(args.config) as runtime:
+        if args.action == "collect":
+            show(await runtime.collect(dry_run=dry, grace=args.grace))
+            return 0
+        if not args.root:
+            raise SystemExit(f"store {args.action} needs ROOT")
+        try:
+            if args.action == "compact":
+                show(await runtime.compact(args.root, dry_run=dry))
+            else:
+                show(await runtime.forget(args.root, files=args.files, dry_run=dry))
+        except KeyError:
+            print(f"no root {args.root!r}", file=sys.stderr)
+            return 1
+        except (ValueError, StoreError) as exc:  # refused: still at work, or read by a run
+            print(str(exc), file=sys.stderr)
+            return 1
+    return 0
+
+
 def _store(args: argparse.Namespace) -> int:
     """`store check`: the data format and whether this statecraft reads it (exit 1 when not);
     `store migrate`: back the store up and upgrade it."""
+    if args.action in ("collect", "compact", "forget"):
+        return asyncio.run(_upkeep(args))
     from ..providers.stores import sqlite
     from ..runtime.config import read
 
@@ -193,9 +244,15 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--token", help="bearer token for --url (default: $STATECRAFT_TOKEN)")
         return p
 
-    store = sub.add_parser("store", help="check or migrate the store's data format")
-    store.add_argument("action", choices=["check", "migrate"])
+    store = sub.add_parser(
+        "store", help="check or migrate the store's format; collect, compact or forget"
+    )
+    store.add_argument("action", choices=["check", "migrate", "collect", "compact", "forget"])
+    store.add_argument("root", nargs="?")
     store.add_argument("--config", required=True)
+    store.add_argument("--apply", action="store_true", help="do it (upkeep is dry by default)")
+    store.add_argument("--grace", type=float, default=3600.0, help="collect: minimum object age")
+    store.add_argument("--files", action="store_true", help="forget: the run's files too")
     serve = sub.add_parser("serve")
     serve.add_argument("--config", required=True)
     serve.add_argument("--host", default="127.0.0.1")
@@ -222,10 +279,16 @@ def main(argv: list[str] | None = None) -> int:
     resume.add_argument("root")
     resume.add_argument("--config", required=True)
     resume.add_argument("--timeout", type=float)
-    for name in ("agents", "tools", "providers", "ps", "questions"):
+    for name in ("agents", "tools", "providers", "ps", "questions", "faults", "metrics"):
         target(sub.add_parser(name))
-    for name in ("inspect", "tree", "history"):
+    for name in ("inspect", "tree", "history", "repin", "calls"):
         target(sub.add_parser(name)).add_argument("id")
+    resolve = target(sub.add_parser("resolve", help="settle a call whose outcome is unknown"))
+    resolve.add_argument("key")
+    resolve.add_argument("outcome", choices=["completed", "failed", "replay"])
+    resolve.add_argument("--result", help="completed: what the state receives (JSON)")
+    hold = target(sub.add_parser("maintenance", help="no new steps start while on"))
+    hold.add_argument("state", choices=["on", "off", "status"])
     signal = target(sub.add_parser("signal"))
     signal.add_argument("id")
     signal.add_argument("signal", choices=["STOP", "CONT", "TERM", "KILL", "USR"])

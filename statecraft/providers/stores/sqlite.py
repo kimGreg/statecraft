@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from ...kernel.process import Lease, Record
-from ...kernel.store import FormatError, StateStore, Unavailable
+from ...kernel.store import COMPACTED, FormatError, StateStore, Unavailable
 from ...kernel.transitions import has_work
 
 T = TypeVar("T")
@@ -59,9 +59,11 @@ CREATE TABLE IF NOT EXISTS meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 
 #: The data format this statecraft reads and writes. 1: statecraft 0.2 (no `meta` table); 2: the
-#: call journal (`calls`). A store records its format; an older one is migrated explicitly
-#: (`statecraft store migrate`, after a backup), a newer one is refused.
-FORMAT = 2
+#: call journal (`calls`); 3: history entries may be deltas between checkpoints, applied inbox
+#: messages may be compacted (an older statecraft would misread both). A store records its
+#: format; an older one is migrated explicitly (`statecraft store migrate`, after a backup), a
+#: newer one is refused.
+FORMAT = 3
 
 
 def _migrate_1(db: sqlite3.Connection) -> None:
@@ -73,7 +75,12 @@ def _migrate_1(db: sqlite3.Connection) -> None:
     db.execute("CREATE INDEX IF NOT EXISTS calls_agent ON calls(agent, n)")
 
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1}
+def _migrate_2(db: sqlite3.Connection) -> None:
+    """2 -> 3: nothing to rewrite (full-record history entries are valid checkpoints); the format
+    number keeps an older statecraft from reading deltas it does not know."""
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migrate_1, 2: _migrate_2}
 
 
 def _statements(script: str) -> list[str]:
@@ -194,6 +201,50 @@ class _Tables:
             "SELECT body FROM calls WHERE agent = ? ORDER BY n", (agent_id,)
         ).fetchall()
         return [json.loads(b) for (b,) in rows]
+
+    def history_trim(self, agent_id: str, revision: int, entry: dict[str, Any]) -> int:
+        dropped = self.db.execute(
+            "DELETE FROM history WHERE agent = ? AND revision <> ?", (agent_id, revision)
+        ).rowcount
+        self.db.execute(
+            "UPDATE history SET body = ? WHERE agent = ? AND revision = ?",
+            (_dump(entry), agent_id, revision),
+        )
+        return dropped
+
+    def event_drop(self, root: str, seqs: list[int]) -> None:
+        self.db.executemany(
+            "DELETE FROM events WHERE root = ? AND seq = ?", [(root, n) for n in seqs]
+        )
+
+    def inbox_compact(self, agent_id: str, upto: int) -> int:
+        return self.db.execute(
+            "UPDATE inbox SET body = ? WHERE agent = ? AND n <= ? AND body <> ?",
+            (_dump(COMPACTED), agent_id, upto, _dump(COMPACTED)),
+        ).rowcount
+
+    def forget(self, agent_ids: list[str], root: str) -> None:
+        for table, column in (
+            ("agents", "id"),
+            ("leases", "id"),
+            ("inbox", "agent"),
+            ("history", "agent"),
+            ("calls", "agent"),
+        ):
+            self.db.executemany(
+                f"DELETE FROM {table} WHERE {column} = ?", [(i,) for i in agent_ids]
+            )
+        self.db.execute("DELETE FROM events WHERE root = ?", (root,))
+
+    def setting_get(self, name: str) -> Any:
+        row = self._one("SELECT value FROM meta WHERE key = ?", f"setting:{name}")
+        return json.loads(row[0]) if row else None
+
+    def setting_put(self, name: str, value: Any) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (f"setting:{name}", _dump(value)),
+        )
 
     def tree_ids(self, root: str) -> list[str]:
         rows = self.db.execute(
