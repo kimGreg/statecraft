@@ -146,6 +146,8 @@ class Attacher(Agent):
     @state
     async def spawn(self, ctx, data):
         target = {"root": ctx.input["run"], "mode": ctx.input.get("mode", "ro")}
+        if ctx.input.get("bare"):  # a bare root id attaches read-only
+            target = ctx.input["run"]
         return Spawn({"w": ("t:scribbler", {})}, then="wait", attach={"w": target})
 
     @state
@@ -174,6 +176,10 @@ async def test_an_attached_child_is_read_only_unless_granted_rw(tmp_path) -> Non
         await rt.spawn("t:attacher", {"run": "run1"}, root_id="a1")  # ro by default
         await rt.run("a1", scan_every=0.01)
         assert (await rt.artifact("a1", "ended"))["payload"] == {"child": "active"}  # faulted
+        assert not (tmp_path / "run1" / "shared" / "scribble.txt").exists()
+        await rt.spawn("t:attacher", {"run": "run1", "bare": True}, root_id="a0")
+        await rt.run("a0", scan_every=0.01)
+        assert (await rt.artifact("a0", "ended"))["payload"] == {"child": "active"}  # faulted
         assert not (tmp_path / "run1" / "shared" / "scribble.txt").exists()
         await rt.spawn("t:attacher", {"run": "run1", "mode": "rw"}, root_id="a2")
         await rt.run("a2", scan_every=0.01)
