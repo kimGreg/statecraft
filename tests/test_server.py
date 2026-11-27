@@ -15,6 +15,7 @@ import json
 import socket
 from typing import Any
 
+import pytest
 import uvicorn
 
 from statecraft import Agent, Done, Wait, state
@@ -104,16 +105,14 @@ async def test_the_same_api_embedded_and_served() -> None:
     try:
         async with StatecraftClient(f"http://127.0.0.1:{port}") as client:
             served = await scenario(client)
-            try:
+            with pytest.raises(StatecraftError) as unknown:
                 await client.get("nobody")
-            except StatecraftError as exc:
-                assert exc.status == 404
+            assert unknown.value.status == 404
             assert await client.questions() == []  # the question was answered
-            try:  # an ended agent takes no more signals: refused, not silently dropped
+            # an ended agent takes no more signals: refused, not silently dropped
+            with pytest.raises(StatecraftError) as ended:
                 await client.signal("s1", "STOP")
-                raise AssertionError("a signal to an ended agent was accepted")
-            except StatecraftError as exc:
-                assert exc.status == 409
+            assert ended.value.status == 409
     finally:
         server.should_exit = True
         await task

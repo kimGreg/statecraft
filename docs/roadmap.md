@@ -8,7 +8,11 @@ mount plan, mountable and workspace_requires, host-path rule, folder fsync, W9, 
 real OpenSandbox 1.2.1 server, in both cancel modes; the A4 hardening rows are configuration of
 the OpenSandbox deployment, documented in the package README, not yet automated); A5 done
 (`examples/shared_coding`, the chaos harness in `chaos/` with a shell effect, a real-model run
-through the sandbox shell). Track A is done except the optional A6. Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
+through the sandbox shell). Track A is done except the optional A6. B2 done (MCP M2 to M8; M7
+partly: a connection closed with a request out stays `transient`, the client cannot prove it
+unsent). B3 done (A4, A6, A7, A8, A11, A12, A13, V8, R7, R8, compaction quality, T8, T9, T10,
+T14; R11 moves with E1; T13 partly: the `run()` races behind the flaky tests are fixed).
+Baseline `main` at `84830e5` (P0.6 remediation merged, P0.7 gate passed).
 This plan follows the revised architecture: the kernel stays minimal, sandboxes and volumes are
 provider concerns, and every new guarantee is a generic effect or workspace contract with a test.
 

@@ -211,3 +211,43 @@ def test_exceptions_and_http_answers_are_classified() -> None:
     assert found["bug"].cls == "failed"  # an ordinary exception is never retried
     assert classify_status(400, "bad field").code == "400"
     assert classify_status(408).cls == "timeout" and classify_status(429).cls == "transient"
+
+
+async def test_a_provably_unsent_failure_is_retried_by_the_manager() -> None:
+    """`unavailable` with sent=False is tried again, even for a tool that may not repeat a sent
+    request: it never left."""
+    from statecraft import EffectDefinition, EffectError
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def invoke(self, operation, arguments, context):
+            self.calls += 1
+            if self.calls < 3:
+                raise EffectError("unavailable", "no connection yet", sent=False)
+            return "done"
+
+    flaky = Flaky()
+    rt = memory_runtime()
+    rt.registrar.providers.register("f", flaky)
+    rt.registrar.tools.register(
+        EffectDefinition(name="f.op", provider="f", operation="op", policy={"kind": "deduplicated"})
+    )
+
+    class Caller(Agent):
+        start = "go"
+
+        @state
+        async def go(self, ctx, data):
+            data["r"] = await ctx.call("f.op", call_name="once")
+            return Done
+
+    rt.registrar.agents.register("caller", Caller, tools=["f.*"])
+    rt.effects.backoff = 0.001
+    async with rt:
+        root = await rt.spawn("caller", root_id="c")
+        await rt.run(root, timeout=5)
+        record = await rt.store.load(root)
+        [crossing] = [c for h in await rt.history(root) for c in h.get("crossings", [])]
+    assert record.data["r"] == "done" and flaky.calls == 3 and crossing["attempts"] == 3

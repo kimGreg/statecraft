@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import time
 
 from ..sdk.effect import tool
@@ -30,7 +31,12 @@ async def sleep(seconds: float) -> float:
 
 @tool(name="work.burn", policy="read_only", execution="process", timeout=120)
 def burn(seconds: float) -> str:
-    """Hold a CPU for `seconds` (in a process: the event loop keeps moving)."""
+    """Hold a CPU for `seconds` (in a process: the event loop keeps moving). Each run is logged
+    to the file `STATECRAFT_BURN_LOG` names, when set (a test counts real runs, reruns too)."""
+    log = os.environ.get("STATECRAFT_BURN_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n")
     deadline = time.monotonic() + seconds
     digest = b""
     while time.monotonic() < deadline:

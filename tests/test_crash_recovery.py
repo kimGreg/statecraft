@@ -45,8 +45,12 @@ def check_finished(tmp: Path) -> None:
     total = json.loads((tmp / "ws" / "crashroot" / root.published["sum"]["path"]).read_text())
     assert total["payload"]["value"] == 3
     logs = sorted((tmp / "ws" / "crashroot" / "shared" / "log").iterdir())
-    keys = {p.read_text() for p in logs}
-    assert keys == {"crashroot/a/0/work/log", "crashroot/b/0/work/log"}
+    runs: dict[str, int] = {}
+    for p in logs:  # one file per run (key and process): a duplicate run cannot hide
+        runs[p.read_text()] = runs.get(p.read_text(), 0) + 1
+    assert set(runs) == {"crashroot/a/0/work/log", "crashroot/b/0/work/log"}
+    # at least once; at most once per process (the crashed one may have run it uncommitted)
+    assert all(1 <= n <= 2 for n in runs.values()), runs
 
 
 POINTS = [

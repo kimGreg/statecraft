@@ -182,7 +182,11 @@ async def test_a_providers_concurrency_limit_holds() -> None:
     assert running["most"] == 2
 
 
-async def test_cpu_work_in_a_process_keeps_heartbeats_and_others_moving() -> None:
+async def test_cpu_work_in_a_process_keeps_heartbeats_and_others_moving(
+    tmp_path, monkeypatch
+) -> None:
+    log = tmp_path / "burns.log"
+    monkeypatch.setenv("STATECRAFT_BURN_LOG", str(log))
     runtime = runtime_with(executors=1, concurrency=4, scan_every=0.01, lease_ttl=0.6, beat=0.1)
     async with runtime:
         burner = await runtime.spawn("burner")
@@ -195,6 +199,7 @@ async def test_cpu_work_in_a_process_keeps_heartbeats_and_others_moving() -> Non
             c["attempts"] for e in await runtime.history(burner) for c in e.get("crossings", [])
         ]
         assert attempts == [1]  # the lease held: the step was never cancelled and rerun
+    assert len(log.read_text().split()) == 1  # and the work really ran once (reruns would log)
 
 
 class Waiter(Agent):
