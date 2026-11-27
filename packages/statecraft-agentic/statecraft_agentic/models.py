@@ -25,6 +25,8 @@ import httpx
 
 from statecraft import EffectDefinition, EffectError, EffectPolicy
 
+from .context import estimate
+
 PROVIDER = "model"
 MODEL_POLICY = EffectPolicy(
     kind="read_only", deterministic=False, cost="metered", timeout=180, max_attempts=3
@@ -169,7 +171,8 @@ class ScriptedModel:
         return {
             "content": step.get("text"),
             "tool_calls": calls,
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            # what it was sent, estimated as a model would count it
+            "usage": {"prompt_tokens": estimate(messages), "completion_tokens": 5},
         }
 
 

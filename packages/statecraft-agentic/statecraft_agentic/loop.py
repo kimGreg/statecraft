@@ -1,14 +1,30 @@
 """Model-driven agents as ordinary state machines (architecture §12.2).
 
     prepare -> think -> act_one -> act_one -> ... -> think -> ... -> finish -> Done
-                          |
-                          +- a boundary tool (spawn_agent, wait_for, ask_person, sleep) returns
-                             Spawn/Wait; wait_result adds its result as the tool's response
+                 |        |                                            |
+                 |        +- a boundary tool (spawn_agent, wait_for,     +- a follow-up waits:
+                 |           ask_person, sleep) returns Spawn/Wait;        think again
+                 |           wait_result adds its result
+                 +- the context is over budget: compact -> think
 
 `think` calls a model tool (`model.<name>`) through `ctx.call`; `act_one` calls one tool the model
 chose. So the runtime checkpoints between model turns and between tool calls: a crash reruns only
 the unfinished turn or call, and every call is checked, retried by policy and recorded like any
 other. The conversation is in `data`; the model's private reasoning is never kept.
+
+The conversation is the agent's durable history; a model turn is sent a projection of it
+(`context.project`): the system prompt and the task, then a summary of compacted messages, then
+the rest. When the projection is over the context budget, `compact` (its own state, so its model
+call is checkpointed like a turn) summarizes the oldest messages that can be cut without
+separating a tool call from its result. Nothing is deleted from the history.
+
+People steer a running agent with USR signals (durable, like every signal):
+    ("USR", {"type": "steer", "text": "..."})       read before the next model turn (after the
+                                                    tool calls of the current turn)
+    ("USR", {"type": "follow_up", "text": "..."})   kept until the agent would finish; then it
+                                                    goes on with it instead (the last answer is
+                                                    the output)
+Any other USR message goes to `on_signal`.
 
 Settings come from the definition's `extensions.agentic`:
 
@@ -17,6 +33,10 @@ Settings come from the definition's `extensions.agentic`:
     tools: [search.query]           # tools offered to the model (within the agent's grant)
     skills: [literature-review]     # pinned at start (see `skills`)
     output: report                  # the artifact type of the final answer (else the first write)
+    context:
+      max_tokens: 60000             # the context budget (none: never compacted)
+      keep_tokens: 15000            # recent messages kept as they are (default: a quarter)
+      files: [shared/AGENTS.md]     # workspace files given as project context (when present)
 """
 
 from __future__ import annotations
@@ -26,6 +46,8 @@ import re
 from typing import Any, ClassVar
 
 from statecraft import Agent, Done, Spawn, Wait, state
+
+from .context import cut_for, estimate, project, summary_request
 
 GENERAL = """You are one agent in a larger procedure. Work only with your tools.
 - Computed values (coordinates, distances, areas, counts) come from tools; never invent them.
@@ -76,6 +98,10 @@ class AgenticAgent(Agent):
     max_tool_calls: ClassVar[int] = 48
     max_children: ClassVar[int] = 8
     max_output_retries: ClassVar[int] = 2
+    #: The context budget in tokens (None: never compacted); `context.max_tokens` overrides it.
+    context_tokens: ClassVar[int | None] = None
+    #: Workspace files given as project context when present; `context.files` overrides it.
+    context_files: ClassVar[tuple[str, ...]] = ()
 
     # ---- hooks a subclass may override ------------------------------------------------------
     async def task(self, ctx) -> str:
@@ -103,6 +129,10 @@ class AgenticAgent(Agent):
     def skills_of(self, ctx) -> list[str]:
         return list(ctx.extension("agentic").get("skills") or [])
 
+    def on_signal(self, ctx, data: dict[str, Any], message: Any) -> None:
+        """A USR message that is neither a steer nor a follow-up (ignored by default)."""
+        return None
+
     # ---- states -----------------------------------------------------------------------------
     @state
     async def prepare(self, ctx, data):
@@ -122,6 +152,7 @@ class AgenticAgent(Agent):
                 await self.task_instruction(ctx, data),
                 GENERAL.format(output=shape),
                 ("Skills you can load with `load_skill`: " + ", ".join(others)) if others else "",
+                await self._project_context(ctx),
             )
             if p
         )
@@ -138,6 +169,9 @@ class AgenticAgent(Agent):
             retries=0,
             output=output,
             usage={"prompt": 0, "completion": 0},
+            compaction=None,
+            follow_ups=[],
+            steered=0,
         )
         return "think"
 
@@ -145,16 +179,23 @@ class AgenticAgent(Agent):
     async def think(self, ctx, data):
         if data["turns"] >= self.max_model_turns:
             raise RuntimeError(f"more than {self.max_model_turns} model turns")
+        self._take_signals(ctx, data)
+        budget, keep = self._budget(ctx)
+        over = budget is not None and self._context_tokens(data) > budget
+        if over and cut_for(data["messages"], data.get("compaction"), keep) is not None:
+            return "compact"
+        sent = project(data["messages"], data.get("compaction"))
         reply = await ctx.call(
-            f"model.{self._model(ctx)}",
-            messages=[dict(m) for m in data["messages"]],
-            tools=self._tools(ctx, data),
+            f"model.{self._model(ctx)}", messages=sent, tools=self._tools(ctx, data)
         )
         data["turns"] += 1
-        for key, value in (reply.get("usage") or {}).items():
-            short = {"prompt_tokens": "prompt", "completion_tokens": "completion"}.get(key)
-            if short and isinstance(value, int):
-                data["usage"][short] += value
+        self._count(data, reply)
+        prompt = (reply.get("usage") or {}).get("prompt_tokens")
+        data["last_prompt"] = {
+            "tokens": prompt if isinstance(prompt, int) else estimate(sent),
+            "upto": len(data["messages"]),
+            "compactions": (data.get("compaction") or {}).get("count", 0),
+        }
         content = reply.get("content") or ""
         calls = list(reply.get("tool_calls") or [])
         message: dict[str, Any] = {"role": "assistant", "content": content or None}
@@ -176,6 +217,31 @@ class AgenticAgent(Agent):
             return "act_one"
         data["final"] = content
         return "finish"
+
+    @state
+    async def compact(self, ctx, data):
+        """Summarize the oldest messages that can be cut; the history keeps them."""
+        _budget, keep = self._budget(ctx)
+        earlier = data.get("compaction")
+        cut = cut_for(data["messages"], earlier, keep)
+        if cut is None:
+            return "think"
+        reply = await ctx.call(
+            f"model.{self._model(ctx)}",
+            messages=summary_request(data["messages"], earlier, cut),
+            tools=[],
+        )
+        self._count(data, reply)
+        summary = str(reply.get("content") or "").strip()
+        if not summary:
+            raise RuntimeError("the model gave no summary to compact the context with")
+        data["compaction"] = {
+            "covered_until": cut,
+            "summary": summary,
+            "count": (earlier or {}).get("count", 0) + 1,
+        }
+        data.pop("last_prompt", None)
+        return "think"
 
     @state
     async def act_one(self, ctx, data):
@@ -222,6 +288,12 @@ class AgenticAgent(Agent):
         except (ValueError, json.JSONDecodeError) as exc:
             problem = f"{type(exc).__name__}: {exc}"
             payload = None
+        self._take_signals(ctx, data)
+        if not problem and data["follow_ups"]:
+            text = data["follow_ups"].pop(0)
+            data["messages"].append({"role": "user", "content": text})
+            data["final"] = None
+            return "think"
         if problem:
             data["retries"] += 1
             if data["retries"] > self.max_output_retries:
@@ -247,6 +319,52 @@ class AgenticAgent(Agent):
         return Done
 
     # ---- helpers ----------------------------------------------------------------------------
+    def _count(self, data: dict[str, Any], reply: dict[str, Any]) -> None:
+        for key, value in (reply.get("usage") or {}).items():
+            short = {"prompt_tokens": "prompt", "completion_tokens": "completion"}.get(key)
+            if short and isinstance(value, int):
+                data["usage"][short] += value
+
+    def _take_signals(self, ctx, data: dict[str, Any]) -> None:
+        """Steers become user messages now; follow-ups wait until the agent would finish."""
+        for message in ctx.signals:
+            kind = message.get("type") if isinstance(message, dict) else None
+            text = str(message.get("text") or "") if isinstance(message, dict) else ""
+            if kind == "steer" and text:
+                data["messages"].append({"role": "user", "content": text})
+                data["steered"] = data.get("steered", 0) + 1
+            elif kind == "follow_up" and text:
+                data.setdefault("follow_ups", []).append(text)
+            else:
+                self.on_signal(ctx, data, message)
+
+    def _budget(self, ctx) -> tuple[int | None, int]:
+        settings = ctx.extension("agentic").get("context") or {}
+        budget = settings.get("max_tokens", self.context_tokens)
+        if budget is None:
+            return None, 0
+        return int(budget), int(settings.get("keep_tokens") or int(budget) // 4)
+
+    def _context_tokens(self, data: dict[str, Any]) -> int:
+        """The projection's size: the tokens the model reported for the previous turn plus an
+        estimate of what was added since; an estimate of the whole after a compaction."""
+        last = data.get("last_prompt")
+        count = (data.get("compaction") or {}).get("count", 0)
+        if last and last.get("compactions") == count and last["upto"] <= len(data["messages"]):
+            return int(last["tokens"]) + estimate(data["messages"][last["upto"] :])
+        return estimate(project(data["messages"], data.get("compaction")))
+
+    async def _project_context(self, ctx) -> str:
+        settings = ctx.extension("agentic").get("context") or {}
+        found = []
+        for path in settings.get("files", self.context_files) or ():
+            try:
+                text = await ctx.files.read_text(str(path))
+            except (FileNotFoundError, KeyError, PermissionError):
+                continue
+            found.append(f"Project context ({path}):\n{text.strip()}")
+        return "\n\n".join(found)
+
     def _model(self, ctx) -> str:
         return str(ctx.extension("agentic").get("model") or self.model)
 

@@ -95,7 +95,8 @@ async def test_a_model_call_is_an_ordinary_recorded_tool_call() -> None:
         crossings = [c for e in await runtime.history(root) for c in e.get("crossings", [])]
         model_calls = [c for c in crossings if c["effect"] == "model.default"]
         assert model_calls and model_calls[0]["provider"] == "model"
-        assert model_calls[0]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
+        usage = model_calls[0]["usage"]
+        assert usage["prompt_tokens"] > 0 and usage["completion_tokens"] == 5
         policy = next(t for t in runtime.tools() if t["name"] == "model.default")["policy"]
         assert (policy["kind"], policy["deterministic"], policy["cost"]) == (
             "read_only",
