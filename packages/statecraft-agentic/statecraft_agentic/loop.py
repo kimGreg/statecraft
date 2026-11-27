@@ -57,10 +57,8 @@ from statecraft import Agent, Done, EffectError, Spawn, Wait, state
 
 from .context import cut_for, estimate, project, summary_request
 
-GENERAL = """You are one agent in a larger procedure. Work only with your tools.
+GENERAL = """You are one agent in a larger procedure. Work only with the tools you are given.
 - Computed values (coordinates, distances, areas, counts) come from tools; never invent them.
-- `spawn_agent` starts another agent; `wait_for` waits until it ends; its output is then read
-  with `read_artifact`. `ask_person` asks a person and waits for the answer.
 - When you are done, answer with your final result only{output}."""
 
 COLLABORATE = """Working with other agents:
@@ -289,6 +287,11 @@ class AgenticAgent(Agent):
         if data["calls"] > self.max_tool_calls:
             raise RuntimeError(f"more than {self.max_tool_calls} tool calls")
         name, arguments = call_["name"], call_["arguments"]
+        offered = {t["function"]["name"] for t in self._tools(ctx, data)}
+        if name == "wait_for" and "join_agents" in offered:
+            name = "join_agents"  # the earlier name of join_agents
+        if name not in offered:  # what the model was not offered is never run
+            return self._answer(data, {"error": f"unknown tool {name!r}: not offered to you"})
         if name in BOUNDARY:
             boundary = await self._boundary(ctx, data, name, arguments)
             if isinstance(boundary, (Spawn, Wait)):

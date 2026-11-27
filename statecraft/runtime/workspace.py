@@ -180,6 +180,15 @@ class AgentFiles:
         await self._check_read(path)
         return await self._ctx._files.exists(path)
 
+    async def create(self, path: str, data: bytes | str) -> bool:
+        """Create-only, in the agent's own `skills/` folder (resources pinned for its life: no
+        agent may write or replace them). False when the file exists."""
+        path = clean(path)
+        if not (path.startswith(home(self._ctx.id) + "/skills/") and self._mine(path)):
+            raise NotAllowed(f"{self._ctx.id} may create only in its own skills/ folder")
+        payload = data.encode("utf-8") if isinstance(data, str) else data
+        return bool(await self._ctx._files.create(path, payload))
+
     async def write(self, path: str, data: bytes | str) -> None:
         path = clean(path)
         self._check_write(path)

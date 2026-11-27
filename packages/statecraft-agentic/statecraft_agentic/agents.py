@@ -13,7 +13,7 @@ from typing import Any
 
 from statecraft import Agent, ChildFailed, Done, Spawn, Wait, state
 
-from .loop import AgenticAgent
+from .loop import SKILLS_SERVICE, AgenticAgent
 
 
 class Decider(AgenticAgent):
@@ -55,10 +55,18 @@ class Decider(AgenticAgent):
 
 
 class SkillAgent(AgenticAgent):
-    """Runs one skill as its own process: the skill named in the input is its instruction."""
+    """Runs one skill as its own process: the skill named in the input is its instruction. Its
+    model is offered only the tools the skill allows that the agent is granted (a skill never
+    widens a grant; `extensions.agentic.skill_agent.tools` is the grant)."""
 
     def skills_of(self, ctx) -> list[str]:
         return [str(ctx.input["skill"])]
+
+    def offered(self, ctx) -> list[str]:
+        catalog = ctx.service(SKILLS_SERVICE)
+        skill = catalog.get(str(ctx.input["skill"])) if catalog is not None else None
+        allowed = set(skill.allowed_tools) if skill is not None else set()
+        return [t for t in super().offered(ctx) if t in allowed]
 
     def _output_type(self, ctx) -> str | None:
         return str(ctx.input.get("output") or "result")

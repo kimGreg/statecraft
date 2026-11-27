@@ -6,6 +6,10 @@
       test:    {provider: scripted, steps: [{say: "..."}, {call: tool, arguments: {...}}]}
     skill_paths: [./skills]
     concurrency: 4                     # model calls at once
+    skill_agent: {tools: [search.query]}    # what agentic:skill may call (within its skill's
+                                            # allowed-tools); none by default
+    patterns: {spawns: [researcher]}        # what agentic:sequence and :fanout may start;
+                                            # none by default
 
 Registers the `model.<name>` tools, the skill catalog (a service its agents use), the reusable
 agents (`agentic:decider`, `agentic:skill`, `agentic:sequence`, `agentic:fanout`) and a validator
@@ -32,10 +36,23 @@ def register(registrar: Any) -> None:
     for folder in settings.get("skill_paths") or []:
         catalog.add_folder(Path(folder))
     models = [f"model.{n}" for n in (settings.get("models") or {})] or ["model.*"]
-    registrar.agents.register("agentic:decider", Decider, tools=models, writes=["decision"])
-    registrar.agents.register("agentic:skill", SkillAgent, tools=["*"], spawns=[])
-    registrar.agents.register("agentic:sequence", Sequence, spawns=["*"], writes=["sequence"])
-    registrar.agents.register("agentic:fanout", FanOut, spawns=["*"], writes=["fanout"])
+    names = list(settings.get("models") or {})
+    # the built-in agents use `default`, or the first model configured when none is so named
+    use = {"agentic": {"model": names[0]}} if names and "default" not in names else {}
+    registrar.agents.register(
+        "agentic:decider", Decider, tools=models, writes=["decision"], extensions=use
+    )
+    # the generic agents get only what the operator grants them: a parent allowed to start one
+    # never reaches tools or agents through it that it was not granted itself
+    skill_tools = list((settings.get("skill_agent") or {}).get("tools") or [])
+    pattern_spawns = list((settings.get("patterns") or {}).get("spawns") or [])
+    registrar.agents.register(
+        "agentic:skill", SkillAgent, tools=[*models, *skill_tools], extensions=use
+    )
+    registrar.agents.register(
+        "agentic:sequence", Sequence, spawns=pattern_spawns, writes=["sequence"]
+    )
+    registrar.agents.register("agentic:fanout", FanOut, spawns=pattern_spawns, writes=["fanout"])
     registrar.validator(check)
 
 

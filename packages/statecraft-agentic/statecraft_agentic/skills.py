@@ -3,19 +3,20 @@
 
     catalog = SkillCatalog(); catalog.add_folder("./skills")
 
+A skill's files are read once, when the catalog loads it; its digest is computed from those bytes.
 When an agentic agent starts, the skills its definition allows are **pinned** (`{name: digest}`)
-and an immutable copy of each is written to the workspace (`shared/.skills/<digest>/...`, or the
-agent's private folder when it may not write shared/). Loading a skill later reads that copy, so a
-crash and a changed skill between start and first use change nothing. A skill grants no
-permission: the tools it mentions run only if the agent's definition permits them; its scripts
-run only as registered tools.
+and a copy of those bytes is written create-only to the agent's own `home/<agent>/skills/
+<digest>/` (no agent may write there, so no other agent can change it). Loading a skill later
+reads that copy and checks its digest, so a crash, a changed skill on disk, or a changed copy
+change nothing unnoticed. A skill grants no permission: the tools it mentions run only if the
+agent's definition permits them; its scripts run only as registered tools.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ class Skill:
     allowed_tools: tuple[str, ...]
     files: tuple[str, ...]
     digest: str
+    #: the files' bytes as read when the catalog loaded the skill (what the digest covers)
+    contents: dict[str, bytes] = field(default_factory=dict, repr=False, compare=False)
 
 
 def front_matter(path: Path) -> dict[str, Any]:
@@ -54,18 +57,24 @@ def load_skill(folder: Path) -> Skill:
         for p in sorted(folder.rglob("*"))
         if p.is_file() and "__pycache__" not in p.parts
     )
-    digest = hashlib.sha256()
-    for relative in files:
-        digest.update(relative.encode())
-        digest.update((folder / relative).read_bytes())
+    contents = {relative: (folder / relative).read_bytes() for relative in files}
     return Skill(
         name=name,
         description=str(front.get("description") or ""),
         folder=folder,
         allowed_tools=tuple(allowed.split() if isinstance(allowed, str) else allowed),
         files=files,
-        digest="sha256-" + digest.hexdigest()[:24],
+        digest=digest_of(contents),
+        contents=contents,
     )
+
+
+def digest_of(contents: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(contents):
+        digest.update(relative.encode())
+        digest.update(contents[relative])
+    return "sha256-" + digest.hexdigest()[:24]
 
 
 class SkillCatalog:
@@ -89,27 +98,25 @@ class SkillCatalog:
         return {name: self.get(name).digest for name in names}
 
     async def keep(self, ctx: Any, name: str) -> str:
-        """Write an immutable copy of the skill's current version; returns where it is."""
+        """Write the pinned copy of the skill (create-only); returns where it is."""
         skill = self.get(name)
         base = self.copy_root(ctx, skill.digest)
-        for relative in skill.files:
-            target = f"{base}/{relative}"
-            try:
-                if await ctx.files.exists(target):
-                    continue
-            except PermissionError:
-                pass
-            await ctx.files.write(target, (skill.folder / relative).read_bytes())
+        for relative, data in skill.contents.items():
+            await ctx.files.create(f"{base}/{relative}", data)
         return base
 
     @staticmethod
     def copy_root(ctx: Any, digest: str) -> str:
-        if getattr(ctx, "_mode", "own") == "ro":
-            return f"home/{ctx.id}/private/skills/{digest}"
-        return f"shared/.skills/{digest}"
+        return f"home/{ctx.id}/skills/{digest}"
 
     async def read(self, ctx: Any, digest: str, relative: str = SKILL_FILE) -> str:
-        return await ctx.files.read_text(f"{self.copy_root(ctx, digest)}/{relative}")
+        """A file of the pinned copy, after checking the copy still has its digest."""
+        base = self.copy_root(ctx, digest)
+        paths = await ctx.files.list(base)
+        contents = {p.removeprefix(base + "/"): await ctx.files.read(p) for p in paths}
+        if digest_of(contents) != digest:
+            raise RuntimeError(f"the pinned copy of a skill changed ({digest}): not used")
+        return contents[relative].decode("utf-8")
 
 
 __all__ = ["Skill", "SkillCatalog", "front_matter", "load_skill"]

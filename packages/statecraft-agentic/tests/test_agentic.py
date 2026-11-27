@@ -230,8 +230,20 @@ async def test_a_skill_cannot_widen_permissions(tmp_path) -> None:
     assert "grants no permission" in str(raised.value)
 
 
+async def test_sequence_and_fanout_start_only_what_the_operator_grants() -> None:
+    runtime = memory_runtime()
+    agentic(runtime.registrar)  # no `patterns.spawns`: they may start nothing
+    runtime.registrar.agents.register("leaf", Leaf, writes=["leaf_out"])
+    async with runtime:
+        fan = await runtime.spawn("agentic:fanout", {"children": {"a": ["leaf", {"v": 1}]}})
+        await runtime.run(fan, timeout=10)
+        record = await runtime.get(fan)
+    assert record["view"] == "suspended" and "may not spawn leaf" in record["error"]
+
+
 async def test_sequence_and_fanout_patterns() -> None:
     runtime = memory_runtime()
+    runtime.registrar.settings("agentic")["patterns"] = {"spawns": ["leaf"]}
     agentic(runtime.registrar)
     runtime.registrar.agents.register("leaf", Leaf, writes=["leaf_out"])
     async with runtime:
