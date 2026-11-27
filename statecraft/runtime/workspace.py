@@ -18,6 +18,7 @@ agents it keeps, by reference, nothing copied).
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
 from ..kernel.process import Record
@@ -29,6 +30,14 @@ if TYPE_CHECKING:
 
 #: Paths every agent may read besides the views': shared files and the runtime's files.
 READABLE = ("shared/", "run/")
+
+
+class FileChanged(Exception):
+    """An edit made against one version of a file found another."""
+
+
+def content_digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 class NotAllowed(PermissionError):
@@ -194,6 +203,36 @@ class AgentFiles:
         self._check_write(path)
         await self._ctx._files.put(path, data.encode("utf-8") if isinstance(data, str) else data)
 
+    async def digest(self, path: str) -> str | None:
+        """The content digest of a file this agent may read, or None when it does not exist."""
+        path = clean(path)
+        await self._check_read(path)
+        try:
+            return content_digest(await self._ctx._files.get(path))
+        except FileNotFoundError:
+            return None
+
+    async def edit(self, path: str, data: bytes | str, *, expected: str | None) -> str:
+        """Change a file only if it is still what this edit was made against: `expected` is the
+        digest it had before (`digest(path)`, read in an earlier step so that it is committed
+        data), None for a file that must not exist yet. Safe to
+        repeat: when the state runs again after the edit was applied, the file already holds
+        the new content and the edit reports `"already"`; otherwise `"applied"`. A file changed
+        by someone else in between is refused (`FileChanged`). Not atomic against a concurrent
+        writer that does not use `edit`: the workspace is an ordinary shared file system."""
+        path = clean(path)
+        self._check_write(path)
+        body = data.encode("utf-8") if isinstance(data, str) else data
+        current = await self.digest(path)
+        if current == content_digest(body):
+            return "already"
+        if current != expected:
+            raise FileChanged(
+                f"{path} changed since it was read (expected {expected}, found {current})"
+            )
+        await self._ctx._files.put(path, body)
+        return "applied"
+
     async def list(self, prefix: str) -> list[str]:
         found = await self._ctx._files.list(prefix)
         allowed = []
@@ -216,11 +255,13 @@ __all__ = [
     "HOME_FOLDERS",
     "READABLE",
     "AgentFiles",
+    "FileChanged",
     "Files",
     "NotAllowed",
     "WorkspaceProvider",
     "WorkspaceService",
     "clean",
+    "content_digest",
     "home",
     "input_path",
 ]
