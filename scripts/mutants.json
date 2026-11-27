@@ -1,0 +1,622 @@
+{
+ "audit-01": {
+  "title": "commit_step: drop owner/epoch fencing",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                or (current.owner, current.epoch) != (lease.owner, lease.epoch)\n",
+    ""
+   ]
+  ]
+ },
+ "audit-02": {
+  "title": "commit_step: drop lease-expiry check",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                or not current.valid(now)\n",
+    ""
+   ]
+  ]
+ },
+ "audit-03": {
+  "title": "renew: accept an expired (not re-acquired) lease",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "if current != lease or not lease.valid(now):",
+    "if current != lease:"
+   ]
+  ]
+ },
+ "audit-04": {
+  "title": "release: ignore owner/epoch",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "if current is not None and (current.owner, current.epoch) == (lease.owner, lease.epoch):",
+    "if current is not None:"
+   ]
+  ]
+ },
+ "audit-05": {
+  "title": "commit_step: stop releasing the lease",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "            t.put_lease(agent_id, None, epoch)\n            return saved",
+    "            return saved"
+   ]
+  ]
+ },
+ "audit-06": {
+  "title": "executor: cancelled step does not release its lease",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "            if not committed:  # never leave the lease to expire (stop, cancel, store errors)\n                with contextlib.suppress(Exception):\n                    await asyncio.shield(self.store.release(agent_id, lease))\n",
+    "            if False:\n                pass\n"
+   ]
+  ]
+ },
+ "audit-07": {
+  "title": "signal intent re-sent with a fresh message id (applied twice after a crash)",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "target.id, intent[\"id\"], {\"kind\": \"signal\"",
+    "target.id, intent[\"id\"] + uuid.uuid4().hex, {\"kind\": \"signal\""
+   ]
+  ]
+ },
+ "audit-08": {
+  "title": "commit consumes the whole mailbox (ignores signals_seen)",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "mailbox=record.mailbox[t.signals_seen :],",
+    "mailbox=[],"
+   ]
+  ]
+ },
+ "audit-09": {
+  "title": "ctx.signals never records signals_seen (messages redelivered forever)",
+  "edits": [
+   [
+    "statecraft/runtime/context.py",
+    "        self.effects.signals_seen = len(self.record.mailbox)\n",
+    ""
+   ]
+  ]
+ },
+ "audit-10": {
+  "title": "inbox_applied off by one",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "return r.but(inbox_applied=n)",
+    "return r.but(inbox_applied=n - 1)"
+   ]
+  ]
+ },
+ "audit-11": {
+  "title": "may_retry ignores max_attempts",
+  "edits": [
+   [
+    "statecraft/kernel/effects.py",
+    "    if attempt >= policy.max_attempts:\n        return False\n",
+    ""
+   ]
+  ]
+ },
+ "audit-12": {
+  "title": "may_retry off-by-one on max_attempts",
+  "edits": [
+   [
+    "statecraft/kernel/effects.py",
+    "if attempt >= policy.max_attempts:",
+    "if attempt > policy.max_attempts:"
+   ]
+  ]
+ },
+ "audit-13": {
+  "title": "non_repeatable not refused",
+  "edits": [
+   [
+    "statecraft/runtime/effects.py",
+    "if policy.kind == \"non_repeatable\":",
+    "if policy.kind == \"never\":"
+   ]
+  ]
+ },
+ "audit-14": {
+  "title": "may_retry ignores the policy (retries anything transient)",
+  "edits": [
+   [
+    "statecraft/kernel/effects.py",
+    "        return policy.repeatable(keyed)\n",
+    "        return True\n"
+   ]
+  ]
+ },
+ "audit-15": {
+  "title": "'failed' class retried",
+  "edits": [
+   [
+    "statecraft/kernel/effects.py",
+    "if failure.cls in (\"transient\", \"timeout\", \"unavailable\"):\n        return policy.repeatable(keyed)\n    return False",
+    "if failure.cls in (\"transient\", \"timeout\", \"unavailable\", \"failed\"):\n        return policy.repeatable(keyed)\n    return False"
+   ]
+  ]
+ },
+ "audit-16": {
+  "title": "read-only attach may write shared/",
+  "edits": [
+   [
+    "statecraft/runtime/workspace.py",
+    "if self._ctx._mode == \"ro\":",
+    "if self._ctx._mode == \"readonly\":"
+   ]
+  ]
+ },
+ "audit-17": {
+  "title": "attached child defaults to rw",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "return {\"workspace\": target, \"workspace_mode\": \"ro\"}",
+    "return {\"workspace\": target, \"workspace_mode\": \"rw\"}"
+   ]
+  ]
+ },
+ "audit-18": {
+  "title": "kill does not bump the epoch/clear the lease",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "            t.put_lease(agent_id, None, epoch + 1)\n",
+    ""
+   ]
+  ]
+ },
+ "audit-19": {
+  "title": "Unread check removed",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "            if after.ended and t.inbox_read(agent_id, before.inbox_applied):\n                raise Unread(f\"{agent_id}: messages arrived before it could end\")\n",
+    ""
+   ]
+  ]
+ },
+ "audit-20": {
+  "title": "pin ignores policy digest",
+  "edits": [
+   [
+    "statecraft/runtime/registry.py",
+    "return current if current.binding() == binding else None",
+    "return current if {k: v for k, v in current.binding().items() if k != 'policy_digest'} == {k: v for k, v in binding.items() if k != 'policy_digest'} else None"
+   ]
+  ]
+ },
+ "audit-21": {
+  "title": "pin ignores code digest",
+  "edits": [
+   [
+    "statecraft/runtime/registry.py",
+    "elif record_definition.get(\"code\") and current.code",
+    "elif False and current.code"
+   ]
+  ]
+ },
+ "audit-22": {
+  "title": "max_depth off by one",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "if \"max_depth\" in self.limits and depth > self.limits[\"max_depth\"]:",
+    "if \"max_depth\" in self.limits and depth > self.limits[\"max_depth\"] + 1:"
+   ]
+  ]
+ },
+ "audit-23": {
+  "title": "second answer silently accepted",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "        if not stored:\n            raise InvalidAnswer(f\"{question_id} is already answered\")\n",
+    ""
+   ]
+  ]
+ },
+ "audit-24": {
+  "title": "join clears when any child ended",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "            live = [n for n, v in views.items() if v is None or v.status not in ENDED]",
+    "            live = [n for n, v in views.items() if v is None or v.status not in ENDED][:0]"
+   ]
+  ]
+ },
+ "audit-25": {
+  "title": "ended records with pending intents not scanned",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "return record.status == \"active\" or bool(record.pending_intents)",
+    "return record.status == \"active\""
+   ]
+  ]
+ },
+ "audit-26": {
+  "title": "fault drops the wake",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "reasons=[*reasons, {\"kind\": \"fault\", \"error\": error, \"state\": record.state}], error=error",
+    "reasons=[*reasons, {\"kind\": \"fault\", \"error\": error, \"state\": record.state}], error=error, wake=None"
+   ]
+  ]
+ },
+ "audit-27": {
+  "title": "unpublished objects of other agents readable via ctx.files",
+  "edits": [
+   [
+    "statecraft/runtime/workspace.py",
+    "if path in await self._ctx._published_paths():",
+    "if True:"
+   ]
+  ]
+ },
+ "audit-28": {
+  "title": "stale attempt may write any staging folder of the agent",
+  "edits": [
+   [
+    "statecraft/runtime/workspace.py",
+    "if path.startswith(self._ctx.staging + \"/\"):",
+    "if path.startswith(home(self._ctx.id) + \"/staging/\"):"
+   ]
+  ]
+ },
+ "audit-29": {
+  "title": "another agent's private/staging readable",
+  "edits": [
+   [
+    "statecraft/runtime/workspace.py",
+    "if folder is not None and rest[folder] == \"skills\":",
+    "if folder is not None and rest[folder] in (\"skills\", \"private\", \"staging\"):"
+   ]
+  ]
+ },
+ "audit-30": {
+  "title": "question id without step (reused across steps)",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "\"question_id\": record.key(\"question\", wait[\"name\"]),",
+    "\"question_id\": f\"{record.id}/{record.state}/question/{wait['name']}\","
+   ]
+  ]
+ },
+ "audit-31": {
+  "title": "fault commits write no history entry",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "        t.history_append(after.id, after.revision, jsonable(entry))\n",
+    "        if kind != \"fault\":\n            t.history_append(after.id, after.revision, jsonable(entry))\n"
+   ]
+  ]
+ },
+ "audit-32": {
+  "title": "heartbeat does not cancel the step on lease loss",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "                self._cancelled.add(agent_id)\n                work.cancel()\n                return",
+    "                self._cancelled.add(agent_id)\n                return"
+   ]
+  ]
+ },
+ "audit-33": {
+  "title": "idempotency key not passed to the provider",
+  "edits": [
+   [
+    "statecraft/runtime/effects.py",
+    "            key=key,\n            deadline=definition.policy.timeout,",
+    "            key=None,\n            deadline=definition.policy.timeout,"
+   ]
+  ]
+ },
+ "audit-34": {
+  "title": "TERM while stopped keeps 'stopped'",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "            terminating=True,\n            reasons=[],",
+    "            terminating=True,\n            reasons=[r for r in record.reasons if r[\"kind\"] == \"stopped\"],"
+   ]
+  ]
+ },
+ "audit-35": {
+  "title": "KILL drops unread mailbox",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "        undelivered=[*record.undelivered, *_unread(record.mailbox)],\n    )\n    return ended",
+    "        undelivered=list(record.undelivered),\n    )\n    return ended"
+   ]
+  ]
+ },
+ "audit-36": {
+  "title": "max_live_agents ignores the root",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "live = sum(1 for r in tree if not r.ended) + count",
+    "live = sum(1 for r in tree if not r.ended and r.parent) + count"
+   ]
+  ]
+ },
+ "audit-37": {
+  "title": "max_total_agents counts only live agents",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "total = len(tree) + count",
+    "total = sum(1 for r in tree if not r.ended) + count"
+   ]
+  ]
+ },
+ "audit-38": {
+  "title": "live-children check ignores children ended by an earlier intent",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "            if child_id in ending:\n                continue\n",
+    ""
+   ]
+  ]
+ },
+ "audit-39": {
+  "title": "answer timeout clears with None instead of the default",
+  "edits": [
+   [
+    "statecraft/kernel/transitions.py",
+    "\"answer\": copy.deepcopy(reason[\"default\"]),\n                    \"by\": \"timeout\",",
+    "\"answer\": None,\n                    \"by\": \"timeout\","
+   ]
+  ]
+ },
+ "audit-40": {
+  "title": "KILL does not cancel the running step",
+  "edits": [
+   [
+    "statecraft/runtime/runtime.py",
+    "            executor.cancel(agent_id, \"killed\")",
+    "            pass"
+   ]
+  ]
+ },
+ "a1-settle-ignores-block": {
+  "title": "settle-ignores-block",
+  "edits": [
+   [
+    "statecraft/runtime/effects.py",
+    "        if ctx.effects.blocked:\n            problems +=",
+    "        if False:\n            problems +="
+   ]
+  ]
+ },
+ "a1-calls-after-indeterminate": {
+  "title": "calls-after-indeterminate",
+  "edits": [
+   [
+    "statecraft/runtime/effects.py",
+    "        if ctx.effects.blocked:\n            first =",
+    "        if False:\n            first ="
+   ]
+  ]
+ },
+ "a1-new-key-escape": {
+  "title": "new-key-escape",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                    and other[\"status\"] == \"indeterminate\"",
+    "                    and other[\"status\"] == \"never\""
+   ]
+  ]
+ },
+ "a1-no-digest-check": {
+  "title": "no-digest-check",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                if existing[\"digest\"] != digest:",
+    "                if False:"
+   ]
+  ]
+ },
+ "a1-capacity-on-cancel": {
+  "title": "capacity-on-cancel",
+  "edits": [
+   [
+    "statecraft/runtime/effects.py",
+    "        running = context.running()\n        if not running:",
+    "        running = []\n        if not running:"
+   ]
+  ]
+ },
+ "plan-delta-append-lost": {
+  "title": "history: an append delta drops the old items",
+  "edits": [
+   [
+    "statecraft/kernel/delta.py",
+    "        return [*(old if isinstance(old, list) else []), *delta[\"+\"]]",
+    "        return list(delta[\"+\"])"
+   ]
+  ]
+ },
+ "plan-compact-keeps-first": {
+  "title": "compaction keeps the first history entry",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                        last = entries[-1]",
+    "                        last = entries[0]"
+   ]
+  ]
+ },
+ "plan-gc-without-lease": {
+  "title": "collection sweeps an agent whose step runs",
+  "edits": [
+   [
+    "statecraft/runtime/upkeep.py",
+    "                if lease is None:\n                    report[\"skipped\"].append({\"agent\": record.id, \"why\": \"a step is running\"})\n                    continue",
+    "                pass"
+   ]
+  ]
+ },
+ "plan-gc-ignores-history": {
+  "title": "collection ignores references in history",
+  "edits": [
+   [
+    "statecraft/runtime/upkeep.py",
+    "*(entry[\"record\"] for entry in history)",
+    "*()"
+   ]
+  ]
+ },
+ "plan-budget-not-refused": {
+  "title": "a call over budget is sent",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                    if total > most or used >= most:",
+    "                    if False:"
+   ]
+  ]
+ },
+ "plan-limits-not-atomic": {
+  "title": "tree limits not counted in the commit",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "            if limits and isinstance(outcome, Transition) and outcome.spawns:",
+    "            if False:"
+   ]
+  ]
+ },
+ "plan-maintenance-ignored": {
+  "title": "maintenance lets new steps start",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "        if not self.stopping and not self.held and is_runnable(",
+    "        if not self.stopping and is_runnable("
+   ]
+  ]
+ },
+ "plan-scope-not-checked": {
+  "title": "a read token may change things",
+  "edits": [
+   [
+    "statecraft/server/guard.py",
+    "            needed = \"read\" if scope.get(\"method\") in (\"GET\", \"HEAD\") else \"control\"",
+    "            needed = \"read\""
+   ]
+  ]
+ },
+ "plan-roots-not-checked": {
+  "title": "a restricted token touches every run",
+  "edits": [
+   [
+    "statecraft/server/tokens.py",
+    "        return self.roots is None or any(root.startswith(prefix) for prefix in self.roots)",
+    "        return True"
+   ]
+  ]
+ },
+ "plan-mount-always-rw": {
+  "title": "the shared mount is always read-write",
+  "edits": [
+   [
+    "statecraft/ports/workspace.py",
+    "\"mode\": scope[\"shared\"]}",
+    "\"mode\": \"rw\"}"
+   ]
+  ]
+ },
+ "plan-old-format-read": {
+  "title": "an older store format is read without migration",
+  "edits": [
+   [
+    "statecraft/providers/stores/sqlite.py",
+    "            elif found < FORMAT:\n                if not self.migrate:",
+    "            elif found < FORMAT:\n                if False:"
+   ]
+  ]
+ },
+ "plan-attempts-not-kept": {
+  "title": "uncommitted attempts leave no diagnostics",
+  "edits": [
+   [
+    "statecraft/kernel/executor.py",
+    "            if not committed:\n                await self._diagnose(record, lease, why, outcome)",
+    "            pass"
+   ]
+  ]
+ },
+ "plan-edit-repeats": {
+  "title": "a repeated coding edit applies twice",
+  "edits": [
+   [
+    "packages/statecraft-coding/statecraft_coding/agent.py",
+    "            if current == earlier[\"after\"]:",
+    "            if False:"
+   ]
+  ]
+ },
+ "plan-forget-live-reader": {
+  "title": "a run read by another is forgotten",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                    if reads or pending:",
+    "                    if False:"
+   ]
+  ]
+ },
+ "plan-revoke-unseen": {
+  "title": "a revoked token works until restart",
+  "edits": [
+   [
+    "statecraft/server/tokens.py",
+    "        if self._stamp() != self._seen:",
+    "        if False:"
+   ]
+  ]
+ },
+ "plan-chld-missing": {
+  "title": "children send no CHLD",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "        if after.parent and _child_news(before, after):",
+    "        if False:"
+   ]
+  ]
+ },
+ "plan-dead-holds-kept": {
+  "title": "holds of dead attempts are never spent",
+  "edits": [
+   [
+    "statecraft/kernel/store.py",
+    "                if gone or (hold[\"agent\"] == agent and hold[\"epoch\"] < epoch):",
+    "                if False:"
+   ]
+  ]
+ }
+}
