@@ -304,7 +304,11 @@ class Executor:
                 target = await self.store.find(intent["target"])
                 if target is not None and signal_name(intent["signal"]) == "KILL":
                     await self.store.kill(target.id)
-                    self.cancel(target.id, "killed")
+                    killed = getattr(self.env, "killed", None)  # every executor of the runtime
+                    if killed is not None:
+                        killed(target.id)
+                    else:
+                        self.cancel(target.id, "killed")
                 elif target is not None:
                     with contextlib.suppress(Ended):  # a signal to an ended child is a no-op
                         await self.store.append_inbox(
@@ -410,7 +414,13 @@ class Executor:
         not commit anyway, and must stop calling effects)."""
         while True:
             await asyncio.sleep(self.beat)
-            renewed = await self.store.renew(agent_id, lease, self.lease_ttl, self.now())
+            try:
+                renewed = await self.store.renew(agent_id, lease, self.lease_ttl, self.now())
+            except StoreError as exc:  # busy: try again until the lease would have expired
+                if lease.valid(self.now()):
+                    log.warning("%s: lease renewal failed (%s); trying again", agent_id, exc)
+                    continue
+                renewed = None
             if renewed is None:
                 log.warning("%s: lease lost; cancelling the step", agent_id)
                 self._cancelled.add(agent_id)

@@ -12,6 +12,7 @@ waiting for them, and their result is dropped.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import inspect
 import multiprocessing
@@ -55,12 +56,19 @@ class PythonProvider:
         try:
             if definition.execution == "async":
                 return await fn(**arguments)
-            if definition.execution == "thread":
-                return await asyncio.to_thread(functools.partial(fn, **arguments))
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                self._process_pool(), functools.partial(fn, **arguments)
-            )
+            pool = None if definition.execution == "thread" else self._process_pool()
+            if pool is None:
+                ctx = contextvars.copy_context()
+                call = functools.partial(ctx.run, functools.partial(fn, **arguments))
+            else:
+                call = functools.partial(fn, **arguments)
+            work = loop.run_in_executor(pool, call)
+            # a thread or a process cannot be stopped: cancelling the call leaves the work
+            # running, and the effect manager holds its capacity until it ends
+            if context is not None and hasattr(context, "work"):
+                context.work.append(work)
+            return await asyncio.shield(work)
         except EffectError:
             raise
         except asyncio.CancelledError:

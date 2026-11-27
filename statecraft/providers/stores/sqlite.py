@@ -1,22 +1,40 @@
-"""The local state store: one SQLite file, one `BEGIN IMMEDIATE` transaction per operation.
+"""The local state store: one SQLite file, one transaction per operation.
 
 Several executor processes may share the file; SQLite serializes the writers and each operation
 reads and writes inside its own transaction, so fencing and CAS checks hold across processes.
+
+Connection ownership: each store has one connection, owned by one thread of its own; every
+operation runs there, one at a time, so the event loop never waits on a database lock (heartbeats
+keep moving while another process writes). Writes take `BEGIN IMMEDIATE`; reads take a deferred
+`BEGIN` and see a snapshot (WAL). A lock held longer than `busy_timeout` raises `Unavailable`:
+nothing was done, and the executor tries again next pass. Fencing does not depend on any of this:
+a commit after the lease expired is refused, however long it waited. A process that forks gets a
+connection of its own.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sqlite3
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from ...kernel.process import Lease, Record
-from ...kernel.store import StateStore
+from ...kernel.store import StateStore, Unavailable
 from ...kernel.transitions import has_work
+
+T = TypeVar("T")
+#: How long one operation waits for another process's lock before `Unavailable` (seconds).
+BUSY_TIMEOUT = 10.0
+#: How long opening the file waits for others creating it at the same moment (seconds).
+OPEN_TIMEOUT = 30.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents  (id TEXT PRIMARY KEY, work INTEGER NOT NULL, body TEXT NOT NULL);
@@ -25,6 +43,7 @@ CREATE TABLE IF NOT EXISTS leases  (id TEXT PRIMARY KEY, owner TEXT, epoch INTEG
                                     expires REAL);
 CREATE TABLE IF NOT EXISTS inbox   (agent TEXT NOT NULL, n INTEGER NOT NULL, id TEXT NOT NULL,
                                     body TEXT NOT NULL, PRIMARY KEY (agent, id));
+CREATE INDEX IF NOT EXISTS inbox_n ON inbox(agent, n);
 CREATE TABLE IF NOT EXISTS events  (root TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL,
                                     body TEXT NOT NULL, PRIMARY KEY (root, seq), UNIQUE (root, id));
 CREATE TABLE IF NOT EXISTS history (agent TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -33,7 +52,12 @@ CREATE TABLE IF NOT EXISTS history (agent TEXT NOT NULL, revision INTEGER NOT NU
 
 
 def _dump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return json.dumps(value, ensure_ascii=False)  # key order kept, as the memory store keeps it
+
+
+def _locked(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 class _Tables:
@@ -131,27 +155,85 @@ class _Tables:
 
 
 class SqliteStore(StateStore):
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, busy_timeout: float = BUSY_TIMEOUT) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(
-            self.path, timeout=30, isolation_level=None, check_same_thread=False
-        )
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.executescript(SCHEMA)
+        self.busy_timeout = busy_timeout
+        self._db: sqlite3.Connection | None = None
+        self._pid = 0
+        self._thread: ThreadPoolExecutor | None = None
         self._lock = threading.RLock()
+        self._run_sync(self._connect)  # open (and create) now: errors show at construction
+
+    # ---- the connection, owned by the store's thread -----------------------------------------
+    def _connect(self) -> None:
+        deadline = time.monotonic() + OPEN_TIMEOUT
+        while True:
+            db = sqlite3.connect(
+                self.path,
+                timeout=self.busy_timeout,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            try:
+                db.execute("PRAGMA journal_mode=WAL")  # needs an exclusive lock: may be busy
+                db.execute("PRAGMA synchronous=FULL")
+                db.executescript(SCHEMA)
+                break
+            except sqlite3.OperationalError as exc:
+                db.close()
+                if not _locked(exc) or time.monotonic() > deadline:
+                    raise Unavailable(f"cannot open {self.path}: {exc}") from exc
+                time.sleep(0.05)  # another process is creating the file: wait for it
+        self._db, self._pid = db, os.getpid()
+
+    def _executor(self) -> ThreadPoolExecutor:
+        if self._thread is None or self._pid != os.getpid():
+            self._thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="statecraft-db")
+        return self._thread
+
+    def _run_sync(self, fn: Callable[[], T]) -> T:
+        with self._lock:
+            stale = self._db is None or self._pid != os.getpid()  # first use, or a fork
+            if stale and fn is not self._connect:
+                self._connect()
+            return fn()
+
+    async def _run(self, fn: Callable[[], T]) -> T:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor(), lambda: self._run_sync(fn))
 
     @contextmanager
-    def transaction(self) -> Iterator[_Tables]:
+    def transaction(self, write: bool = True) -> Iterator[_Tables]:
         with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
+            db = self._db
+            assert db is not None
             try:
-                yield _Tables(self._db)
-            except BaseException:
-                self._db.execute("ROLLBACK")
+                db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            except sqlite3.OperationalError as exc:
+                if _locked(exc):
+                    raise Unavailable(f"{self.path} stayed locked: {exc}") from exc
                 raise
-            self._db.execute("COMMIT")
+            try:
+                yield _Tables(db)
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+            try:
+                db.execute("COMMIT")
+            except sqlite3.OperationalError as exc:
+                if db.in_transaction:  # never leave the connection inside a transaction
+                    db.execute("ROLLBACK")
+                if _locked(exc):
+                    raise Unavailable(f"{self.path}: commit refused: {exc}") from exc
+                raise
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+        if self._thread is not None:
+            self._thread.shutdown(wait=False)
+            self._thread = None

@@ -109,6 +109,7 @@ class Runtime:
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._seen_views: dict[str, Any] = {}
+        self._temporary: list[Executor] = []  # executors `run()` makes while it runs
 
     # ---- construction -------------------------------------------------------------------------
     @classmethod
@@ -192,6 +193,11 @@ class Runtime:
             raise NotStarted("start the runtime first: `await runtime.start()` or `async with`")
 
     # ---- the executor's environment -----------------------------------------------------------
+    def killed(self, agent_id: str) -> None:
+        """An agent was killed: every executor of this runtime cancels its running step."""
+        for executor in [*self.executors, *self._temporary]:
+            executor.cancel(agent_id, "killed")
+
     def notify(self) -> None:
         self.wakeup.set()
         for listener in list(self.listeners):
@@ -419,8 +425,7 @@ class Runtime:
             raise Ended(f"{agent_id} has ended ({record.status}); it takes no more signals")
         if signal_name(signal) == "KILL":
             await self.store.kill(agent_id)
-            for executor in self.executors:
-                executor.cancel(agent_id, "killed")
+            self.killed(agent_id)
         else:
             await self.store.append_inbox(
                 agent_id,
@@ -633,8 +638,10 @@ class Runtime:
         executor when the runtime has none of its own."""
         self._require_started()
         own = None
+        temporary = self._temporary
         if not self.executors:
             own = Executor(self, owner=f"{self.owner}-run", **{**self.executor_options, **options})
+            temporary.append(own)
             if root:
                 own.roots = {root}
 
@@ -643,7 +650,14 @@ class Runtime:
                 self.wakeup.clear()
                 moved = await own.tick() if own is not None else False
                 busy = bool(own.running) if own is not None else await self._busy(root)
-                if not moved and not busy and not await self._sleeping(root):
+                # quiet only if nothing happened since this pass began (a step that ended
+                # during the pass notifies; its agent may have work the pass did not see)
+                if (
+                    not moved
+                    and not busy
+                    and not self.wakeup.is_set()
+                    and not await self._sleeping(root)
+                ):
                     return
                 if not moved:
                     with contextlib.suppress(asyncio.TimeoutError):
@@ -657,6 +671,7 @@ class Runtime:
         finally:
             if own is not None:
                 await own.drain()
+                temporary.remove(own)
             if root:
                 await self.refresh_views(root)
         return await self.tree(root) if root else []

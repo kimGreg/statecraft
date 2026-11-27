@@ -169,3 +169,27 @@ async def test_roots_are_the_records_without_a_parent(store) -> None:
     for agent_id in ("b", "a", "a/child", "a/child/leaf", "b/x"):
         await store.create(rec(agent_id))
     assert [r.id for r in await store.roots()] == ["a", "b"]
+
+
+async def test_both_stores_keep_the_same_json(store) -> None:
+    from statecraft.kernel.store import NotJSON
+
+    await store.create(
+        rec(data={"z": 1, "a": (1, 2), 3: "x"}, children={"zeta": "z", "alpha": "a"})
+    )
+    loaded = await store.load("root")
+    assert loaded.data == {"z": 1, "a": [1, 2], "3": "x"}  # tuples are lists, keys strings
+    assert list(loaded.data) == ["z", "a", "3"] and list(loaded.children) == ["zeta", "alpha"]
+    lease = await store.try_acquire("root", "a", 10, now=0)
+    with pytest.raises(NotJSON):  # not JSON: refused before anything is written
+        await store.commit_step("root", lease, 0, Transition(state="s1", data={"s": {1}}), now=1)
+    assert (await store.load("root")).step == 0
+    with pytest.raises(NotJSON):
+        await store.append_inbox("root", "m", {"kind": "signal", "signal": ["USR", b"x"]})
+
+
+async def test_an_expired_lease_cannot_be_renewed(store) -> None:
+    await store.create(rec())
+    lease = await store.try_acquire("root", "a", 10, now=0)
+    assert await store.renew("root", lease, 10, now=11) is None  # expired, even unclaimed
+    assert await store.renew("root", lease, 10, now=5) is not None

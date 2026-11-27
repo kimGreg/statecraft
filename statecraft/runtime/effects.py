@@ -39,6 +39,12 @@ class EffectContext:
     deadline: float | None
     attempt: int = 1
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Work the provider started that cancelling the call cannot stop (a thread, a process):
+    #: the call's capacity stays taken, and no other attempt starts, until it ends.
+    work: list[asyncio.Future[Any]] = field(default_factory=list)
+
+    def running(self) -> list[asyncio.Future[Any]]:
+        return [w for w in self.work if not w.done()]
 
 
 def _size(value: Any) -> int:
@@ -53,6 +59,27 @@ class EffectManager:
         self.registry = registry
         self.backoff = backoff
         self._capacity: dict[str, asyncio.Semaphore] = {}
+        #: waiters that release capacity once work a cancelled call could not stop has ended
+        self._lingering: set[asyncio.Task[None]] = set()
+
+    def _release_after(self, context: EffectContext, slots: asyncio.Semaphore | None) -> None:
+        """Release the call's capacity now, or when the work it started ends."""
+        if slots is None:
+            return
+        running = context.running()
+        if not running:
+            slots.release()
+            return
+
+        async def wait_then_release() -> None:
+            try:
+                await asyncio.gather(*running, return_exceptions=True)
+            finally:
+                slots.release()
+
+        task = asyncio.ensure_future(wait_then_release())
+        self._lingering.add(task)
+        task.add_done_callback(self._lingering.discard)
 
     def _slots(self, provider_name: str, provider: Any) -> asyncio.Semaphore | None:
         limit = getattr(provider, "concurrency", None)
@@ -158,18 +185,23 @@ class EffectManager:
                     waited = time.monotonic()
                     if slots is not None:
                         await slots.acquire()
-                    crossing["waited"] = round(time.monotonic() - waited, 4)
+                    crossing["waited"] = round(
+                        crossing.get("waited", 0) + time.monotonic() - waited, 4
+                    )
                     try:
                         result = await asyncio.wait_for(
                             provider.invoke(definition.operation or name, arguments, context),
                             policy.timeout,
                         )
                     finally:
-                        if slots is not None:
-                            slots.release()
+                        self._release_after(context, slots)
                 except TimeoutError as exc:
                     failure = EffectError("timeout", f"no result in {policy.timeout}s", effect=name)
                     failure.__cause__ = exc
+                    # work that cannot be stopped is still running: no other attempt overlaps it
+                    if context.running():
+                        crossing["lingered"] = True
+                        await asyncio.gather(*context.running(), return_exceptions=True)
                 except EffectError as exc:
                     failure = exc
                     failure.effect = failure.effect or name

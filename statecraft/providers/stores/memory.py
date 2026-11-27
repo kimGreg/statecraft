@@ -86,7 +86,7 @@ class MemoryStore(StateStore):
         self._lock = threading.RLock()
 
     @contextmanager
-    def transaction(self) -> Iterator[_Tables]:
+    def transaction(self, write: bool = True) -> Iterator[_Tables]:
         with self._lock:
             working = copy.deepcopy(self._state)
             yield _Tables(working)

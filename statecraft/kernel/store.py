@@ -16,12 +16,15 @@ transaction. Times are passed in, so the store never reads a clock of its own.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from .process import Fault, Lease, Record, Transition
 from .transitions import apply_outcome, apply_signal
+
+T = TypeVar("T")
 
 
 class StoreError(RuntimeError):
@@ -42,6 +45,23 @@ class Busy(StoreError):
 
 class Ended(StoreError):
     """The agent has ended: it takes no more signals or answers."""
+
+
+class Unavailable(StoreError):
+    """The store could not be reached or stayed locked: nothing was done; try again."""
+
+
+class NotJSON(ValueError):
+    """A record or message holds a value that is not JSON (a set, bytes, an object): stores
+    keep JSON only, the same in every store. A step whose data is not JSON faults."""
+
+
+def jsonable(value: Any) -> Any:
+    """The value as every store keeps it: through JSON (tuples become lists, keys strings)."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise NotJSON(f"not JSON: {exc}") from exc
 
 
 class Unread(StoreError):
@@ -75,52 +95,65 @@ def root_of(agent_id: str) -> str:
 class StateStore:
     """Fencing and atomicity on top of an adapter's `transaction()`."""
 
-    def transaction(self) -> AbstractContextManager[Tables]:
+    def transaction(self, write: bool = True) -> AbstractContextManager[Tables]:
         raise NotImplementedError
+
+    # ---- running a transaction ---------------------------------------------------------------
+
+    async def _txn(self, body: Callable[[Tables], T], *, write: bool = True) -> T:
+        """Run `body` in one transaction. Where it runs is the adapter's: inline (memory), or on
+        the thread that owns the store's connection (SQLite), so the event loop never waits on a
+        lock. `write=False` is a read: it may see a snapshot and never blocks writers."""
+        return await self._run(lambda: self._in_transaction(body, write))
+
+    def _in_transaction(self, body: Callable[[Tables], T], write: bool) -> T:
+        with self.transaction(write=write) as t:
+            return body(t)
+
+    async def _run(self, fn: Callable[[], T]) -> T:
+        return fn()
 
     # ---- reads -------------------------------------------------------------------------------
 
     async def load(self, agent_id: str) -> Record:
-        with self.transaction() as t:
-            record = t.get(agent_id)
+        record = await self.find(agent_id)
         if record is None:
             raise KeyError(agent_id)
         return record
 
     async def find(self, agent_id: str) -> Record | None:
-        with self.transaction() as t:
-            return t.get(agent_id)
+        return await self._txn(lambda t: t.get(agent_id), write=False)
 
     async def lease(self, agent_id: str) -> Lease | None:
-        with self.transaction() as t:
-            return t.get_lease(agent_id)[0]
+        return await self._txn(lambda t: t.get_lease(agent_id)[0], write=False)
 
     async def scan_work(self) -> list[Record]:
         """Every record with work left: active, or ended with intents pending."""
-        with self.transaction() as t:
-            return [r for r in (t.get(i) for i in t.work_ids()) if r is not None]
+        return await self._txn(
+            lambda t: [r for r in (t.get(i) for i in t.work_ids()) if r is not None], write=False
+        )
 
     async def roots(self) -> list[Record]:
         """Every root (a run), in id order."""
-        with self.transaction() as t:
-            return [r for r in (t.get(i) for i in t.root_ids()) if r is not None]
+        return await self._txn(
+            lambda t: [r for r in (t.get(i) for i in t.root_ids()) if r is not None], write=False
+        )
 
     async def tree(self, root: str) -> list[Record]:
         """The root and every agent under it, in id order."""
-        with self.transaction() as t:
-            return [r for r in (t.get(i) for i in t.tree_ids(root)) if r is not None]
+        return await self._txn(
+            lambda t: [r for r in (t.get(i) for i in t.tree_ids(root)) if r is not None],
+            write=False,
+        )
 
     async def read_inbox(self, agent_id: str, after: int) -> list[dict[str, Any]]:
-        with self.transaction() as t:
-            return t.inbox_read(agent_id, after)
+        return await self._txn(lambda t: t.inbox_read(agent_id, after), write=False)
 
     async def read_events(self, root: str, after_seq: int = 0) -> list[dict[str, Any]]:
-        with self.transaction() as t:
-            return t.event_read(root, after_seq)
+        return await self._txn(lambda t: t.event_read(root, after_seq), write=False)
 
     async def history(self, agent_id: str) -> list[dict[str, Any]]:
-        with self.transaction() as t:
-            return t.history_read(agent_id)
+        return await self._txn(lambda t: t.history_read(agent_id), write=False)
 
     # ---- writes ------------------------------------------------------------------------------
 
@@ -136,7 +169,9 @@ class StateStore:
         """Bump the revision; write the record, its history entry and its durable event in the
         caller's transaction. New publications are stamped with that event's sequence, so views
         can order them by when they were published."""
-        after = after.but(revision=(before.revision if before else 0) + 1)
+        after = Record.from_dict(
+            jsonable(after.but(revision=(before.revision if before else 0) + 1).to_dict())
+        )
         event = {
             "id": f"{after.id}@{after.revision}",
             "agent": after.id,
@@ -148,7 +183,7 @@ class StateStore:
             "reasons": [r["kind"] for r in after.reasons],
             **detail,
         }
-        seq = t.event_append(root_of(after.id), event["id"], event)
+        seq = t.event_append(root_of(after.id), event["id"], jsonable(event))
         if any("seq" not in ref for ref in after.published.values()):
             stamped = {
                 k: ref if "seq" in ref else {**ref, "seq": seq}
@@ -161,19 +196,22 @@ class StateStore:
             entry["detail"] = dict(detail)
         if crossings:
             entry["crossings"] = crossings
-        t.history_append(after.id, after.revision, entry)
+        t.history_append(after.id, after.revision, jsonable(entry))
         return after
 
     async def create(self, record: Record) -> bool:
         """Create-only: a spawn carried out twice creates one child."""
-        with self.transaction() as t:
+
+        def body(t: Tables) -> bool:
             if t.get(record.id) is not None:
                 return False
             self._save(t, None, record.but(revision=0), "created")
             return True
 
+        return await self._txn(body)
+
     async def try_acquire(self, agent_id: str, owner: str, ttl: float, now: float) -> Lease | None:
-        with self.transaction() as t:
+        def body(t: Tables) -> Lease | None:
             record = t.get(agent_id)
             lease, epoch = t.get_lease(agent_id)
             if record is None or record.ended or (lease is not None and lease.valid(now)):
@@ -182,8 +220,10 @@ class StateStore:
             t.put_lease(agent_id, new, new.epoch)
             return new
 
+        return await self._txn(body)
+
     async def renew(self, agent_id: str, lease: Lease, ttl: float, now: float) -> Lease | None:
-        with self.transaction() as t:
+        def body(t: Tables) -> Lease | None:
             current, epoch = t.get_lease(agent_id)
             if current != lease or not lease.valid(now):
                 return None
@@ -191,11 +231,15 @@ class StateStore:
             t.put_lease(agent_id, new, epoch)
             return new
 
+        return await self._txn(body)
+
     async def release(self, agent_id: str, lease: Lease) -> None:
-        with self.transaction() as t:
+        def body(t: Tables) -> None:
             current, epoch = t.get_lease(agent_id)
             if current is not None and (current.owner, current.epoch) == (lease.owner, lease.epoch):
                 t.put_lease(agent_id, None, epoch)
+
+        await self._txn(body)
 
     async def commit_step(
         self,
@@ -205,7 +249,7 @@ class StateStore:
         outcome: Transition | Fault,
         now: float,
     ) -> Record:
-        with self.transaction() as t:
+        def body(t: Tables) -> Record:
             current, epoch = t.get_lease(agent_id)
             if (
                 current is None
@@ -226,6 +270,8 @@ class StateStore:
             t.put_lease(agent_id, None, epoch)
             return saved
 
+        return await self._txn(body)
+
     async def commit_control(
         self,
         agent_id: str,
@@ -235,7 +281,7 @@ class StateStore:
         kind: str = "control",
         **detail: Any,
     ) -> Record:
-        with self.transaction() as t:
+        def body(t: Tables) -> Record:
             before = t.get(agent_id)
             if before is None:
                 raise KeyError(agent_id)
@@ -249,8 +295,10 @@ class StateStore:
                 return before
             return self._save(t, before, after, kind, **detail)
 
+        return await self._txn(body)
+
     async def kill(self, agent_id: str) -> Record:
-        with self.transaction() as t:
+        def body(t: Tables) -> Record:
             before = t.get(agent_id)
             if before is None:
                 raise KeyError(agent_id)
@@ -260,9 +308,13 @@ class StateStore:
                 return before
             return self._save(t, before, apply_signal(before, "KILL"), "signal", signal="KILL")
 
+        return await self._txn(body)
+
     async def append_inbox(self, agent_id: str, message_id: str, message: Any) -> bool:
         """Append if that id is not there yet; signals and answers are never applied twice."""
-        with self.transaction() as t:
+        message = jsonable(message)
+
+        def body(t: Tables) -> bool:
             record = t.get(agent_id)
             if record is None:
                 raise KeyError(agent_id)
@@ -270,15 +322,20 @@ class StateStore:
                 raise Ended(f"{agent_id} has ended ({record.status}); it takes no more messages")
             return t.inbox_append(agent_id, message_id, message)
 
+        return await self._txn(body)
+
 
 __all__ = [
     "Busy",
     "Conflict",
     "Ended",
     "Fenced",
+    "NotJSON",
     "StateStore",
     "StoreError",
     "Tables",
+    "Unavailable",
     "Unread",
+    "jsonable",
     "root_of",
 ]
