@@ -818,9 +818,14 @@ class Runtime:
 
     async def _busy(self, root: str | None) -> bool:
         records = await self.store.tree(root) if root else await self.store.scan_work()
-        return any((not r.ended and not r.reasons) or r.pending_intents for r in records) or any(
+        if any((not r.ended and not r.reasons) or r.pending_intents for r in records) or any(
             e.running for e in self.executors
-        )
+        ):
+            return True
+        for r in records:  # a message not applied yet (a CONT just sent) is work to do
+            if not r.ended and await self.store.read_inbox(r.id, r.inbox_applied):
+                return True
+        return False
 
     async def _sleeping(self, root: str | None) -> bool:
         records = await self.store.tree(root) if root else await self.store.scan_work()
