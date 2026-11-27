@@ -155,3 +155,15 @@ async def test_concurrent_spawns_cannot_pass_a_limit_together() -> None:
         assert len(tree) <= 5
         refused = [r.id for r in tree if r.error and "limit max_total_agents=5" in r.error]
         assert len(refused) == 1 and refused[0] in ("race/a", "race/b")
+
+
+async def test_the_early_check_counts_ended_agents_too() -> None:
+    """What `ctx.spawn_problem` tells an agent counts every agent the tree had, ended ones too
+    (the commit counts them as well)."""
+    async with runtime_with(max_total_agents=3) as runtime:
+        await runtime.spawn("fan", {"n": 2}, root_id="e")
+        await runtime.run("e", timeout=10)
+        parent = await runtime.store.load("e")
+        assert all(r.ended for r in await runtime.store.tree("e") if r.parent)
+        problem = await runtime.limit_problem(parent, 1)
+        assert problem == "limit max_total_agents=3: the tree would have 4"
